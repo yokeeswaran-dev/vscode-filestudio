@@ -466,6 +466,8 @@ const GROW_MARGIN_ROWS = 10;
 const GROW_MARGIN_COLS = 3;
 const MIN_ZOOM = 10;
 const MAX_ZOOM = 400;
+/** Zoom change per Ctrl+wheel notch, as in Excel (the status-bar − / + buttons step by 10). */
+const WHEEL_ZOOM_STEP = 15;
 const MAX_SCROLL_HEIGHT = 10_000_000;
 const REBASE_PX = 1_000_000;
 const REGION_SNAP = 512;
@@ -637,14 +639,17 @@ const NO_CELLS = [];
  * @property {boolean} wired            the grid's events are wired (first mountGrid)
  * @property {boolean} renderQueued
  * @property {number} statsSeq
- * @property {number} statsReq
- * @property {{ mode: 'cells' | 'rows' | 'cols', x: number, y: number, raf: number, anchor: number, last: number, frozenR: boolean, frozenC: boolean } | null} drag
- *   frozenR / frozenC: the drag started in the frozen rows / columns (else it auto-scrolls instead of entering them)
+ * @property {StatsRequest | null} statsReq  selection statistics being gathered (scheduleStats)
+ * @property {{ mode: 'cells' | 'rows' | 'cols' | 'deselect', x: number, y: number, raf: number, anchor: number, last: number, frozenR: boolean, frozenC: boolean, deselect?: { from: Cell, base: Selection, to: Cell } } | null} drag
+ *   frozenR / frozenC: the drag started in the frozen rows / columns (else it auto-scrolls instead of entering them);
+ *   deselect: Ctrl+drag from a selected cell (deselectCells) - the cell, the selection before, the cell last hovered
  * @property {{ key: string, timer: ReturnType<typeof setTimeout> | undefined }} hover
  * @property {boolean} keyNav           the last selection change came from the keyboard (shows the active cell's note / link)
  * @property {{ rows: [number, number, boolean][], cols: [number, number, boolean][] }} hdrSel
  * @property {number} zoomWheelAt
  * @property {CellBox | null} cellBox   read-only cell text box opened by a double-click (CELL TEXT BOX)
+ * @property {HTMLElement | null} lostFocus  the grid or the cell text box whose focus went to <body> (see wireGridEvents)
+ * @property {string | undefined} bannerText  lossy-content banner the host sent last (init / invalidate), even if dismissed
  */
 
 /** @type {GridState | null} */
@@ -684,13 +689,15 @@ function showGrid(msg) {
     wired: false,
     renderQueued: false,
     statsSeq: 0,
-    statsReq: 0,
+    statsReq: null,
     drag: null,
     hover: { key: '', timer: undefined },
     keyNav: false,
     hdrSel: { rows: [], cols: [] },
     zoomWheelAt: 0,
     cellBox: null,
+    lostFocus: null,
+    bannerText: msg.banner,
   };
   resetRowCache();
   rowCache.metaFloor = rowCache.reqSeq;
@@ -845,16 +852,40 @@ function buildGridDom(msg) {
 function buildGridApp(msg, dom) {
   /** @type {HTMLElement[]} */
   const parts = [];
-  if (msg.banner) {
-    dom.banner = buildBanner(msg.banner, () => {
-      dom.banner = null;
-      // The Dismiss button had focus: give it back to the grid instead of losing it to <body>.
-      G?.dom.scroller.focus({ preventScroll: true });
-    });
-    parts.push(dom.banner);
-  }
+  if (msg.banner) parts.push(buildGridBanner(msg.banner, dom));
   parts.push(dom.formulaBar, h('div', { class: 'fv-grid-host' }, dom.scroller), dom.tabBar, dom.statusBar, dom.tooltip, dom.ariaDesc);
   return parts;
+}
+
+/**
+ * The grid's lossy-content banner (kept in dom.banner).
+ * @param {string} text @param {GridDom} dom
+ */
+function buildGridBanner(text, dom) {
+  dom.banner = buildBanner(text, () => {
+    dom.banner = null;
+    // The Dismiss button had focus: give it back to the grid instead of losing it to <body>.
+    G?.dom.scroller.focus({ preventScroll: true });
+  });
+  return dom.banner;
+}
+
+/**
+ * After a reload (InvalidateMessage.banner): shows, replaces or removes the lossy-content banner, on the grid or on the
+ * "no worksheets" page, so it says what the reloaded file holds (a chart added or removed on disk). A banner the user
+ * dismissed stays dismissed while the host sends the same text.
+ * @param {string | undefined} text
+ */
+function updateBanner(text) {
+  const g = G;
+  if (!g || text === g.bannerText) return;
+  g.bannerText = text;
+  const focused = document.activeElement;
+  root.querySelector(':scope > .fv-banner')?.remove();
+  g.dom.banner = null;
+  if (text) root.prepend(g.dom.scroller.isConnected ? buildGridBanner(text, g.dom) : buildBanner(text, null));
+  // Removing a banner whose Dismiss button had the focus would drop it to <body>.
+  if (focused instanceof HTMLElement && !focused.isConnected && g.dom.scroller.isConnected) g.dom.scroller.focus({ preventScroll: true });
 }
 
 /**
@@ -907,6 +938,17 @@ function wireGridEvents() {
   // is debounced and would otherwise be dropped.
   listen(window, 'pagehide', () => saveGridState.flush());
   listen(document, 'copy', onCopyEvent);
+  // VS Code's context menu (also a click in the workbench) takes the focus out of the webview's frame, which drops it
+  // to <body>: the grid / cell text box that had it is remembered, so that the menu's Copy copies from it and the
+  // focus goes back to it when the frame gets the focus again or a key is pressed (onLostFocusKeyDown).
+  listen(document, 'focusout', (/** @type {FocusEvent} */ e) => {
+    if (G && !e.relatedTarget && (e.target === G.dom.scroller || e.target === G.cellBox?.el)) G.lostFocus = /** @type {HTMLElement} */ (e.target);
+  });
+  listen(document, 'focusin', () => {
+    if (G) G.lostFocus = null;
+  });
+  listen(window, 'focus', () => restoreLostFocus());
+  listen(document, 'keydown', onLostFocusKeyDown);
   listen(document, 'mousedown', (e) => {
     // A click anywhere but the cell text box closes it (the focus goes back to the grid unless the click focuses
     // something else, such as the name box).
@@ -921,6 +963,10 @@ function wireGridEvents() {
   listen(root, 'mousedown', (/** @type {MouseEvent} */ e) => {
     const target = /** @type {HTMLElement} */ (e.target);
     if (e.button === 0 && target.closest('.fv-banner, .fv-formula-bar, .fv-tabbar, .fv-statusbar') && !target.closest('.fv-namebox, .fv-formula')) e.preventDefault();
+    // A press elsewhere ends a text selection in the formula bar, like leaving Excel's formula bar (the grid's press
+    // is default-prevented, which would keep it highlighted).
+    const s = window.getSelection();
+    if (s && !s.isCollapsed && !target.closest('.fv-formula') && G?.dom.formula.contains(s.anchorNode)) s.removeAllRanges();
   });
 
   // Tab arrows are updated on the next frame: showing them resizes the observed tab strip, which inside the
@@ -1288,6 +1334,7 @@ function onInvalidate(msg) {
   closeCellBox(); // its text may have changed
   resetRowCache();
   hideTooltip();
+  if (msg.banner !== undefined) updateBanner(msg.banner ?? undefined);
   if (msg.meta) {
     rowCache.metaFloor = rowCache.reqSeq;
     G.saved = snapshotState();
@@ -3827,6 +3874,49 @@ function selectCell(view, r, c, add = false) {
   setSelection(view, ranges, m);
 }
 
+/**
+ * Ctrl+click (Ctrl+drag) on selected cells deselects them, like Excel 365: every range of `base` is split around the
+ * hole (measured in Excel: the part below it, then right of it, left of it and above it, in place of the range), and
+ * the active cell becomes the top-left cell of the last piece of the last range that was split. When nothing would
+ * stay selected, the selection is `base` (Excel keeps a single cell that is Ctrl+clicked).
+ * @param {SheetView} view @param {Selection} base  the selection before the click @param {Range} hole
+ */
+function deselectCells(view, base, hole) {
+  /** @type {Range[]} */
+  const ranges = [];
+  /** @type {Range | undefined} */
+  let lastPiece;
+  let split = false;
+  for (const rg of base.ranges) {
+    if (hole.r1 < rg.r0 || hole.r0 > rg.r1 || hole.c1 < rg.c0 || hole.c0 > rg.c1) {
+      ranges.push(rg);
+      continue;
+    }
+    split = true;
+    const r0 = Math.max(rg.r0, hole.r0);
+    const r1 = Math.min(rg.r1, hole.r1);
+    /** @type {Range[]} */
+    const pieces = [];
+    if (hole.r1 < rg.r1) pieces.push({ r0: hole.r1 + 1, c0: rg.c0, r1: rg.r1, c1: rg.c1 });
+    if (hole.c1 < rg.c1) pieces.push({ r0, c0: hole.c1 + 1, r1, c1: rg.c1 });
+    if (hole.c0 > rg.c0) pieces.push({ r0, c0: rg.c0, r1, c1: hole.c0 - 1 });
+    if (hole.r0 > rg.r0) pieces.push({ r0: rg.r0, c0: rg.c0, r1: hole.r0 - 1, c1: rg.c1 });
+    if (pieces.length) lastPiece = pieces[pieces.length - 1];
+    ranges.push(...pieces);
+  }
+  if (!split || !ranges.length) {
+    if (view.sel !== base) {
+      view.sel = base;
+      selectionChanged(view, null);
+    }
+    return;
+  }
+  // A range removed whole leaves no piece: the active cell stays when still selected, else the last range's first cell.
+  const last = ranges[ranges.length - 1];
+  const p = lastPiece ? { r: lastPiece.r0, c: lastPiece.c0 } : selectionContainsIn(ranges, base.active) ? base.active : { r: last.r0, c: last.c0 };
+  setSelection(view, ranges, masterOf(view, p.r, p.c), { reveal: null });
+}
+
 /** Extends the last range from the anchor to (r, c). @param {SheetView} view @param {number} r @param {number} c */
 function extendSelection(view, r, c, reveal = true) {
   const sel = view.sel;
@@ -3838,7 +3928,8 @@ function extendSelection(view, r, c, reveal = true) {
 /**
  * Whole rows a..b (or columns), from a header click / drag. The active cell is the first cell of row (column)
  * `activeIdx` shown in the window, like Excel, so selecting a header never scrolls and the next arrow key starts
- * where the user is looking.
+ * where the user is looking. Merged cells do not widen the range: Excel's header click on column D selects D:D even
+ * where B35:D35 is merged (the name box and Ctrl/Shift+Space do grow over merges, see snapRange).
  * @param {SheetView} view @param {'rows' | 'cols'} mode @param {number} a @param {number} b
  * @param {boolean | 'last'} add  true = new range, false = replace all, 'last' = replace the last range (Shift+click)
  * @param {number} [activeIdx]
@@ -3848,14 +3939,13 @@ function selectLines(view, mode, a, b, add, activeIdx = a) {
   const hi = Math.max(a, b);
   /** @type {Range} */
   const rg = mode === 'rows' ? { r0: lo, r1: hi, c0: 0, c1: view.maxC - 1 } : { r0: 0, r1: view.maxR - 1, c0: lo, c1: hi };
-  const snapped = snapRange(view, rg);
   const shown = firstShownCell(view);
   const active = mode === 'rows' ? masterOf(view, activeIdx, shown.c) : masterOf(view, shown.r, activeIdx);
   const keep = add === 'last' ? view.sel.ranges.slice(0, -1) : add ? view.sel.ranges : [];
   const anchor = mode === 'rows' ? { r: activeIdx, c: active.c } : { r: active.r, c: activeIdx };
   // Shift+click keeps the active cell of the range being extended.
-  const keepActive = add === 'last' && selectionContainsIn([snapped], view.sel.active);
-  setSelection(view, [...keep, snapped], keepActive ? view.sel.active : active, { anchor, cursor: mode === 'rows' ? { r: b, c: active.c } : { r: active.r, c: b }, reveal: null });
+  const keepActive = add === 'last' && selectionContainsIn([rg], view.sel.active);
+  setSelection(view, [...keep, rg], keepActive ? view.sel.active : active, { anchor, cursor: mode === 'rows' ? { r: b, c: active.c } : { r: active.r, c: b }, reveal: null });
 }
 
 /** @param {Range[]} ranges @param {Cell} p */
@@ -4045,6 +4135,13 @@ function onGridMouseDown(e) {
           if (e.detail < 2) openLink(cell.link);
           return;
         }
+        if (selectionContains(view, hit.r, hit.c)) {
+          // Ctrl+click on a selected cell deselects it; dragging on deselects the cells passed over (Excel 365).
+          const base = view.sel;
+          startDrag('deselect', e, 0, { from: m, base });
+          deselectCells(view, base, cellArea(view, m.r, m.c));
+          return;
+        }
       }
       if (e.shiftKey) extendSelection(view, hit.r, hit.c, false);
       else selectCell(view, hit.r, hit.c, additive);
@@ -4053,17 +4150,20 @@ function onGridMouseDown(e) {
   }
 }
 
-/** @param {'cells' | 'rows' | 'cols'} mode @param {MouseEvent} e @param {number} anchor */
-function startDrag(mode, e, anchor) {
+/**
+ * @param {'cells' | 'rows' | 'cols' | 'deselect'} mode @param {MouseEvent} e @param {number} anchor
+ * @param {{ from: Cell, base: Selection }} [deselect]  mode 'deselect': the Ctrl+clicked cell and the selection before
+ */
+function startDrag(mode, e, anchor, deselect) {
   if (!G) return;
   // `last` = header index already applied (the mousedown handler selected up to the clicked header).
   const view = activeView();
   const L = /** @type {Layout} */ (view.L);
   const last = mode === 'rows' ? view.sel.cursor.r : mode === 'cols' ? view.sel.cursor.c : -1;
-  const from = view.sel.anchor;
+  const from = deselect ? deselect.from : view.sel.anchor;
   const frozenR = mode === 'cols' || (mode === 'rows' ? anchor : from.r) < L.fr;
   const frozenC = mode === 'rows' || (mode === 'cols' ? anchor : from.c) < L.fc;
-  G.drag = { mode, x: e.clientX, y: e.clientY, raf: 0, anchor, last, frozenR, frozenC };
+  G.drag = { mode, x: e.clientX, y: e.clientY, raf: 0, anchor, last, frozenR, frozenC, deselect: deselect ? { ...deselect, to: deselect.from } : undefined };
 }
 
 /**
@@ -4109,17 +4209,25 @@ function dragUpdate() {
   const vy = clamp(d.y - rect.top, min.y, Math.max(min.y, sc.clientHeight - 1));
   const hit = hitTest(vx, vy);
   if (d.mode === 'rows' || d.mode === 'cols') {
-    // Whole rows / columns from the drag anchor to the hovered header (re-snapped only when it changes).
+    // Whole rows / columns from the drag anchor to the hovered header (updated only when it changes); merged cells do
+    // not widen them (selectLines).
     const rows = d.mode === 'rows';
     const at = rows ? hit.r : hit.c;
     if (at === d.last) return;
     d.last = at;
     const lo = Math.min(d.anchor, at);
     const hi = Math.max(d.anchor, at);
-    const rg = snapRange(view, rows ? { r0: lo, r1: hi, c0: 0, c1: view.maxC - 1 } : { r0: 0, r1: view.maxR - 1, c0: lo, c1: hi });
+    /** @type {Range} */
+    const rg = rows ? { r0: lo, r1: hi, c0: 0, c1: view.maxC - 1 } : { r0: 0, r1: view.maxR - 1, c0: lo, c1: hi };
     const sel = view.sel;
     view.sel = { ranges: [...sel.ranges.slice(0, -1), rg], active: sel.active, anchor: sel.anchor, cursor: rows ? { r: at, c: 0 } : { r: 0, c: at } };
     selectionChanged(view, null);
+  } else if (d.deselect) {
+    // Ctrl+drag from a selected cell: the rectangle from it to the hovered cell is taken out of the first selection.
+    const ds = d.deselect;
+    if (hit.r === ds.to.r && hit.c === ds.to.c) return;
+    ds.to = { r: hit.r, c: hit.c };
+    deselectCells(view, ds.base, snapRange(view, rangeOf(ds.from, hit)));
   } else if (hit.r !== view.sel.cursor.r || hit.c !== view.sel.cursor.c) {
     extendSelection(view, hit.r, hit.c, false);
   }
@@ -4259,7 +4367,7 @@ function onGridWheel(e) {
   if (now - G.zoomWheelAt < 60) return;
   G.zoomWheelAt = now;
   const view = activeView();
-  setZoom(view.zoom + (e.deltaY < 0 ? 10 : -10));
+  setZoom(view.zoom + (e.deltaY < 0 ? WHEEL_ZOOM_STEP : -WHEEL_ZOOM_STEP));
 }
 
 /**
@@ -4320,7 +4428,9 @@ const announceActive = debounce(() => {
 
 /** @param {KeyboardEvent} e */
 function onGridKeyDown(e) {
-  if (!G || e.target !== G.dom.scroller || e.isComposing) return;
+  if (!G || e.isComposing) return;
+  // From <body>: onLostFocusKeyDown gave the grid its focus back.
+  if (e.target !== G.dom.scroller && !(e.target === document.body && document.activeElement === G.dom.scroller)) return;
   const view = activeView();
   const L = view.L;
   if (!L) return;
@@ -4384,10 +4494,24 @@ function onGridKeyDown(e) {
       hoverReset();
       closeMenu();
       return;
+    case 'F2': {
+      // Excel's F2 edits the active cell in place: here the read-only cell text box, caret at the end of the text.
+      if (ctrl || shift || e.altKey) return;
+      const m = masterOf(view, view.sel.active.r, view.sel.active.c);
+      openCellBox(view, m.r, m.c, true);
+      break;
+    }
+    case 'Backspace':
+      // Ctrl+Backspace scrolls the active cell into view; Shift+Backspace keeps only the active cell selected (Excel).
+      if (e.altKey || ctrl === shift) return;
+      if (ctrl) scrollCellIntoView(view, view.sel.active.r, view.sel.active.c);
+      else selectCell(view, view.sel.active.r, view.sel.active.c);
+      break;
     default: {
       const k = e.key.toLowerCase();
       if (ctrl && !e.altKey && k === 'a') selectRegionOrAll(view);
       else if (ctrl && !e.altKey && !shift && k === 'c') copySelectionFromKeyboard();
+      else if (ctrl && !e.altKey && !shift && e.key === '.') nextCorner(view);
       else return;
     }
   }
@@ -4403,7 +4527,7 @@ function onGridKeyDown(e) {
  * Keys that work wherever the focus is in the grid view (the grid's own handler runs first and stops what it
  * handles): F6 / Shift+F6 move between the view's regions like Excel's F6 (past the first / last region the key is
  * left to VS Code, whose F6 moves on to the next workbench part), Ctrl+G goes to the name box (Excel's Go To),
- * Ctrl+PageUp / PageDown switch sheets.
+ * Ctrl+PageUp / PageDown switch sheets, Ctrl+A selects no page text.
  * @param {KeyboardEvent} e
  */
 function onGridAppKeyDown(e) {
@@ -4421,9 +4545,42 @@ function onGridAppKeyDown(e) {
     // The tab strip was rebuilt: keep the focus on the (new) active tab; from the menu, go back to the grid.
     if (inTabs) /** @type {HTMLElement | null} */ (G.dom.tabStrip.querySelector('.fv-tab-active'))?.focus();
     else if (!focus || focus === document.body || !focus.isConnected) G.dom.scroller.focus({ preventScroll: true });
+  } else if (ctrl && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'a') {
+    // On a tab, a bar button or the menu, select-all would highlight the whole view's text (the browser's, or VS
+    // Code's run on the page): nothing to select there. The name box and the cell text box select their own text.
+    const t = /** @type {HTMLElement} */ (e.target);
+    if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA') return;
   } else return;
   e.preventDefault();
   e.stopPropagation();
+}
+
+/**
+ * A key pressed while the focus is lost on <body> (VS Code's context menu or the workbench took it, see
+ * wireGridEvents; or the focused element went away): the grid takes the focus back and handles the key, so the
+ * keyboard goes on working where it left off. When the cell text box had the focus, the box takes it back.
+ * @param {KeyboardEvent} e
+ */
+function onLostFocusKeyDown(e) {
+  if (!G || G.sheet < 0 || e.target !== document.body || e.defaultPrevented) return;
+  const box = G.cellBox;
+  if (box && G.lostFocus === box.el) {
+    box.menu = false;
+    box.el.focus({ preventScroll: true });
+    return;
+  }
+  G.dom.scroller.focus({ preventScroll: true });
+  onGridKeyDown(e);
+  if (!e.defaultPrevented) onGridAppKeyDown(e);
+}
+
+/** The frame got the focus back: the grid / cell text box that lost it to <body> takes it again. */
+function restoreLostFocus() {
+  const el = G?.lostFocus;
+  const focus = document.activeElement;
+  if (!G || !el || !el.isConnected || (focus && focus !== document.body)) return;
+  if (G.cellBox?.el === el) G.cellBox.menu = false;
+  el.focus({ preventScroll: true });
 }
 
 /**
@@ -4832,6 +4989,39 @@ function cycleInSelection(view, major, delta) {
 }
 
 /**
+ * Ctrl+. (Excel): the active cell moves clockwise to the next corner of its range (top-left, top-right, bottom-right,
+ * bottom-left; from a cell that is no corner, to the top-left one), and the range is now extended from that corner, so
+ * Shift+Arrow moves the opposite corner. The selection itself does not change.
+ * @param {SheetView} view
+ */
+function nextCorner(view) {
+  const sel = view.sel;
+  const n = sel.ranges.length;
+  // The range holding the active cell (the latest one that does).
+  let k = n - 1;
+  while (k > 0 && !selectionContainsIn([sel.ranges[k]], sel.active)) k--;
+  const rg = sel.ranges[k];
+  /** @type {Cell[]} */
+  const corners = [
+    { r: rg.r0, c: rg.c0 },
+    { r: rg.r0, c: rg.c1 },
+    { r: rg.r1, c: rg.c1 },
+    { r: rg.r1, c: rg.c0 },
+  ];
+  // A merged active cell is at every corner it covers: the next stop is the first corner clockwise after them.
+  const area = cellArea(view, sel.active.r, sel.active.c);
+  const inArea = corners.map((p) => selectionContainsIn([area], p));
+  if (inArea.every(Boolean)) return; // one cell or one merged area: no other corner
+  const next = inArea.some(Boolean) ? [0, 1, 2, 3].find((j) => !inArea[j] && inArea[(j + 3) % 4]) ?? 0 : 0;
+  const corner = corners[next];
+  const opposite = corners[(next + 2) % 4];
+  const active = masterOf(view, corner.r, corner.c);
+  // The range holding the active cell becomes the last one (the one Shift+Arrow / Shift+click extend).
+  const ranges = k === n - 1 ? sel.ranges : [...sel.ranges.slice(k + 1), ...sel.ranges.slice(0, k + 1)];
+  setSelection(view, ranges, active, { anchor: corner, cursor: opposite });
+}
+
+/**
  * PageUp / PageDown (Alt: left / right) like Excel: scrolls by the rows (columns) that fit on the screen, so every
  * page starts with a whole row, and moves the active cell by the same number of rows. Up undoes down.
  * @param {SheetView} view @param {number} dir @param {boolean} extend @param {boolean} horizontal
@@ -5010,9 +5200,14 @@ async function currentRegion(view, alive) {
 
 // ----- CLIPBOARD -----
 // Ctrl+C copies the selection as TSV (display text; fields with tab, newline or quote are quoted) plus a
-// simple HTML table. One cell (or one merged area) is copied as its display text alone: plain text, never quoted,
-// no table and no line break added. Rows that are not cached are fetched first, then written with the async
-// clipboard API.
+// simple HTML table. Hidden rows and columns (hidden in the file or by a filter) are left out, as in the text and
+// HTML Excel puts on the clipboard; a selection of hidden cells only keeps them. Text cells of a workbook are marked as
+// text in the HTML (mso-number-format, as Excel marks them), so pasting into Excel keeps '007', '1-2' or '=1+1' as text
+// instead of turning them into numbers, dates or formulas. A CSV file has no cell types: its fields are left to Excel's
+// paste, which converts them as Excel does when it opens the file. One cell (or one merged area) is copied as its
+// display text alone: plain text, never quoted, no table and no line break added. Rows that are not cached are fetched
+// first, then copied the same way (or written as plain text with the async clipboard API when the browser refuses a
+// copy event).
 
 /**
  * 'cell' = one cell or one merged area (plain text only), 'single' = one range, 'rows' / 'cols' = several ranges
@@ -5035,6 +5230,15 @@ function copySelectionFromKeyboard() {
     copyAsync(plan);
     return;
   }
+  copyPayload(payload);
+}
+
+/**
+ * Puts a payload on the clipboard through a copy event (text + HTML), else (execCommand refused, or no copy event
+ * reached onCopyEvent) as plain text with the async clipboard API.
+ * @param {{ text: string, html: string, cells: number }} payload
+ */
+function copyPayload(payload) {
   pendingCopy = payload;
   let ok = false;
   try {
@@ -5043,18 +5247,33 @@ function copySelectionFromKeyboard() {
     ok = false;
   }
   if (!ok || pendingCopy) {
-    // execCommand was refused (or no copy event fired): fall back to the async clipboard.
     pendingCopy = null;
-    writeClipboard(payload.text, plan.cells);
+    writeClipboard(payload.text, payload.cells);
   }
 }
 
-/** Native copy (context menu, Cmd+C forwarded by VS Code) while the grid has focus. @param {ClipboardEvent} e */
+/**
+ * Native copy (VS Code's context menu or Edit menu, Cmd+C forwarded by VS Code) while the grid has the focus, or
+ * while the focus is lost on <body> after the grid or the cell text box had it: VS Code's context menu takes the
+ * focus away before its Copy runs (see wireGridEvents). The box then gives its selected text.
+ * @param {ClipboardEvent} e
+ */
 function onCopyEvent(e) {
-  if (!G || document.activeElement !== G.dom.scroller || !e.clipboardData) return;
+  if (!G || !e.clipboardData) return;
+  const focus = document.activeElement;
+  const lost = !focus || focus === document.body ? G.lostFocus : null;
+  const box = G.cellBox;
+  if (box && lost === box.el) {
+    const text = box.el.value.slice(box.el.selectionStart, box.el.selectionEnd);
+    if (text) {
+      e.preventDefault();
+      e.clipboardData.setData('text/plain', text);
+    }
+    return;
+  }
+  if (focus !== G.dom.scroller && lost !== G.dom.scroller) return;
   let payload = pendingCopy;
   pendingCopy = null;
-  let cells = 0;
   if (!payload) {
     const plan = planCopy(activeView());
     if (typeof plan === 'string') {
@@ -5063,7 +5282,6 @@ function onCopyEvent(e) {
       return;
     }
     payload = buildCopyPayload(plan.view, plan.ranges, plan.mode, (r) => getRow(plan.view.index, r));
-    cells = plan.cells;
     if (!payload) {
       e.preventDefault();
       copyAsync(plan);
@@ -5073,7 +5291,7 @@ function onCopyEvent(e) {
   e.preventDefault();
   e.clipboardData.setData('text/plain', payload.text);
   if (payload.html) e.clipboardData.setData('text/html', payload.html);
-  setStatusMessage(cells || payload.cells ? `Copied ${formatCount(cells || payload.cells)} cell${(cells || payload.cells) === 1 ? '' : 's'}` : 'Copied', 'info');
+  setStatusMessage(payload.cells ? `Copied ${formatCount(payload.cells)} cell${payload.cells === 1 ? '' : 's'}` : 'Copied', 'info');
 }
 
 /**
@@ -5125,49 +5343,74 @@ function buildCopyPayload(view, ranges, mode, rowOf) {
     if (row === undefined) return null;
     return { text: displayText(row ? findCell(row.cells, c0) : null), html: '', cells: 1 };
   }
+  const sm = view.meta;
+  /** Rows (columns) of [a, b] that are not hidden; all of them when every one is hidden. */
+  const shown = (/** @type {number} */ a, /** @type {number} */ b, /** @type {Record<number, { hidden?: boolean }>} */ info) => {
+    /** @type {number[]} */
+    const out = [];
+    for (let i = a; i <= b; i++) if (info[i]?.hidden !== true) out.push(i);
+    if (out.length) return out;
+    for (let i = a; i <= b; i++) out.push(i);
+    return out;
+  };
   /** @type {string[][]} */
   const table = [];
-  /** @param {number} r @param {number} c0 @param {number} c1 @param {string[]} out */
-  const appendRow = (r, c0, c1, out) => {
+  /** Per table cell: a text cell (marked as text in the HTML). @type {boolean[][]} */
+  const isText = [];
+  const markText = G?.kind === 'sheet';
+  /** @param {number} r @param {number[]} cols ascending @param {string[]} out @param {boolean[]} outText */
+  const appendRow = (r, cols, out, outText) => {
     const row = rowOf(r);
     if (row === undefined) return false;
     const cells = row ? row.cells : NO_CELLS;
-    let i = lowerBound(cells, c0);
-    for (let c = c0; c <= c1; c++) {
+    let i = cols.length ? lowerBound(cells, cols[0]) : 0;
+    for (const c of cols) {
+      while (i < cells.length && cells[i].c < c) i++;
       let text = '';
+      let str = false;
       if (i < cells.length && cells[i].c === c) {
         const cell = cells[i++];
         const covered = view.mergeIndex.size && mergeAt(view, r, c) >= 0 && !(masterOf(view, r, c).r === r && masterOf(view, r, c).c === c);
-        if (!covered) text = displayText(cell);
+        if (!covered) {
+          text = displayText(cell);
+          str = markText && cell.t === 's' && text !== '';
+        }
       }
       out.push(text);
+      outText.push(str);
     }
     return true;
   };
   if (mode === 'cols') {
     const { r0, r1 } = ranges[0];
-    for (let r = r0; r <= r1; r++) {
+    const colsOf = ranges.map((rg) => shown(rg.c0, rg.c1, sm.cols));
+    for (const r of shown(r0, r1, sm.rows)) {
       /** @type {string[]} */
       const out = [];
-      for (const rg of ranges) if (!appendRow(r, rg.c0, rg.c1, out)) return null;
+      /** @type {boolean[]} */
+      const outText = [];
+      for (const cols of colsOf) if (!appendRow(r, cols, out, outText)) return null;
       table.push(out);
+      isText.push(outText);
     }
   } else {
     for (const rg of ranges) {
-      for (let r = rg.r0; r <= rg.r1; r++) {
+      const cols = shown(rg.c0, rg.c1, sm.cols);
+      for (const r of shown(rg.r0, rg.r1, sm.rows)) {
         /** @type {string[]} */
         const out = [];
-        if (!appendRow(r, rg.c0, rg.c1, out)) return null;
+        /** @type {boolean[]} */
+        const outText = [];
+        if (!appendRow(r, cols, out, outText)) return null;
         table.push(out);
+        isText.push(outText);
       }
     }
   }
   const quote = (/** @type {string} */ s) => (/[\t\r\n"]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
   const text = table.map((row) => row.map(quote).join('\t')).join('\r\n');
-  const html =
-    '<meta charset="utf-8"><table>' +
-    table.map((row) => '<tr>' + row.map((s) => `<td>${escapeHtml(s).replace(/\r?\n/g, '<br>')}</td>`).join('') + '</tr>').join('') +
-    '</table>';
+  const td = (/** @type {string} */ s, /** @type {boolean} */ str) => `<td${str ? ` style="mso-number-format:'\\@'"` : ''}>${escapeHtml(s).replace(/\r?\n/g, '<br>')}</td>`;
+  const html = '<meta charset="utf-8"><table>' + table.map((row, i) => '<tr>' + row.map((s, j) => td(s, isText[i][j])).join('') + '</tr>').join('') + '</table>';
   return { text, html, cells: table.length * (table[0]?.length ?? 0) };
 }
 
@@ -5194,7 +5437,7 @@ async function copyAsync(plan) {
     const rows = await fetchRows(plan.view.index, r0, r1, { c0, c1 });
     if (G !== grid) return;
     const payload = buildCopyPayload(plan.view, plan.ranges, plan.mode, (r) => rows.get(r) ?? null);
-    if (payload) await writeClipboard(payload.text, plan.cells);
+    if (payload) copyPayload(payload);
   } catch (err) {
     setStatusMessage(`Copy failed: ${err instanceof Error ? err.message : String(err)}`, 'warn');
   }
@@ -5230,6 +5473,8 @@ async function writeClipboard(text, cells) {
  * @property {number} st         scroller position when it opened: a scroll event at that position keeps it open
  * @property {number} sl
  * @property {boolean} loaded    the cell's row was loaded (else onRows fills the text in when it arrives)
+ * @property {boolean} menu      a context menu was opened on it and the focus has not come back since: VS Code's menu
+ *   takes the focus away (to <body>), which must not close the box (its Copy copies the box's selected text)
  */
 
 /** @param {MouseEvent} e */
@@ -5249,10 +5494,12 @@ function onGridDblClick(e) {
 }
 
 /**
- * Opens (or re-opens) the read-only text box of a cell.
+ * Opens (or re-opens) the read-only text box of a cell: all of its text selected (double-click), or the caret at the
+ * end of the text (F2, as Excel's in-cell edit puts it).
  * @param {SheetView} view @param {number} r @param {number} c  top-left cell of the cell / merged area
+ * @param {boolean} [caretAtEnd]
  */
-function openCellBox(view, r, c) {
+function openCellBox(view, r, c, caretAtEnd = false) {
   const g = /** @type {GridState} */ (G);
   closeCellBox(false);
   const host = g.dom.scroller.parentElement;
@@ -5273,15 +5520,19 @@ function openCellBox(view, r, c) {
       autocomplete: 'off',
       'aria-label': `${colName(c)}${r + 1} cell text, read-only`,
       onkeydown: (/** @type {KeyboardEvent} */ e) => {
+        if (G?.cellBox?.el === el) G.cellBox.menu = false;
         if (e.isComposing || (e.key !== 'Escape' && e.key !== 'Enter' && e.key !== 'Tab')) return;
         e.preventDefault();
         e.stopPropagation();
         closeCellBox();
       },
       // Focus moving elsewhere in the view (F6, Ctrl+G, a click on the name box) closes it; switching to another
-      // window keeps it, and the browser gives it the focus back.
+      // window keeps it, and the browser gives it the focus back. So does VS Code's context menu on it.
       onblur: () => {
-        if (G?.cellBox?.el === el && document.hasFocus()) closeCellBox(false);
+        if (G?.cellBox?.el === el && document.hasFocus() && !G.cellBox.menu) closeCellBox(false);
+      },
+      oncontextmenu: () => {
+        if (G?.cellBox?.el === el) G.cellBox.menu = true;
       },
       onwheel: (/** @type {WheelEvent} */ e) => onCellBoxWheel(e, el),
       onbeforeinput: (/** @type {Event} */ e) => e.preventDefault(),
@@ -5299,12 +5550,12 @@ function openCellBox(view, r, c) {
   );
   el.value = text;
   const sc = g.dom.scroller;
-  g.cellBox = { el, sheet: view.index, r, c, st: sc.scrollTop, sl: sc.scrollLeft, loaded: cell !== undefined };
+  g.cellBox = { el, sheet: view.index, r, c, st: sc.scrollTop, sl: sc.scrollLeft, loaded: cell !== undefined, menu: false };
   host.appendChild(el);
   layoutCellBox(view, el, r, c, cell);
   el.focus({ preventScroll: true });
-  el.setSelectionRange(0, el.value.length);
-  el.scrollTop = 0;
+  el.setSelectionRange(caretAtEnd ? el.value.length : 0, el.value.length);
+  el.scrollTop = caretAtEnd ? el.scrollHeight : 0;
 }
 
 /**
@@ -5699,7 +5950,15 @@ function ensureTabVisible(tab) {
 function scrollTabs(dir) {
   if (!G) return;
   const strip = G.dom.tabStrip;
-  strip.scrollBy({ left: dir * Math.max(80, strip.clientWidth * 0.6), behavior: 'smooth' });
+  strip.scrollBy({ left: dir * Math.max(80, strip.clientWidth * 0.6), behavior: reduceMotion() ? 'auto' : 'smooth' });
+}
+
+/**
+ * Animations are off: the OS setting (media query) or VS Code's "Reduce Motion" (workbench.reduceMotion), which
+ * reaches the webview only as the body class vscode-reduce-motion.
+ */
+function reduceMotion() {
+  return document.body.classList.contains('vscode-reduce-motion') || window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 
 function updateTabArrows() {
@@ -5892,6 +6151,12 @@ function buildFormulaBar() {
     if ((e.key === 'Escape' || e.key === 'Enter') && !e.ctrlKey && !e.altKey && !e.metaKey) {
       e.preventDefault();
       G?.dom.scroller.focus({ preventScroll: true });
+    } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'a') {
+      // Select all = the formula text, as in a text box (the page's select-all would take the whole view). Not
+      // passed on: VS Code would run its own select-all on the page.
+      e.preventDefault();
+      e.stopPropagation();
+      window.getSelection()?.selectAllChildren(formula);
     }
   });
   const bar = h(
@@ -5976,7 +6241,22 @@ function setStatusMessage(text, kind, ms = 4000) {
   statusMsgTimer = ms ? setTimeout(() => G && (G.dom.statusMsg.textContent = ''), ms) : undefined;
 }
 
-/** Selection statistics via getStats, debounced. Single cells show nothing (like Excel). */
+/**
+ * Selection statistics being gathered: the getStats requests not answered yet, the sum of the answers so far, how many
+ * requests were sent and whether ranges were left out (more hidden-row gaps than the requests carry).
+ * @typedef {{ ids: Set<number>, stats: SelectionStats, requests: number, cut: boolean }} StatsRequest
+ */
+
+/** Most ranges one getStats request carries (the host reads the first 1,024: MAX_STATS_RANGES in viewerProvider.ts). */
+const STATS_MAX_RANGES = 1024;
+/** Most getStats requests for one selection; a selection split into more ranges is aggregated only partly. */
+const STATS_MAX_REQUESTS = 16;
+
+/**
+ * Selection statistics via getStats, debounced. Single cells show nothing (like Excel). Hidden rows (hidden in the
+ * file or by a filter) are left out like in Excel's status bar (hidden columns are counted there): the ranges are
+ * split around them, over several requests when there are many gaps.
+ */
 const scheduleStats = debounce(() => {
   if (!G || G.sheet < 0) return;
   const view = activeView();
@@ -5986,7 +6266,7 @@ const scheduleStats = debounce(() => {
   const r = sel.ranges[0];
   const single = sel.ranges.length === 1 && r.r0 === area.r0 && r.r1 === area.r1 && r.c0 === area.c0 && r.c1 === area.c1;
   if (single) {
-    G.statsReq = 0;
+    G.statsReq = null;
     clearStats();
     return;
   }
@@ -5997,16 +6277,86 @@ const scheduleStats = debounce(() => {
     const c1 = Math.min(rg.c1, sm.colCount - 1);
     if (rg.r0 <= r1 && rg.c0 <= c1) ranges.push({ r0: rg.r0, c0: rg.c0, r1, c1 });
   }
-  if (!ranges.length) {
-    G.statsReq = 0;
+  const parts = withoutHiddenRows(hiddenRowsOf(sm), ranges);
+  if (!parts.length) {
+    G.statsReq = null;
     clearStats();
     return;
   }
-  const reqId = ++G.statsSeq;
-  G.statsReq = reqId;
+  const sent = Math.min(parts.length, STATS_MAX_RANGES * STATS_MAX_REQUESTS);
+  /** @type {StatsRequest} */
+  const req = { ids: new Set(), stats: { count: 0, numCount: 0, sum: 0 }, requests: 0, cut: sent < parts.length };
+  G.statsReq = req;
   G.dom.statusStats.classList.add('fv-pending');
-  post({ type: 'getStats', reqId, sheet: view.index, ranges });
+  for (let i = 0; i < sent; i += STATS_MAX_RANGES) {
+    const reqId = ++G.statsSeq;
+    req.ids.add(reqId);
+    req.requests++;
+    post({ type: 'getStats', reqId, sheet: view.index, ranges: parts.slice(i, Math.min(sent, i + STATS_MAX_RANGES)) });
+  }
 }, STATS_DEBOUNCE_MS);
+
+/** Hidden rows of a sheet (the host marks zero-height rows hidden too), ascending. @type {WeakMap<SheetMeta, number[]>} */
+const hiddenRowCache = new WeakMap();
+
+/** @param {SheetMeta} sm */
+function hiddenRowsOf(sm) {
+  let out = hiddenRowCache.get(sm);
+  if (!out) {
+    out = [];
+    for (const key in sm.rows) if (sm.rows[key].hidden === true) out.push(Number(key));
+    out.sort((a, b) => a - b);
+    hiddenRowCache.set(sm, out);
+  }
+  return out;
+}
+
+/**
+ * The ranges without their hidden rows (the same array when none of them holds one), else as disjoint ranges ascending
+ * by row: like the host's forEachRangeRow, the rows are cut into bands covered by the same ranges and each band's
+ * column spans are merged, so cells of overlapping ranges still count once when the ranges go out in several requests.
+ * @param {number[]} hidden ascending @param {Range[]} ranges
+ * @returns {Range[]}
+ */
+function withoutHiddenRows(hidden, ranges) {
+  /** Index of the first hidden row at or after row r. */
+  const from = (/** @type {number} */ r) => {
+    let lo = 0;
+    let hi = hidden.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (hidden[mid] < r) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+  const holds = (/** @type {Range} */ rg) => {
+    const i = from(rg.r0);
+    return i < hidden.length && hidden[i] <= rg.r1;
+  };
+  if (!ranges.some(holds)) return ranges;
+  /** @type {Range[]} */
+  const out = [];
+  const cuts = [...new Set(ranges.flatMap((rg) => [rg.r0, rg.r1 + 1]))].sort((a, b) => a - b);
+  for (let k = 0; k + 1 < cuts.length; k++) {
+    const top = cuts[k];
+    const bottom = cuts[k + 1] - 1;
+    /** @type {[number, number][]} */
+    const spans = [];
+    for (const rg of ranges.filter((g) => g.r0 <= top && g.r1 >= bottom).sort((a, b) => a.c0 - b.c0)) {
+      const last = spans[spans.length - 1];
+      if (last && rg.c0 <= last[1] + 1) last[1] = Math.max(last[1], rg.c1);
+      else spans.push([rg.c0, rg.c1]);
+    }
+    // Runs of visible rows between the band's hidden rows.
+    for (let i = from(top), start = top; start <= bottom; i++) {
+      const end = i < hidden.length && hidden[i] <= bottom ? hidden[i] - 1 : bottom;
+      if (start <= end) for (const [c0, c1] of spans) out.push({ r0: start, r1: end, c0, c1 });
+      start = end + 2;
+    }
+  }
+  return out;
+}
 
 /** Empties the selection statistics (no stats for a single cell or an empty selection). */
 function clearStats() {
@@ -6026,26 +6376,47 @@ function onStats(msg) {
     probe.resolve(msg.stats.count);
     return;
   }
-  if (msg.reqId !== G.statsReq) return;
-  const s = msg.stats;
+  const req = G.statsReq;
+  if (!req || !req.ids.delete(msg.reqId)) return;
+  // The answers of a selection split over several requests add up.
+  const s = req.stats;
+  const m = msg.stats;
+  // Sum / Average / Min / Max in the first numeric cell's format (SelectionStats.text) come formatted from the host for
+  // the cells of one request: kept when a single answer holds numbers, else the numbers are shown in our own format.
+  if (m.numCount) s.text = s.numCount ? undefined : m.text;
+  s.count += m.count;
+  s.numCount += m.numCount;
+  s.sum += m.sum;
+  if (m.errors) s.errors = (s.errors ?? 0) + m.errors;
+  if (m.min !== undefined) s.min = s.min === undefined ? m.min : Math.min(s.min, m.min);
+  if (m.max !== undefined) s.max = s.max === undefined ? m.max : Math.max(s.max, m.max);
+  if (m.partial) (s.partial = true), (s.scanned = (s.scanned ?? 0) + (m.scanned ?? 0));
+  if (req.ids.size) return;
+  G.statsReq = null;
+  if (s.numCount) s.avg = s.sum / s.numCount;
   const el = G.dom.statusStats;
   el.classList.remove('fv-pending');
-  // A selection larger than the host's work cap is aggregated only partly (SelectionStats.partial): say so.
-  const partial = s.partial === true;
+  // A selection larger than the host's work cap (SelectionStats.partial) or split into more ranges than the requests
+  // carry is aggregated only partly: say so.
+  const partial = s.partial === true || req.cut;
   const mark = partial ? ' (partial)' : '';
   /** @type {[string, string][]} */
   const items = [];
   if (s.count > 0) items.push([`Count${mark}`, formatCount(s.count)]);
-  if (s.numCount > 0) {
-    items.push([`Sum${mark}`, formatStat(s.sum)]);
-    if (s.avg !== undefined) items.push([`Average${mark}`, formatStat(s.avg)]);
-    if (s.min !== undefined) items.push([`Min${mark}`, formatStat(s.min)]);
-    if (s.max !== undefined) items.push([`Max${mark}`, formatStat(s.max)]);
+  // Like Excel, a selection with an error value (#DIV/0!, #N/A ...) shows only Count.
+  if (s.numCount > 0 && !s.errors) {
+    const text = s.text;
+    items.push([`Sum${mark}`, text?.sum ?? formatStat(s.sum)]);
+    if (s.avg !== undefined) items.push([`Average${mark}`, text?.avg ?? formatStat(s.avg)]);
+    if (s.min !== undefined) items.push([`Min${mark}`, text?.min ?? formatStat(s.min)]);
+    if (s.max !== undefined) items.push([`Max${mark}`, text?.max ?? formatStat(s.max)]);
   }
   el.classList.toggle('fv-stats-partial', partial);
-  el.title = partial
-    ? `The selection is too large to aggregate completely: these values cover only its first ${formatCount(s.scanned ?? 0)} cells (row by row).`
-    : '';
+  el.title = !partial
+    ? ''
+    : req.requests === 1 && !req.cut
+      ? `The selection is too large to aggregate completely: these values cover only its first ${formatCount(s.scanned ?? 0)} cells (row by row).`
+      : 'The selection is too large to aggregate completely: these values cover only part of it.';
   el.replaceChildren(...items.map(([label, value]) => h('span', { class: 'fv-stat' }, h('span', { class: 'fv-stat-label' }, `${label}:`), ' ', h('span', { class: 'fv-stat-value' }, value))));
 }
 
@@ -6072,7 +6443,8 @@ function formatCount(n) {
 //   - mermaid diagrams: lazy `import('mermaid')`, rendered when they come near the viewport (IntersectionObserver),
 //     one at a time with event-loop yields, SVG cached per source+theme; the theme is derived from the --vscode-*
 //     colours and diagrams are re-themed whenever they change; until rendered a diagram is an empty sized placeholder
-//   - copy buttons on every `pre > code` block (result announced through a polite live region)
+//   - copy buttons on every `pre > code` block, copying the code exactly as shown (result announced through a polite
+//     live region)
 //   - task checkboxes -> `toggleTask`, answered by `toggleTaskResult` (serialized: one edit per document version,
 //     quick clicks are queued; only the renderer's own checkboxes count)
 //   - link routing: `#anchor` scrolls inside the article and moves the focus there, anything else -> `openLink`
@@ -6093,7 +6465,9 @@ function formatCount(n) {
 /**
  * @typedef {{ level: number, text: string, slug: string, line: number }} MdTocEntry
  * @typedef {{ type?: string, kind?: string, fileName?: string, html: string, toc?: MdTocEntry[], source?: string,
- *   mode?: string, version: number }} MdMessage  Fields shared by `init` (kind 'markdown') and `markdownUpdate`.
+ *   mode?: string, version: number, readOnly?: boolean }} MdMessage  Fields shared by `init` (kind 'markdown') and
+ *   `markdownUpdate` (`readOnly`: the document cannot be edited, task checkboxes are disabled; an update without it
+ *   keeps the current state).
  * @typedef {{ key: string, dark: boolean, variables: Record<string, string | boolean> }} MdMermaidTheme
  *   Mermaid 'base' theme whose themeVariables are derived from the VS Code theme's colours (see mdMermaidTheme);
  *   `key` identifies it in the SVG cache and tells when diagrams must be re-themed.
@@ -6102,9 +6476,10 @@ function formatCount(n) {
  * @typedef {{ line: number, checked: boolean, version: number }} MdToggle
  *   A task toggle: source line, requested state, version of the article it applies to.
  * @typedef {Extract<HostMessage, { type: 'toggleTaskResult' }>} MdToggleResult
- * @typedef {{ anchor: Element | null, offset: number, top: number | null }} MdScrollKeeper
+ * @typedef {{ anchor: Element | null, offset: number, top: number | null, until: number }} MdScrollKeeper
  *   Scroll position held through late layout changes (images, diagrams) until the user scrolls himself: `anchor`
- *   stays `offset` px below the top of the view; without an anchor, scrollTop stays `top` (null: nothing held).
+ *   stays `offset` px below the top of the view; without an anchor, scrollTop stays `top` (null: nothing held). Until
+ *   `until` (performance.now()), any size change of the content puts it back too (see mdHoldOnResize).
  * @typedef {{ line: number | null, offset: number, top: number }} MdSavedScroll
  *   Persisted view position: top-level block starting at source `line`, `offset` px from the top of the view.
  */
@@ -6119,6 +6494,11 @@ const MD_ID_PREFIX = 'user-content-';
 const MD_STATE_SCROLL_KEY = 'markdownScroll';
 const DOCX_STATE_SCROLL_KEY = 'docxScrollTop';
 const MD_SCROLL_SAVE_MS = 200;
+/**
+ * How long after a position is set (restore, update, in-page jump) a size change of the content puts it back: blocks of a
+ * large document get their real height (content-visibility) only in the frames after they come near the view.
+ */
+const MD_SCROLL_SETTLE_MS = 1000;
 /** On update, how long to wait for changed on-screen diagrams before swapping anyway (they then finish in place). */
 const MD_DIAGRAM_SWAP_WAIT_MS = 800;
 /** At most this many changed diagrams are rendered before an update is swapped in; the rest render lazily. */
@@ -6186,12 +6566,14 @@ const mdState = {
   toc: [],
   /** Latest TextDocument.version received from the host. */
   version: 0,
+  /** The document is read-only (a git: version, a file VS Code shows read-only): task checkboxes are disabled. */
+  readOnly: false,
   /** Bumped on every render; async work belonging to an older render is dropped. */
   generation: 0,
   /** Mermaid theme of the diagrams on screen (set by every render). @type {MdMermaidTheme} */
   theme: { key: '', dark: false, variables: {} },
   /** @type {MdScrollKeeper} */
-  scroll: { anchor: null, offset: 0, top: null },
+  scroll: { anchor: null, offset: 0, top: null, until: 0 },
   /** Watches the diagrams of the current article; renders them when they get near the viewport. */
   diagramObserver: /** @type {IntersectionObserver | null} */ (null),
   /** Measures rendered diagrams (placeholder height of their next render). */
@@ -6281,6 +6663,7 @@ function showMarkdown(msg) {
     mdBlocks = [...blocks, ...deferred];
     root.replaceChildren(view);
 
+    mdHoldOnResize(view, article, mdState.scroll);
     mdRestoreScroll(view, article, saved);
     mdWatchDiagrams([article], []);
     mdTasksAfterRender(article);
@@ -6318,6 +6701,7 @@ function updateMarkdown(msg) {
       kind: 'markdown',
       fileName: msg.fileName || mdState.fileName,
       mode: msg.mode || mdState.mode,
+      readOnly: typeof msg.readOnly === 'boolean' ? msg.readOnly : mdState.readOnly,
     });
     return;
   }
@@ -6341,10 +6725,12 @@ function updateMarkdown(msg) {
 }
 
 /**
- * Records the per-message fields (version, toc, source) of an init/update.
+ * Records the per-message fields (version, toc, source, read-only) of an init/update.
  * @param {MdMessage} msg
  */
 function mdAcceptMessage(msg) {
+  if (msg.type === 'init') mdState.readOnly = msg.readOnly === true;
+  else if (typeof msg.readOnly === 'boolean') mdState.readOnly = msg.readOnly;
   mdState.version = Number.isFinite(msg.version) ? msg.version : mdState.version;
   mdState.toc = Array.isArray(msg.toc) ? msg.toc : [];
   mdState.source = typeof msg.source === 'string' ? msg.source : '';
@@ -6407,7 +6793,9 @@ function mdMaterializeBlocks(raws, theme, staging) {
   const holder = document.createElement('div');
   if (staging) staging.append(holder);
   holder.innerHTML = sanitize(markup.join(''), MD_SANITIZE_OPTIONS);
+  mdHardenCodeBlocks(holder);
   mdAddCopyButtons(holder);
+  mdSetTasksReadOnly(holder);
   for (const div of mdCollectDiagrams(holder)) mdShowCachedDiagram(div, theme);
   for (const wrapper of Array.from(holder.children)) {
     const block = blocks[Number(wrapper.getAttribute('data-md-block'))];
@@ -6665,11 +7053,7 @@ async function mdPatchArticle(html) {
   article.dataset.version = String(mdState.version); // the latest version that rendered to this html
   mdState.pending = null;
 
-  const keeper = mdState.scroll;
-  keeper.anchor = anchor ? anchor.anchor : null;
-  keeper.offset = anchor ? anchor.offset : 0;
-  keeper.top = null;
-  mdHoldScroll(view, keeper);
+  mdKeepScroll(view, mdState.scroll, anchor ? anchor.anchor : null, anchor ? anchor.offset : 0, null);
   mdRestoreFocus(focus, view);
   mdWatchDiagrams(Array.from(added, (block) => block.nodes).flat(), removedNodes);
   mdTasksAfterRender(article);
@@ -6837,7 +7221,7 @@ function mdNearestElement(index, step) {
  */
 function mdCreateScrollKeeper(view, saveState) {
   /** @type {MdScrollKeeper} */
-  const keeper = { anchor: null, offset: 0, top: null };
+  const keeper = { anchor: null, offset: 0, top: null, until: 0 };
   const release = () => {
     keeper.anchor = null;
     keeper.top = null;
@@ -6858,6 +7242,40 @@ function mdCreateScrollKeeper(view, saveState) {
   // Images that finish loading late change the height of the content above: put the held position back.
   view.addEventListener('load', () => mdHoldScroll(view, keeper), true);
   return keeper;
+}
+
+/**
+ * Holds a new position (`anchor` at `offset` px below the top of the view, or scrollTop `top` without an anchor) and
+ * applies it now.
+ * @param {HTMLElement} view
+ * @param {MdScrollKeeper} keeper
+ * @param {Element | null} anchor
+ * @param {number} offset
+ * @param {number | null} top
+ */
+function mdKeepScroll(view, keeper, anchor, offset, top) {
+  keeper.anchor = anchor;
+  keeper.offset = offset;
+  keeper.top = anchor ? null : top;
+  keeper.until = performance.now() + MD_SCROLL_SETTLE_MS;
+  mdHoldScroll(view, keeper);
+}
+
+/**
+ * Puts a held position back when the content changes size within MD_SCROLL_SETTLE_MS of being set. In a large document
+ * the blocks are laid out with an estimated height (content-visibility: auto) until they come near the view; when they
+ * get their real height, the held block would otherwise move away (a reload restored the view sections away from where
+ * the user was, a jump landed lower than the scroll padding).
+ * @param {HTMLElement} view
+ * @param {Element} content the article / page (its height changes with any block's)
+ * @param {MdScrollKeeper} keeper
+ */
+function mdHoldOnResize(view, content, keeper) {
+  const observer = new ResizeObserver(() => {
+    if (performance.now() <= keeper.until) mdHoldScroll(view, keeper);
+  });
+  observer.observe(content);
+  onDispose(() => observer.disconnect());
 }
 
 /**
@@ -6928,23 +7346,33 @@ function mdBlockLine(block) {
 
 /**
  * Persists the view position as "block at source line N, offset px from the top" (survives edits and reloads
- * better than a pixel offset, and works with content-visibility estimates).
+ * better than a pixel offset, and works with content-visibility estimates). The block is the first one that starts
+ * inside the view (it is laid out at once when the position is restored), else the one the view starts in.
  * @param {HTMLElement} view
  */
 function mdSaveScroll(view) {
   const article = mdState.article;
   if (!article || view !== mdState.view) return;
   const blocks = Array.from(article.children);
-  const viewTop = view.getBoundingClientRect().top;
+  const viewRect = view.getBoundingClientRect();
   /** @type {MdSavedScroll} */
   const saved = { line: null, offset: 0, top: Math.round(view.scrollTop) };
-  for (let i = Math.min(mdFirstVisibleBlock(view, blocks), blocks.length - 1); i >= 0; i--) {
+  const first = Math.min(mdFirstVisibleBlock(view, blocks), blocks.length - 1);
+  /** @param {number} i */
+  const pick = (i) => {
     const line = mdBlockLine(blocks[i]);
-    if (line === null) continue;
+    if (line === null) return false;
     saved.line = line;
-    saved.offset = Math.round(blocks[i].getBoundingClientRect().top - viewTop);
-    break;
+    saved.offset = Math.round(blocks[i].getBoundingClientRect().top - viewRect.top);
+    return true;
+  };
+  let found = false;
+  for (let i = first; i >= 0 && i < blocks.length && !found; i++) {
+    const top = blocks[i].getBoundingClientRect().top;
+    if (top >= viewRect.bottom) break;
+    if (top >= viewRect.top) found = pick(i);
   }
+  for (let i = first; i >= 0 && !found; i--) found = pick(i);
   setStateKey(MD_STATE_SCROLL_KEY, saved);
 }
 
@@ -6982,16 +7410,14 @@ function mdRestoreScroll(view, article, saved) {
       anchor = block;
     }
   }
-  const keeper = mdState.scroll;
-  if (anchor) {
-    keeper.anchor = anchor;
-    keeper.offset = saved.offset;
-    keeper.top = null;
-  } else {
-    keeper.anchor = null;
-    keeper.top = saved.top;
+  if (anchor instanceof HTMLElement && article.classList.contains('md-large')) {
+    // Laid out for real now, not with the content-visibility estimate: even a block taller than the view, which starts
+    // above it, lands where it was (an estimated one could stay out of view and never get its real height).
+    const block = anchor;
+    block.style.contentVisibility = 'visible';
+    window.setTimeout(() => block.style.removeProperty('content-visibility'), MD_SCROLL_SETTLE_MS);
   }
-  mdHoldScroll(view, keeper);
+  mdKeepScroll(view, mdState.scroll, anchor, saved.offset, saved.top);
 }
 
 // ----- MARKDOWN: MERMAID -----
@@ -7520,9 +7946,45 @@ function mdCacheSet(key, value) {
 }
 
 // ----- MARKDOWN: CODE COPY -----
+// A copy button copies exactly the code that is shown (no pastejacking): only the buttons this section made count, each
+// copies its own <code> as rendered (innerText: no display:none / hidden / closed <details> text), and a code block of
+// the document keeps no attribute or class that could hide, shrink, recolour or move part of its text while it is still
+// rendered (GitHub's sanitizer removes these too).
 
 /** @type {WeakMap<HTMLButtonElement, number>} */
 const mdCopyTimers = new WeakMap();
+/** Copy buttons made by mdAddCopyButtons -> the <code> each one copies. @type {WeakMap<HTMLButtonElement, HTMLElement>} */
+const mdCopySources = new WeakMap();
+/** Wrappers made by mdAddCopyButtons. @type {WeakSet<Element>} */
+const mdCodeBlocks = new WeakSet();
+/** Attributes kept on a code block (the <pre> and everything in it); `class` is filtered with MD_CODE_CLASS_RE. */
+const MD_CODE_ATTR_RE = /^(?:href|title|lang|id|name|open|hidden|data-[^\s=]+)$/i;
+/** highlight.js classes (tokens, sub-scopes such as `title function_`, the language). */
+const MD_CODE_CLASS_RE = /^(?:hljs(?:-[\w-]+)?|language-\S+|[a-z]+_+)$/;
+
+/**
+ * Sanitized document content: code blocks that get a copy button keep only MD_CODE_ATTR_RE attributes and
+ * highlight.js classes (no `style`, `color`, `size`, stylesheet classes such as fv-sr-only), and buttons of the document
+ * lose the copy button look (they copy nothing, see mdOnClick).
+ * @param {ParentNode} container
+ */
+function mdHardenCodeBlocks(container) {
+  container.querySelectorAll('pre').forEach((pre) => {
+    if (!pre.querySelector(':scope > code')) return;
+    for (const el of [pre, ...Array.from(pre.querySelectorAll('*'))]) {
+      for (const attr of Array.from(el.attributes)) {
+        if (attr.name === 'class') {
+          const kept = Array.from(el.classList).filter((name) => MD_CODE_CLASS_RE.test(name));
+          if (kept.length) el.setAttribute('class', kept.join(' '));
+          else el.removeAttribute('class');
+        } else if (!MD_CODE_ATTR_RE.test(attr.name)) {
+          el.removeAttribute(attr.name);
+        }
+      }
+    }
+  });
+  container.querySelectorAll('.md-copy-button').forEach((el) => el.classList.remove('md-copy-button'));
+}
 
 /**
  * Copy button states: visible label (`data-label`, drawn by CSS as generated content, so it is never part of a text
@@ -7539,15 +8001,18 @@ const MD_COPY_STATES = {
  * @param {ParentNode} container
  */
 function mdAddCopyButtons(container) {
-  container.querySelectorAll('pre > code').forEach((code) => {
+  container.querySelectorAll('pre > code').forEach((el) => {
+    const code = /** @type {HTMLElement} */ (el);
     const pre = code.parentElement;
     const parent = pre && pre.parentElement;
-    if (!pre || !parent || parent.classList.contains('md-code-block')) return;
+    if (!pre || !parent || mdCodeBlocks.has(parent)) return; // the first <code> of a <pre> only
     if (pre.closest('table.front-matter')) return; // raw YAML values: no copy affordance inside the metadata table
     const block = h('div', { class: 'md-code-block' });
+    mdCodeBlocks.add(block);
     parent.insertBefore(block, pre);
     const button = /** @type {HTMLButtonElement} */ (h('button', { class: 'md-copy-button', type: 'button', title: 'Copy code' }));
     mdSetCopyState(button, MD_COPY_STATES.idle);
+    mdCopySources.set(button, code);
     block.append(pre, button);
   });
 }
@@ -7565,12 +8030,13 @@ function mdSetCopyState(button, state) {
  * @param {HTMLButtonElement} button
  */
 async function mdCopyCode(button) {
-  const code = button.parentElement && button.parentElement.querySelector('pre > code');
+  const code = mdCopySources.get(button);
   if (!code) return;
-  const text = (code.textContent || '').replace(/\n$/, '');
   let ok = true;
   try {
-    await mdWriteClipboard(text);
+    // innerText of an element that is not rendered is its whole textContent: copy nothing then.
+    if (!code.getClientRects().length) throw new Error('The code block is not shown.');
+    await mdWriteClipboard(code.innerText.replace(/\n$/, ''));
   } catch {
     ok = false;
   }
@@ -7656,8 +8122,13 @@ const mdTasks = {
   timer: 0,
 };
 
+/** Task checkboxes disabled because the document is read-only (mdSetTasksReadOnly). @type {WeakSet<HTMLInputElement>} */
+const mdReadOnlyTasks = new WeakSet();
+const MD_READ_ONLY_TASK_TITLE = 'Read-only document';
+
 /**
- * A checkbox the renderer produced for a task item (not raw HTML: disabled; not part of a diagram).
+ * A checkbox the renderer produced for a task item (not raw HTML: disabled; not part of a diagram). A read-only
+ * document's task checkboxes are disabled too, but still count (they show the document's state).
  * @param {Element} el
  * @returns {el is HTMLInputElement}
  */
@@ -7666,9 +8137,29 @@ function mdIsTaskCheckbox(el) {
     el instanceof HTMLInputElement &&
     el.classList.contains('task-list-item-checkbox') &&
     el.hasAttribute('data-line') &&
-    !el.disabled &&
+    (!el.disabled || mdReadOnlyTasks.has(el)) &&
     !el.closest('.mermaid, svg')
   );
+}
+
+/**
+ * A read-only document (mdState.readOnly) shows its task checkboxes disabled, like GitHub's read-only task lists: a
+ * click cannot change it. They are enabled again when an update says the document can be edited.
+ * @param {ParentNode} container
+ */
+function mdSetTasksReadOnly(container) {
+  const readOnly = mdState.readOnly;
+  for (const input of mdTaskCheckboxes(container)) {
+    if (mdReadOnlyTasks.has(input) === readOnly) continue;
+    input.disabled = readOnly;
+    if (readOnly) {
+      mdReadOnlyTasks.add(input);
+      input.title = MD_READ_ONLY_TASK_TITLE;
+    } else {
+      mdReadOnlyTasks.delete(input);
+      input.removeAttribute('title');
+    }
+  }
 }
 
 /**
@@ -7679,6 +8170,10 @@ function mdOnChange(event) {
   if (!(input instanceof HTMLInputElement) || !mdIsTaskCheckbox(input)) return;
   const article = mdState.article;
   if (!article || !article.contains(input)) return;
+  if (mdState.readOnly) {
+    input.checked = input.defaultChecked; // read-only document: nothing to edit
+    return;
+  }
   const line = mdTaskLine(input);
   if (line === null) {
     input.checked = input.defaultChecked; // not mapped to a source line: nothing to edit
@@ -7751,6 +8246,8 @@ function mdOnToggleResult(msg) {
  */
 function mdTasksAfterRender(article) {
   const version = Number(article.dataset.version);
+  mdSetTasksReadOnly(article);
+  if (mdState.readOnly) mdTasks.queue = []; // the document became read-only: queued clicks cannot be applied
   mdTasks.confirmed = mdTasks.confirmed.filter((t) => t.version > version); // rendered now: the source says so
   if (!mdTasks.inflight && version >= mdTasks.awaitVersion) {
     while (!mdTasks.inflight && mdTasks.queue.length) {
@@ -7857,7 +8354,7 @@ function mdOnClick(event) {
   if (!target) return;
   if (event.type === 'click') {
     const button = target.closest('.md-copy-button');
-    if (button instanceof HTMLButtonElement && mdState.view && mdState.view.contains(button)) {
+    if (button instanceof HTMLButtonElement && mdCopySources.has(button) && mdState.view && mdState.view.contains(button)) {
       event.preventDefault();
       void mdCopyCode(button);
       return;
@@ -7966,17 +8463,52 @@ function mdScrollToFragment(scope, fragment, toc, keeper) {
     mdFinishDeferredBlocks(); // the target may be in a block not built yet
     target = mdFindAnchorTarget(scope, id, toc);
   }
+  const view = scope.closest('.md-view, .docx-view');
   if (!target) {
-    const view = scope.closest('.md-view, .docx-view');
     if (view instanceof HTMLElement && (!id || id.toLowerCase() === 'top')) {
       view.scrollTop = 0;
       view.focus({ preventScroll: true }); // the next Tab starts at the top, like the browser's own "#top"
     }
     return;
   }
-  target.scrollIntoView({ block: 'start', inline: 'nearest' });
-  mdFlashTarget(target);
-  mdFocusTarget(target);
+  const marked = mdMarkedElement(target, scope);
+  // The anchor's own line when it is inside the marked block (an anchor in the middle of a paragraph), else that block.
+  const shown = marked !== target && marked.contains(target) && target.getClientRects().length ? target : marked;
+  shown.scrollIntoView({ block: 'start', inline: 'nearest' });
+  // Held where it landed while the blocks around it get their real height (a large document's blocks just built).
+  if (view instanceof HTMLElement) {
+    mdKeepScroll(view, keeper, shown, shown.getBoundingClientRect().top - view.getBoundingClientRect().top, null);
+  }
+  mdFlashTarget(marked);
+  mdFocusTarget(marked);
+}
+
+/** Blocks an empty anchor stands for (see mdMarkedElement). */
+const MD_MARKED_BLOCKS = 'h1, h2, h3, h4, h5, h6, p, li, dt, dd, td, th, caption, figcaption, summary, blockquote, pre';
+
+/**
+ * The element an in-page jump highlights and focuses. Usually the target itself; an empty named anchor (`<a name>`,
+ * `<a id>` of a Word bookmark or TOC entry) has no area to highlight and cannot take focus, so the block it is in stands
+ * for it (`<h1><a id="_Toc1"></a>Chapter 2</h1>`), or, when that block shows nothing else (an anchor alone on its line
+ * before a heading), the next element that does.
+ * @param {Element} target
+ * @param {HTMLElement} scope
+ * @returns {Element}
+ */
+function mdMarkedElement(target, scope) {
+  /** @param {Element} el */
+  const hasArea = (el) => {
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  if (hasArea(target) || !target.getClientRects().length) return target; // shown, or not rendered at all
+  const block = target.parentElement && target.parentElement.closest(MD_MARKED_BLOCKS);
+  const start = block && scope.contains(block) ? block : target;
+  if (start !== target && hasArea(start)) return start;
+  for (let el = /** @type {Element | null} */ (start); el && el !== scope; el = el.parentElement) {
+    for (let next = el.nextElementSibling; next; next = next.nextElementSibling) if (hasArea(next)) return next;
+  }
+  return start;
 }
 
 /**
@@ -8096,8 +8628,19 @@ function mdFail(err, message, canReopenAsText) {
  */
 const DOCX_SANITIZE_OPTIONS = {
   ...MD_SANITIZE_OPTIONS,
-  ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix|file):|[^a-z]|[a-z+.-]+(?:[^a-z+.\-:]|$))/i,
+  // Also drive-letter paths (`C:\dir\file`, `C:/dir/file`: Word stores these as they were typed), which DOMPurify would
+  // read as an unknown `c:` scheme; the host opens them like file: links.
+  ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|matrix|file):|[a-z]:[\\/]|[^a-z]|[a-z+.-]+(?:[^a-z+.\-:]|$))/i,
 };
+/** Text blocks that get their own direction (docxSetDirections; the CSS keeps their tabs and spaces). */
+const DOCX_TEXT_BLOCKS = 'p, li, td, th, h1, h2, h3, h4, h5, h6, dt, dd, caption';
+/** A letter of a right-to-left script. */
+const DOCX_RTL_LETTER = '(?=\\p{L})[\\p{Script=Hebrew}\\p{Script=Arabic}\\p{Script=Syriac}\\p{Script=Thaana}\\p{Script=Nko}\\p{Script=Samaritan}\\p{Script=Mandaic}\\p{Script=Adlam}\\p{Script=Hanifi_Rohingya}]';
+const DOCX_RTL_LETTER_RE = new RegExp(DOCX_RTL_LETTER, 'u');
+const DOCX_RTL_LETTERS_RE = new RegExp(DOCX_RTL_LETTER, 'gu');
+const DOCX_LETTERS_RE = /\p{L}/gu;
+/** Words that may push a table past the page (shorter ones are not measured, see docxFitTables). */
+const DOCX_LONG_WORD_RE = /\S{8,}/g;
 
 const docxState = {
   /** @type {HTMLElement | null} */
@@ -8105,7 +8648,7 @@ const docxState = {
   /** @type {HTMLElement | null} */
   page: null,
   /** @type {MdScrollKeeper} */
-  scroll: { anchor: null, offset: 0, top: null },
+  scroll: { anchor: null, offset: 0, top: null, until: 0 },
 };
 
 /**
@@ -8145,13 +8688,14 @@ function showDocx(msg) {
       docxState.view = null;
       docxState.page = null;
     });
+    docxSetDirections(page);
     root.replaceChildren(view);
+    docxWatchTables(page);
+    mdHoldOnResize(view, page, docxState.scroll);
 
     const saved = docxReadScrollTop();
-    if (saved !== undefined) {
-      docxState.scroll.top = saved; // images (data: URIs) decode late: hold the offset until the user scrolls
-      mdHoldScroll(view, docxState.scroll);
-    }
+    // images (data: URIs) decode late: hold the offset until the user scrolls
+    if (saved !== undefined) mdKeepScroll(view, docxState.scroll, null, 0, saved);
     view.focus({ preventScroll: true });
   } catch (err) {
     mdFail(err, 'Could not display the Word document.', false);
@@ -8169,6 +8713,98 @@ function docxReadScrollTop() {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Paragraph direction. Word takes it from the paragraph's own right-to-left flag (w:bidi), which mammoth drops, and
+ * never from the first letter (unicode-bidi: plaintext would right-align an English paragraph that starts with a Hebrew
+ * name). The closest guess: a text block is right-to-left when most of its letters are of a right-to-left script (a tie
+ * goes to its first letter); a block without letters keeps the direction of the block around it.
+ * @param {HTMLElement} page
+ */
+function docxSetDirections(page) {
+  if (!DOCX_RTL_LETTER_RE.test(page.textContent || '')) return; // everything left-to-right, as the page is
+  /** @type {Map<Element, string>} */
+  const dirs = new Map();
+  page.querySelectorAll(DOCX_TEXT_BLOCKS).forEach((el) => {
+    const outer = el.parentElement && el.parentElement.closest(DOCX_TEXT_BLOCKS);
+    const inherited = (outer && dirs.get(outer)) || 'ltr';
+    const own = docxTextDirection(el.textContent || '') || inherited;
+    dirs.set(el, own);
+    if (own !== inherited) /** @type {HTMLElement} */ (el).dir = own;
+  });
+}
+
+/**
+ * @param {string} text
+ * @returns {'ltr' | 'rtl' | null} null when the text has no letters
+ */
+function docxTextDirection(text) {
+  const letters = (text.match(DOCX_LETTERS_RE) || []).length;
+  if (!letters) return null;
+  const rtl = (text.match(DOCX_RTL_LETTERS_RE) || []).length;
+  if (rtl * 2 !== letters) return rtl * 2 > letters ? 'rtl' : 'ltr';
+  const first = /\p{L}/u.exec(text);
+  return first && DOCX_RTL_LETTER_RE.test(first[0]) ? 'rtl' : 'ltr';
+}
+
+/**
+ * Keeps tables on the page (docxFitTables) now and whenever the page width changes (window, editor split).
+ * @param {HTMLElement} page
+ */
+function docxWatchTables(page) {
+  if (!page.querySelector('table')) return;
+  let width = -1;
+  const observer = new ResizeObserver(() => {
+    if (page.clientWidth === width) return;
+    width = page.clientWidth;
+    docxFitTables(page);
+  });
+  observer.observe(page);
+  onDispose(() => observer.disconnect());
+}
+
+/**
+ * Like Word, a word too long for the page (a URL, a path) wraps inside its cell instead of pushing the table past the
+ * page. Only where needed: in a table wider than the page, the cells with the longest words may break them anywhere
+ * (class docx-cell-wrap), longest first, until the table fits. overflow-wrap: anywhere on every cell would let the
+ * table layout squeeze the other columns below their own words ('Qua/ntit/y', '14,2/50.0/0').
+ * @param {HTMLElement} page
+ */
+function docxFitTables(page) {
+  const style = getComputedStyle(page);
+  const available = page.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight) + 0.5;
+  const range = document.createRange();
+  page.querySelectorAll('table').forEach((table) => {
+    if (table.parentElement && table.parentElement.closest('table')) return; // nested: fitted with its outer table
+    if (table.getBoundingClientRect().width <= available) return;
+    /** @type {{ cell: Element, widest: number }[]} */
+    const cells = [];
+    table.querySelectorAll('td, th').forEach((cell) => {
+      if (cell.classList.contains('docx-cell-wrap')) return;
+      let widest = 0;
+      const walker = document.createTreeWalker(cell, NodeFilter.SHOW_TEXT);
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        for (const match of (node.nodeValue || '').matchAll(DOCX_LONG_WORD_RE)) {
+          range.setStart(node, match.index);
+          range.setEnd(node, match.index + match[0].length);
+          widest = Math.max(widest, range.getBoundingClientRect().width);
+        }
+      }
+      if (widest > 0) cells.push({ cell, widest });
+    });
+    cells.sort((a, b) => b.widest - a.widest);
+    // A batch of similar widths per layout pass: few passes even for a column full of long links.
+    let next = 0;
+    while (next < cells.length && table.getBoundingClientRect().width > available) {
+      const limit = cells[next].widest * 0.75;
+      while (next < cells.length && cells[next].widest >= limit) cells[next++].cell.classList.add('docx-cell-wrap');
+    }
+    // Still too wide (many columns of short words): every cell wraps, as Word does in columns narrower than a word.
+    if (table.getBoundingClientRect().width > available) {
+      table.querySelectorAll('td, th').forEach((cell) => cell.classList.add('docx-cell-wrap'));
+    }
+  });
 }
 
 /**
@@ -8248,6 +8884,10 @@ const PDF_ASSETS = {
 const PDF_STATE_KEY = 'pdfView';
 /** Zoom names PDFViewer.currentScaleValue understands besides a scale factor. */
 const PDF_ZOOM_PRESETS = ['auto', 'page-width', 'page-fit', 'page-actual'];
+/** The presets that fit pages to the view (pdfApplyZoom keeps every page inside the width). */
+const PDF_FIT_PRESETS = ['auto', 'page-width', 'page-fit'];
+/** Room pdf.js leaves next to a page fitted to the width (its SCROLLBAR_PADDING: page margins and borders). */
+const PDF_FIT_PADDING = 40;
 /** Zoom of a PDF opened for the first time, and of Ctrl+0 (fit width, at most 125 %; like Firefox). */
 const PDF_DEFAULT_ZOOM = 'auto';
 const PDF_SAVE_DELAY_MS = 250;
@@ -8319,6 +8959,9 @@ const PDF_ICONS = {
  * @property {any} linkService
  * @property {number} pagesCount
  * @property {{ pageNumber: number, scale: number | string, left: number, top: number } | null} location last updateviewarea
+ * @property {string | null} zoomPreset the PDF_ZOOM_PRESETS zoom shown (also when pdfApplyZoom lowered a fit zoom to
+ *   a scale factor), null for a zoom factor
+ * @property {boolean} fitting set while pdfApplyZoom lowers a fit zoom (the scale change keeps zoomPreset)
  * @property {boolean} outlineOpen
  * @property {boolean} matchCase
  * @property {number} findState PDF_FIND_STATE of the last find
@@ -8358,6 +9001,8 @@ function showPdf(msg) {
     linkService: null,
     pagesCount: 0,
     location: null,
+    zoomPreset: null,
+    fitting: false,
     outlineOpen: false,
     matchCase: false,
     findState: PDF_FIND_STATE.FOUND,
@@ -8589,8 +9234,17 @@ function pdfShowDocument(view, viewerLib, pdfDocument) {
   eventBus.on('pagesinit', () => {
     if (!view.disposed) pdfRestoreView(view);
   });
+  // Until now every page had the size of the first one: a fit zoom is lowered if a page turned out wider. (Not the
+  // whole preset again: pdf.js's 'auto' depends on the current page, which may now be a restored landscape page.)
+  eventBus.on('pagesloaded', () => {
+    if (!view.disposed && view.zoomPreset && PDF_FIT_PRESETS.includes(view.zoomPreset)) pdfFitWidestPage(view);
+  });
   eventBus.on('pagechanging', (/** @type {{ pageNumber: number }} */ e) => pdfUpdatePageControls(view, e.pageNumber));
-  eventBus.on('scalechanging', (/** @type {{ scale: number, presetValue?: string }} */ e) => pdfUpdateZoomControls(view, e.scale, e.presetValue));
+  eventBus.on('scalechanging', (/** @type {{ scale: number, presetValue?: string }} */ e) => {
+    if (e.presetValue) view.zoomPreset = e.presetValue;
+    else if (!view.fitting) view.zoomPreset = null;
+    pdfUpdateZoomControls(view, e.scale);
+  });
   eventBus.on('updateviewarea', (/** @type {{ location: PdfView['location'] }} */ e) => {
     if (view.disposed || !e.location) return;
     view.location = e.location;
@@ -8630,7 +9284,7 @@ function pdfShowDocument(view, viewerLib, pdfDocument) {
 function pdfRestoreView(view) {
   const { viewer } = view;
   const saved = view.saved;
-  viewer.currentScaleValue = saved ? saved.zoom : PDF_DEFAULT_ZOOM;
+  pdfApplyZoom(view, saved ? saved.zoom : PDF_DEFAULT_ZOOM);
   if (!saved) return;
   const pageNumber = clamp(saved.page, 1, view.pagesCount);
   if (pageNumber === saved.page && saved.left !== null && saved.top !== null) {
@@ -8677,7 +9331,7 @@ function pdfSaveView(view) {
   /** @type {PdfSavedView} */
   const saved = {
     page: location.pageNumber,
-    zoom: pdfZoomValue(location.scale),
+    zoom: view.zoomPreset ?? pdfZoomValue(location.scale),
     left: Math.round(location.left),
     top: Math.round(location.top),
     outline: view.outlineOpen,
@@ -8823,8 +9477,7 @@ function pdfWireFrame(view) {
       const size = `${d.container.clientWidth}x${d.container.clientHeight}`;
       if (size === lastSize || view.disposed) return;
       lastSize = size;
-      const value = view.viewer?.currentScaleValue;
-      if (view.pdfDocument && PDF_ZOOM_PRESETS.includes(value)) view.viewer.currentScaleValue = value;
+      if (view.zoomPreset) pdfApplyZoom(view, view.zoomPreset);
     });
   });
   observer.observe(d.container);
@@ -8849,14 +9502,13 @@ function pdfUpdatePageControls(view, pageNumber) {
 /**
  * @param {PdfView} view
  * @param {number} scale
- * @param {string | undefined} preset
  */
-function pdfUpdateZoomControls(view, scale, preset) {
+function pdfUpdateZoomControls(view, scale) {
   if (view.disposed) return;
   const d = view.dom;
   d.zoomLabel.textContent = `${Math.round(scale * 100)}%`;
-  d.fitWidthBtn.setAttribute('aria-pressed', String(preset === 'page-width'));
-  d.fitPageBtn.setAttribute('aria-pressed', String(preset === 'page-fit'));
+  d.fitWidthBtn.setAttribute('aria-pressed', String(view.zoomPreset === 'page-width'));
+  d.fitPageBtn.setAttribute('aria-pressed', String(view.zoomPreset === 'page-fit'));
 }
 
 /** @param {PdfView} view */
@@ -8883,7 +9535,46 @@ function pdfGoToPage(view, pageNumber) {
  * @param {string} value PDFViewer.currentScaleValue
  */
 function pdfSetZoom(view, value) {
-  if (view.viewer && view.pdfDocument) view.viewer.currentScaleValue = value;
+  if (view.viewer && view.pdfDocument) pdfApplyZoom(view, value);
+}
+
+/**
+ * Sets the zoom: a scale factor or a PDF_ZOOM_PRESETS name. pdf.js fits 'auto' / 'page-width' / 'page-fit' to the
+ * CURRENT page only, so a wider page (a landscape page in a portrait document) stuck out of the view: a horizontal
+ * scroll bar at "Fit width", and pdf.js's find, which scrolls each match to the horizontal centre, moved the pages left
+ * and right. Like the browser's PDF viewer, a fit zoom here also keeps the widest page inside the view.
+ * @param {PdfView} view
+ * @param {string} value
+ */
+function pdfApplyZoom(view, value) {
+  const { viewer } = view;
+  if (!viewer) return;
+  viewer.currentScaleValue = value;
+  view.zoomPreset = PDF_ZOOM_PRESETS.includes(value) ? value : null;
+  if (PDF_FIT_PRESETS.includes(value)) pdfFitWidestPage(view);
+}
+
+/**
+ * Lowers the zoom of a fit preset so that the widest page fits the view's width too (no horizontal scroll bar; find,
+ * which scrolls a match to the horizontal centre, then cannot move the pages sideways). Never raises it.
+ * @param {PdfView} view
+ */
+function pdfFitWidestPage(view) {
+  const { viewer } = view;
+  if (!viewer) return;
+  const width = view.dom.container.clientWidth - PDF_FIT_PADDING;
+  let fit = Infinity;
+  for (let i = 0; i < view.pagesCount; i++) {
+    const page = viewer.getPageView(i);
+    if (page && page.width > 0) fit = Math.min(fit, (width / page.width) * page.scale);
+  }
+  if (!(fit > 0 && fit < viewer.currentScale - 1e-4)) return;
+  view.fitting = true;
+  try {
+    viewer.currentScale = fit;
+  } finally {
+    view.fitting = false;
+  }
 }
 
 /**

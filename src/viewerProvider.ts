@@ -12,8 +12,10 @@ import type { CellStyle, Range, RowData, SelectionStats, WorkbookMeta } from './
 import type { TaskMarker, TocEntry } from './renderers/markdown';
 import type { PptxDeckMeta, PptxSlide } from './renderers/pptx';
 
+import { execFile } from 'child_process';
 import { randomBytes } from 'crypto';
-import { open as openFileHandle } from 'fs/promises';
+import { constants as fsConstants } from 'fs';
+import { access, open as openFileHandle } from 'fs/promises';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
@@ -63,6 +65,12 @@ export type HostMessage =
       mode: MarkdownMode;
       /** TextDocument.version the html was rendered from. */
       version: number;
+      /**
+       * VS Code treats the document as read-only (a git: version, files.readonlyInclude, files.readonlyFromPermissions
+       * with a read-only file): task checkboxes are disabled, and a toggleTask is refused. Also in markdownUpdate, which
+       * follows a change of this state while the file is open (a settings change).
+       */
+      readOnly?: boolean;
     }
   | {
       type: 'init';
@@ -114,13 +122,24 @@ export type HostMessage =
       rows: RowData[];
       styles: [number, CellStyle][];
     }
+  /**
+   * Reply to getStats. Besides the numbers, `stats.errors` counts error cells (then the status bar shows only Count,
+   * like Excel) and `stats.text` has Sum / Average / Min / Max in the number format of the first numeric cell (dates,
+   * percentages, currency; absent for General). See SelectionStats in renderers/sheet.ts.
+   */
   | { type: 'stats'; reqId: number; stats: SelectionStats }
   | {
       /** Data changed (CSV text edited elsewhere, file reloaded): drop the row cache, re-request visible rows. */
       type: 'invalidate';
       meta?: WorkbookMeta;
+      /**
+       * xlsx reload: the lossy-content banner of the reloaded file (null = none), so it follows content added or
+       * removed on disk (a chart). Absent = keep the banner as it is (CSV).
+       */
+      banner?: string | null;
     }
-  | { type: 'markdownUpdate'; html: string; toc: TocEntry[]; source: string; version: number }
+  /** `readOnly`: as in the markdown init (sent again with every update, so a change of the state reaches the view). */
+  | { type: 'markdownUpdate'; html: string; toc: TocEntry[]; source: string; version: number; readOnly?: boolean }
   /**
    * A link to the document itself was followed (`readme.md#usage` in readme.md, `file:///C:/x/self.docx#intro` in
    * self.docx): scroll the markdown / docx view to `fragment` (decoded; '' = the top), like an in-page `#usage` link.
@@ -130,8 +149,8 @@ export type HostMessage =
       /**
        * Answer to every toggleTask (`line` / `version` echo the request). `applied`: the document now has the requested
        * state (the edit was made, or it already had it); its rendering (markdownUpdate) is sent or follows. Otherwise
-       * the toggle was refused (`reason`, e.g. the document changed since the click) and the checkbox should show the
-       * document's state again. `documentVersion`: TextDocument.version after handling the toggle.
+       * the toggle was refused (`reason`, e.g. the document changed since the click, or it is read-only) and the
+       * checkbox should show the document's state again. `documentVersion`: TextDocument.version after handling the toggle.
        */
       type: 'toggleTaskResult';
       line: number;
@@ -259,12 +278,16 @@ export async function reopenAsText(uri: vscode.Uri, viewColumn?: vscode.ViewColu
   }
 }
 
-/** Reveals a document in the OS file manager (falls back to the VS Code explorer for non-file schemes). */
+/**
+ * Reveals a document in the OS file manager (falls back to the VS Code explorer for non-file schemes). A Git version
+ * of a file (`git:` URI, e.g. the left side of "Open Changes") reveals its working file.
+ */
 export async function revealInOS(uri: vscode.Uri): Promise<void> {
+  const target = gitVersionOf(uri)?.workingFile ?? uri;
   try {
-    await vscode.commands.executeCommand(uri.scheme === 'file' ? 'revealFileInOS' : 'revealInExplorer', uri);
+    await vscode.commands.executeCommand(target.scheme === 'file' ? 'revealFileInOS' : 'revealInExplorer', target);
   } catch (err) {
-    logError(`Could not reveal ${uri.toString(true)}`, err);
+    logError(`Could not reveal ${target.toString(true)}`, err);
   }
 }
 
@@ -545,10 +568,16 @@ class ViewerSession implements vscode.Disposable {
     }
   }
 
-  /** Shows the error view (with "Reopen as Text" for csv/md, "Reveal in Explorer" for xlsx/docx/pdf/pptx). */
-  postError(summary: string, err?: unknown): void {
-    if (err !== undefined) logError(`[${this.kind}] ${summary} (${this.uri.toString(true)})`, err);
-    else getLog().error(`[${this.kind}] ${summary} (${this.uri.toString(true)})`);
+  /**
+   * Shows the error view (with "Reopen as Text" for csv/md, "Reveal in Explorer" for xlsx/docx/pdf/pptx) and logs
+   * `err` with its detail. `alreadyLogged`: `err` is a load / parse failure that its owner logged when it happened, so
+   * showing it (again, e.g. after a webview reload or for a row request) adds no second error entry for one failure.
+   */
+  postError(summary: string, err?: unknown, alreadyLogged = false): void {
+    const where = `[${this.kind}] ${summary} (${this.uri.toString(true)})`;
+    if (err !== undefined && alreadyLogged) getLog().debug(`${where}: shown in the viewer (logged when it occurred)`);
+    else if (err !== undefined) logError(where, err);
+    else getLog().error(where);
     this.post({
       type: 'error',
       message: err === undefined ? summary : `${summary}: ${errorMessageOf(err)}`,
@@ -713,13 +742,27 @@ function resolveLocalPath(rawPath: string, documentUri: vscode.Uri): vscode.Uri 
   return vscode.Uri.joinPath(base, '..', decoded);
 }
 
-/** GitHub-style line fragments (`#L10`, `#L10-L20`) -> editor selection. */
+/**
+ * Line fragments as VS Code's Markdown links accept them -> editor selection (1-based): `#L10` or `#10` (line 10),
+ * `#L10,5` (line 10, column 5), `#L10-L20`, `#L10,5-L20,2`. A reversed range is swapped; line 0 is not a line. A range
+ * end without a column includes that whole line (`#L10-L20` selects lines 10 to 20, like GitHub's highlight).
+ */
 function selectionFromFragment(fragment: string): vscode.Range | undefined {
-  const match = /^L(\d+)(?:-L?(\d+))?$/i.exec(fragment);
-  if (!match) return undefined;
-  const start = Math.max(0, Number(match[1]) - 1);
-  const end = match[2] === undefined ? start : Math.max(start, Number(match[2]) - 1);
-  return end === start ? new vscode.Range(start, 0, start, 0) : new vscode.Range(start, 0, end + 1, 0);
+  const match = /^L?(\d+)(?:,(\d+))?(?:-L?(\d+)(?:,(\d+))?)?$/i.exec(fragment);
+  if (!match || Number(match[1]) === 0 || Number(match[3]) === 0) return undefined;
+  const point = (line: string, column: string | undefined) => ({
+    line: Number(line) - 1,
+    column: column === undefined ? undefined : Math.max(0, Number(column) - 1),
+  });
+  let start = point(match[1], match[2]);
+  if (match[3] === undefined) return new vscode.Range(start.line, start.column ?? 0, start.line, start.column ?? 0);
+  let end = point(match[3], match[4]);
+  if (end.line < start.line || (end.line === start.line && (end.column ?? 0) < (start.column ?? 0))) {
+    [start, end] = [end, start];
+  }
+  return end.column === undefined
+    ? new vscode.Range(start.line, start.column ?? 0, end.line + 1, 0)
+    : new vscode.Range(start.line, start.column ?? 0, end.line, end.column);
 }
 
 function displayPath(uri: vscode.Uri): string {
@@ -745,23 +788,36 @@ async function headingFromFragment(target: vscode.Uri, fragment: string): Promis
   return entry ? new vscode.Range(entry.line, 0, entry.line, 0) : undefined;
 }
 
+/** A missing file. Other stat failures are not "not found", e.g. a UNC host refused by `security.allowedUNCHosts`. */
+function isFileNotFound(err: unknown): boolean {
+  return err instanceof vscode.FileSystemError && err.code === 'FileNotFound';
+}
+
 /**
- * Opens a local target: directories are revealed in the explorer, files open in their default editor - at the line of
- * a `#L10` / `#L10-L20` fragment, or of the heading a `#slug` fragment names in a Markdown file.
+ * Opens a local target: directories are revealed in the explorer, files open in their default editor. Like VS Code's
+ * Markdown links, a fragment is first the heading it names in a Markdown file (`#l2` -> `## L2`), else a line
+ * (`#L10`, `#10`, `#L10,5`, `#L10-L20`).
  */
 async function openLocalTarget(target: vscode.Uri, fragment: string): Promise<void> {
   let stat: vscode.FileStat;
   try {
     stat = await vscode.workspace.fs.stat(target);
-  } catch {
-    void vscode.window.showWarningMessage(`FileStudio could not find "${displayPath(target)}".`);
+  } catch (err) {
+    if (isFileNotFound(err)) {
+      void vscode.window.showWarningMessage(`FileStudio could not find "${displayPath(target)}".`);
+      return;
+    }
+    // VS Code's own reason, e.g. "UNC host 'server' access is not allowed. Please update the
+    // 'security.allowedUNCHosts' setting if you want to allow this host." (the file may well exist).
+    getLog().warn(`Could not open link target ${target.toString(true)}: ${errorMessageOf(err)}`);
+    void vscode.window.showWarningMessage(`FileStudio could not open "${displayPath(target)}": ${errorMessageOf(err)}`);
     return;
   }
   if (stat.type & vscode.FileType.Directory) {
     await vscode.commands.executeCommand('revealInExplorer', target);
     return;
   }
-  const selection = selectionFromFragment(fragment) ?? (await headingFromFragment(target, fragment));
+  const selection = (await headingFromFragment(target, fragment)) ?? selectionFromFragment(fragment);
   await vscode.commands.executeCommand('vscode.open', target, selection ? { selection } : undefined);
 }
 
@@ -935,6 +991,104 @@ function watchForDiskChanges(uri: vscode.Uri, reload: () => Promise<unknown>): v
       watcher.dispose();
     },
   };
+}
+
+// ===== SHARED: READING DOCUMENT FILES =====
+
+/** Every .xlsx / .docx / .pptx is a ZIP package: it starts with a local file header ("PK\x03\x04"). */
+function isZipPackage(data: Uint8Array): boolean {
+  return data.length >= 4 && data[0] === 0x50 && data[1] === 0x4b && data[2] === 0x03 && data[3] === 0x04;
+}
+
+/** A Git version of a file: what VS Code's Git extension writes into a `git:` URI query (toGitUri: path + ref). */
+interface GitVersion {
+  /** The file in the working tree. */
+  readonly workingFile: vscode.Uri;
+  /** 'HEAD', a commit, '~' (the staged version), '~1'..'~3' (merge stages) or '' (the index). */
+  readonly ref: string;
+}
+
+function gitVersionOf(uri: vscode.Uri): GitVersion | undefined {
+  if (uri.scheme !== 'git') return undefined;
+  try {
+    const query: unknown = JSON.parse(uri.query);
+    if (!isRecord(query) || typeof query.path !== 'string' || typeof query.ref !== 'string') return undefined;
+    if (query.submoduleOf !== undefined) return undefined; // a submodule diff, not a file
+    return { workingFile: vscode.Uri.file(query.path), ref: query.ref };
+  } catch {
+    return undefined;
+  }
+}
+
+/** The part of VS Code's Git extension API used here (`vscode.git` exports). */
+interface GitExtensionExports {
+  getAPI(version: 1): { readonly git: { readonly path: string } };
+}
+
+/** Upper bound for a document read from Git. */
+const MAX_GIT_BLOB_BYTES = 1024 * 1024 * 1024;
+
+function execFileBytes(file: string, args: string[], cwd: string): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { cwd, encoding: 'buffer', maxBuffer: MAX_GIT_BLOB_BYTES, windowsHide: true }, (err, stdout) =>
+      err ? reject(err) : resolve(stdout),
+    );
+  });
+}
+
+/**
+ * The committed bytes of a Git version, read with `git cat-file blob` (which never converts content) by the git
+ * executable of VS Code's Git extension. Undefined when that extension is not available, and in Restricted Mode (the
+ * Git extension does not run there either, and git must not run in an untrusted repository).
+ */
+async function readGitBlob(version: GitVersion): Promise<Uint8Array | undefined> {
+  if (!vscode.workspace.isTrusted) return undefined;
+  const gitExtension = vscode.extensions.getExtension<GitExtensionExports>('vscode.git');
+  let gitPath: string | undefined;
+  try {
+    gitPath = gitExtension?.isActive ? gitExtension.exports.getAPI(1).git.path : undefined;
+  } catch {
+    return undefined; // Git is disabled (git.enabled: false)
+  }
+  if (!gitPath) return undefined;
+  // The Git extension's refs: '~' = the index if the file is staged, else HEAD (equal to the index then); '~N' = merge
+  // stage N; '' = the index.
+  const ref = version.ref;
+  const revisions = ref === '~' ? ['', 'HEAD'] : /^~\d$/.test(ref) ? [`:${ref[1]}`] : [ref];
+  if (revisions.some((revision) => revision.startsWith('-'))) return undefined; // a ref must never become an option
+  const cwd = path.dirname(version.workingFile.fsPath);
+  const name = path.basename(version.workingFile.fsPath);
+  let lastError: unknown;
+  for (const revision of revisions) {
+    try {
+      return await execFileBytes(gitPath, ['cat-file', 'blob', `${revision}:./${name}`], cwd);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw lastError;
+}
+
+/**
+ * Reads a workbook / document / presentation / PDF; `isExpected` checks that the bytes are of that format. A Git
+ * version ("Open Changes", Timeline, "Open File (HEAD)") comes from VS Code's Git extension, which runs
+ * `git show --textconv`: when a diff driver converts the file type (Git for Windows maps *.docx and *.pdf to
+ * `astextplain`), that is plain text, not the file. Such a version is read as committed instead.
+ */
+async function readDocumentBytes(uri: vscode.Uri, isExpected: (data: Uint8Array) => boolean): Promise<Uint8Array> {
+  const data = await vscode.workspace.fs.readFile(uri);
+  const version = gitVersionOf(uri);
+  if (!version || isExpected(data)) return data;
+  try {
+    const blob = await readGitBlob(version);
+    if (blob) {
+      getLog().info(`${uri.toString(true)}: Git converted the file to text (textconv); read the committed file instead`);
+      return blob;
+    }
+  } catch (err) {
+    getLog().warn(`Could not read ${version.workingFile.fsPath} (ref "${version.ref}") from Git: ${errorMessageOf(err)}`);
+  }
+  return data;
 }
 
 // ===== SHEET (XLSX) =====
@@ -1215,7 +1369,7 @@ async function readFirstAvailable(
   for (const source of sources) {
     if (source instanceof Uint8Array) return { data: source, source };
     try {
-      return { data: await vscode.workspace.fs.readFile(source), source };
+      return { data: await readDocumentBytes(source, isZipPackage), source };
     } catch (err) {
       lastError = err;
       if (source !== sources[sources.length - 1]) logError(`Could not read ${source.toString(true)}; trying the next source`, err);
@@ -1226,6 +1380,7 @@ async function readFirstAvailable(
 
 // ----- grid requests (shared by xlsx and csv) -----
 
+/** `loadError`: why there is no `source` (logged by the document / view that failed to load or parse it). */
 function answerGetRows(
   session: ViewerSession,
   source: GridSource | undefined,
@@ -1233,7 +1388,7 @@ function answerGetRows(
   loadError?: unknown,
 ): void {
   if (!source) {
-    session.postError(`"${session.fileName}" could not be displayed`, loadError);
+    session.postError(`"${session.fileName}" could not be displayed`, loadError, true);
     return;
   }
   const columns = msg.c0 === undefined ? {} : { c0: msg.c0, c1: msg.c1 };
@@ -1372,7 +1527,8 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
   private sendInit(document: SheetDocument, session: ViewerSession): void {
     const model = document.model;
     if (!model) {
-      session.postError(`Could not open "${document.fileName}"`, document.loadError);
+      // SheetDocument.load logged the failure once; every panel and every 'ready' only shows it.
+      session.postError(`Could not open "${document.fileName}"`, document.loadError, true);
       return;
     }
     try {
@@ -1397,7 +1553,10 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
     }
   }
 
-  /** Grids get 'invalidate' with the new meta (sheet, selection and scroll are kept); error views get a fresh init. */
+  /**
+   * Grids get 'invalidate' with the new meta (sheet, selection and scroll are kept) and the reloaded file's banner;
+   * error views get a fresh init.
+   */
   private refreshAfterReload(document: SheetDocument, session: ViewerSession): void {
     if (!session.isReady) return; // the pending 'ready' will send init from the reloaded workbook
     const model = document.model;
@@ -1406,7 +1565,7 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
       return;
     }
     try {
-      session.post({ type: 'invalidate', meta: model.getMeta() });
+      session.post({ type: 'invalidate', meta: model.getMeta(), banner: lossyBanner(document.lossyFeatures) ?? null });
     } catch (err) {
       session.postError(`Could not reload "${document.fileName}"`, err);
     }
@@ -1462,7 +1621,7 @@ export class TextViewerProvider implements vscode.CustomTextEditorProvider {
   }
 }
 
-// ----- files too large for a custom text editor -----
+// ----- text files VS Code does not pass to a custom text editor -----
 
 /**
  * VS Code passes a text document to extensions only up to 50 MB of text (TextModel._MODEL_SYNC_LIMIT, in UTF-16 code
@@ -1472,19 +1631,30 @@ export class TextViewerProvider implements vscode.CustomTextEditorProvider {
 const EXTENSION_SYNC_LIMIT = 50 * 1024 * 1024;
 
 /**
- * Replaces FileStudio tabs (CSV/TSV/Markdown) whose file is too large to reach the extension with VS Code's text
- * editor, and says why. Also checks the tabs already open at activation (opening such a tab is what activates us).
+ * Replaces FileStudio tabs (CSV/TSV/PSV/SSV/Markdown) whose file VS Code cannot give the extension as a text document
+ * with VS Code's text editor, and says why: files over the 50 MB extension limit, and files VS Code considers binary
+ * (a NUL byte near the start, e.g. a workbook saved as .csv). Our tab would only show VS Code's "The editor could not
+ * be opened due to an unexpected error"; the text editor explains the file and offers "Open Anyway". Also checks the
+ * tabs already open at activation (opening such a tab is what activates us).
  */
-export function watchOversizedTextTabs(): vscode.Disposable {
-  const checking = new Set<string>();
+export function watchUnreadableTextTabs(): vscode.Disposable {
+  /** Files being checked -> whether another event for them came meanwhile (a click: "opened", then "changed" active). */
+  const checking = new Map<string, boolean>();
   const check = (tab: vscode.Tab): void => {
     const input = tab.input;
     if (!(input instanceof vscode.TabInputCustom)) return;
     if (input.viewType !== VIEW_TYPES.csv && input.viewType !== VIEW_TYPES.markdown) return;
     const key = input.uri.toString();
-    if (checking.has(key)) return;
-    checking.add(key);
-    void reopenIfTooLarge(input.uri, tab.group.viewColumn).finally(() => checking.delete(key));
+    if (checking.has(key)) {
+      checking.set(key, true);
+      return;
+    }
+    checking.set(key, false);
+    void reopenIfUnreadable(input.uri, tab).finally(() => {
+      const again = checking.get(key);
+      checking.delete(key);
+      if (again && tab.group.tabs.includes(tab)) check(tab);
+    });
   };
   for (const group of vscode.window.tabGroups.all) for (const tab of group.tabs) check(tab);
   return vscode.window.tabGroups.onDidChangeTabs((e) => {
@@ -1492,23 +1662,39 @@ export function watchOversizedTextTabs(): vscode.Disposable {
   });
 }
 
-async function reopenIfTooLarge(uri: vscode.Uri, viewColumn: vscode.ViewColumn): Promise<void> {
+/** VS Code's reason from an openTextDocument failure ("cannot open <uri>. Detail: <reason>"). */
+function openFailureReason(err: unknown): string {
+  const message = errorMessageOf(err);
+  return /\bDetail: (.+)$/s.exec(message)?.[1].trim() || message;
+}
+
+async function reopenIfUnreadable(uri: vscode.Uri, tab: vscode.Tab): Promise<void> {
   const key = uri.toString();
   if (vscode.workspace.textDocuments.some((d) => d.uri.toString() === key)) return; // synced: our editor works
   const stamp = await diskStampOf(uri);
-  if (!stamp || stamp.size <= EXTENSION_SYNC_LIMIT) return;
+  if (!stamp) return;
+  const tooLarge = stamp.size > EXTENSION_SYNC_LIMIT;
+  // VS Code resolves only the editor a group shows, so only that tab is probed (again when a tab becomes active);
+  // a tab of a file over the size limit always is. Tab properties are live: read after the await.
+  if (!tooLarge && !tab.isActive) return;
   const size = `${(stamp.size / (1024 * 1024)).toFixed(1)} MB`;
+  let reason: string;
   try {
-    // Throws "Files above 50MB cannot be synchronized with extensions" exactly when the custom editor cannot work.
+    // Throws exactly when the custom editor cannot work: "Files above 50MB cannot be synchronized with extensions",
+    // "File seems to be binary and cannot be opened as text".
     await vscode.workspace.openTextDocument(uri);
-    return; // fewer than 50 M characters once decoded (multi-byte text)
+    return; // a text document (also: over 50 MB on disk, but fewer than 50 M characters once decoded)
   } catch (err) {
+    reason = openFailureReason(err);
     getLog().warn(`${uri.toString(true)} (${size}) cannot be shown by FileStudio: ${errorMessageOf(err)}`);
   }
-  await reopenAsText(uri, viewColumn);
+  await reopenAsText(uri, tab.group.viewColumn);
   void vscode.window.showWarningMessage(
-    `"${fileNameOf(uri)}" (${size}) is too large for FileStudio: VS Code passes text files of up to 50 MB to ` +
-      'extensions. It was opened in the text editor instead.',
+    tooLarge
+      ? `"${fileNameOf(uri)}" (${size}) is too large for FileStudio: VS Code passes text files of up to 50 MB to ` +
+          'extensions. It was opened in the text editor instead.'
+      : `FileStudio cannot show "${fileNameOf(uri)}": VS Code does not open it as text (${reason}). It was opened ` +
+          'in the text editor instead.',
   );
 }
 
@@ -1612,7 +1798,7 @@ class CsvView {
 
   private sendInit(): void {
     if (!this.model) {
-      this.session.postError(`Could not parse "${this.session.fileName}"`, this.parseError);
+      this.session.postError(`Could not parse "${this.session.fileName}"`, this.parseError, true); // logged by ensureParsed
       return;
     }
     try {
@@ -1654,6 +1840,42 @@ const TASK_MARKER_TEXT_RE = /^\[[ xX]\]$/;
 function markdownMode(uri: vscode.Uri): MarkdownMode {
   const mode = vscode.workspace.getConfiguration('fileStudio', uri).get<string>('markdown.defaultMode');
   return mode === 'split' || mode === 'wysiwyg' ? mode : 'preview';
+}
+
+/** Settings that make VS Code treat a file as read-only (re-checked when one of them changes). */
+const READONLY_SETTINGS = ['files.readonlyInclude', 'files.readonlyExclude', 'files.readonlyFromPermissions'];
+
+/**
+ * Whether VS Code's text editor treats the document as read-only (filesConfigurationService.isReadonly), so a task
+ * checkbox must not change it either: a read-only file system (git:, a commit), then `files.readonlyInclude`, or
+ * `files.readonlyFromPermissions` with a file that cannot be written, both unless `files.readonlyExclude` matches.
+ * Like VS Code, a glob matches the path relative to the workspace folder or the absolute path. "Set Active Editor
+ * Read-only in Session" is not visible to extensions.
+ */
+async function isReadonlyDocument(document: vscode.TextDocument): Promise<boolean> {
+  const uri = document.uri;
+  if (vscode.workspace.fs.isWritableFileSystem(uri.scheme) === false) return true;
+  const files = vscode.workspace.getConfiguration('files', uri);
+  const folder = vscode.workspace.getWorkspaceFolder(uri);
+  const matches = (setting: string): boolean =>
+    Object.entries(files.get<Record<string, boolean>>(setting) ?? {}).some(
+      ([glob, on]) =>
+        on === true &&
+        (vscode.languages.match({ pattern: glob }, document) > 0 ||
+          (folder !== undefined && vscode.languages.match({ pattern: new vscode.RelativePattern(folder, glob) }, document) > 0)),
+    );
+  if (matches('readonlyInclude')) return !matches('readonlyExclude');
+  // files.readonlyFromPermissions is window-scoped: read it without a resource (as VS Code does), or the extension
+  // host logs "Accessing a window scoped configuration for a resource is not expected".
+  if (uri.scheme === 'file' && vscode.workspace.getConfiguration('files').get<boolean>('readonlyFromPermissions') === true) {
+    try {
+      await access(uri.fsPath, fsConstants.W_OK);
+    } catch (err) {
+      // A file that is gone is not read-only: VS Code shows it as deleted, and a save writes it again.
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') return !matches('readonlyExclude');
+    }
+  }
+  return false;
 }
 
 /** dist + media, plus the document's folder and all workspace folders (for relative images). */
@@ -1701,6 +1923,10 @@ class MarkdownView {
    * only knows versions it got from us, so a toggle for the current version is checked against exactly what it showed.
    */
   private rendered: { version: number; tasks: Map<number, TaskMarker> } | undefined;
+  /** VS Code treats the document as read-only (isReadonlyDocument): task toggles are refused, the webview disables them. */
+  private readOnly = false;
+  /** The first read-only check; 'ready' waits for it, so the init already says whether the checkboxes work. */
+  private readonly firstReadOnlyCheck: Promise<boolean>;
 
   constructor(
     private readonly document: vscode.TextDocument,
@@ -1710,13 +1936,18 @@ class MarkdownView {
     this.rerender = debounce(() => this.pushUpdate(), TEXT_DEBOUNCE_MS);
     this.session.onDispose(this.rerender);
     this.session.onDispose(onTextDocumentChanged(document, () => this.onDocumentChanged()));
+    this.firstReadOnlyCheck = this.refreshReadOnly(false);
+    this.session.onDispose(
+      vscode.workspace.onDidChangeConfiguration((e) => {
+        if (READONLY_SETTINGS.some((setting) => e.affectsConfiguration(setting, document.uri))) void this.refreshReadOnly(true);
+      }),
+    );
   }
 
   private onMessage(msg: WebviewMessage): Promise<void> | void {
     switch (msg.type) {
       case 'ready':
-        this.sendInit();
-        return;
+        return this.firstReadOnlyCheck.then(() => this.sendInit());
       case 'toggleTask':
         return this.toggleTask(msg);
       default:
@@ -1755,7 +1986,27 @@ class MarkdownView {
       source: rendered.source,
       mode: markdownMode(this.document.uri),
       version: rendered.version,
+      readOnly: this.readOnly,
     });
+  }
+
+  /**
+   * Checks again whether the document is read-only. With `push`, a change goes to the webview at once (a settings
+   * change, a file made read-only since the last check), so its task checkboxes follow. Never rejects.
+   */
+  private async refreshReadOnly(push: boolean): Promise<boolean> {
+    let readOnly = false;
+    try {
+      readOnly = await isReadonlyDocument(this.document);
+    } catch (err) {
+      logError(`[markdown] Could not check whether ${this.session.fileName} is read-only`, err);
+    }
+    if (readOnly !== this.readOnly) {
+      this.readOnly = readOnly;
+      getLog().info(`[markdown] ${this.session.fileName} is ${readOnly ? 'read-only: its task checkboxes are disabled' : 'no longer read-only'}`);
+      if (push) this.pushUpdate();
+    }
+    return readOnly;
   }
 
   /** Sends the current rendering: a cheap markdownUpdate when content is shown, otherwise a full init. */
@@ -1773,6 +2024,7 @@ class MarkdownView {
       toc: rendered.toc,
       source: rendered.source,
       version: rendered.version,
+      readOnly: this.readOnly,
     });
   }
 
@@ -1796,6 +2048,13 @@ class MarkdownView {
   private async toggleTask(msg: MessageOf<'toggleTask'>): Promise<void> {
     const document = this.document;
     const where = `line ${msg.line + 1} of ${this.session.fileName}`;
+    // Checked again at the click (the file may have been made read-only since): VS Code's own editor refuses edits to
+    // a read-only document, and an edit applied anyway would change it in memory only (not dirty, never saved).
+    if (await this.refreshReadOnly(true)) {
+      getLog().info(`[markdown] Task toggle on ${where} refused: the document is read-only`);
+      this.answerToggle(msg, false, 'the document is read-only');
+      return;
+    }
     if (msg.version !== document.version) {
       // The webview clicked an older rendering; the change already scheduled the one it is missing.
       getLog().info(`[markdown] Task toggle on ${where} ignored: the document changed (v${msg.version} -> v${document.version})`);
@@ -1849,8 +2108,11 @@ type DocxOutcome = { ok: true; result: DocxResult } | { ok: false; error: unknow
 
 async function renderDocxFile(uri: vscode.Uri): Promise<DocxOutcome> {
   try {
-    const data = await vscode.workspace.fs.readFile(uri);
+    const data = await readDocumentBytes(uri, isZipPackage);
     const result = await renderDocx(data);
+    if (data.length === 0) {
+      getLog().info(`[docx] ${uri.toString(true)} is empty (0 bytes): shown as an empty document, as Word opens it`);
+    }
     if (result.warnings.length > 0) {
       getLog().info(`[docx] ${result.warnings.length} conversion warning(s) for ${uri.toString(true)}`);
     }
@@ -2071,7 +2333,12 @@ async function loadPdfFile(uri: vscode.Uri): Promise<PdfOutcome> {
     if (uri.scheme === 'file') {
       ({ head, size: fileSize } = await readFileHead(uri.fsPath, PDF_HEADER_SEARCH_BYTES));
     } else {
-      data = await vscode.workspace.fs.readFile(uri);
+      const isPdf = (bytes: Uint8Array): boolean => checkPdf(bytes.subarray(0, PDF_HEADER_SEARCH_BYTES)).error === undefined;
+      data = await readDocumentBytes(uri, isPdf);
+      // The bytes go to the webview in init. A Node Buffer (what git, and so the Git file system, returns) would arrive
+      // as { type: 'Buffer', data: [...] }: VS Code's postMessage serializer meets Buffer.toJSON before its typed-array
+      // handling. A plain Uint8Array (a copy) is transferred as bytes.
+      if (Buffer.isBuffer(data)) data = new Uint8Array(data);
       head = data.subarray(0, PDF_HEADER_SEARCH_BYTES);
       fileSize = data.byteLength;
     }
@@ -2132,7 +2399,7 @@ type PptxOutcome = { ok: true; deck: PptxDeck } | { ok: false; error: unknown };
 /** Parses the deck once (renderPptx throws readable messages, keeping the library's error as `cause`). */
 async function loadPptxFile(uri: vscode.Uri): Promise<PptxOutcome> {
   try {
-    const deck = await renderPptx(await vscode.workspace.fs.readFile(uri));
+    const deck = await renderPptx(await readDocumentBytes(uri, isZipPackage));
     const { slideCount, lossy } = deck.meta;
     getLog().info(
       `[pptx] Loaded ${uri.toString(true)} (${slideCount} slide${slideCount === 1 ? '' : 's'}` +

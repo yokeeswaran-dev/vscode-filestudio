@@ -256,6 +256,18 @@ export interface SelectionStats {
   min?: number;
   max?: number;
   /**
+   * Cells holding an error value (#DIV/0!, #N/A ...); they are counted in `count` too. Like Excel, the status bar then
+   * shows only Count. Absent when there is none (always for CSV, whose fields are text).
+   */
+  errors?: number;
+  /**
+   * Sum / Average / Min / Max as Excel's status bar shows them: in the number format of the first numeric cell in the
+   * order of `ranges` (range by range, each row by row; Excel 16 does the same: B9 0.0% then B10 #,##0.00 shows both
+   * as percentages, 'B10,B9' as numbers), e.g. a date, a percentage or a currency. Absent when that cell has the
+   * General format (the viewer formats plain numbers itself) and for CSV.
+   */
+  text?: { sum: string; avg?: string; min?: string; max?: string };
+  /**
    * True when the selection holds more cells than getStats reads (its work cap): the values above cover only the
    * first `scanned` cells, row by row, and are lower bounds / partial aggregates. Absent when complete.
    */
@@ -280,6 +292,12 @@ export interface CsvModel {
    * single spaces (empty fields as "").
    */
   collapseSpaces?: boolean;
+  /**
+   * (v0.1.1, additive) Excel's delimiter directive when the text starts with one (after the BOM): the line as
+   * written, e.g. 'sep=;\r\n'. It sets `delimiter` (unless parseCsv was given one) and is not a row; serializeCsv
+   * writes it back. Absent = no directive.
+   */
+  sepLine?: string;
 }
 
 // ===== IMPLEMENTATION =====
@@ -352,7 +370,10 @@ const TextXform = require('exceljs/lib/xlsx/xform/strings/text-xform') as (new (
 interface XCellParser {
   parser?: unknown;
   model?: XCellLoadModel;
+  /** The <c t="..."> attribute of the cell being parsed ('s', 'str', 'inlineStr', ...). */
+  t?: string;
   parseOpen(node: { name: string; attributes?: Record<string, string | undefined> }): boolean;
+  parseClose(name: string): boolean;
 }
 const CellXform = require('exceljs/lib/xlsx/xform/sheet/cell-xform') as { prototype: XCellParser } | undefined;
 
@@ -457,6 +478,10 @@ interface XCellLoadModel {
   ref?: string;
   /** The <c cm="n"> attribute (ExcelJS drops it): 1-based cell-metadata record, e.g. a dynamic array. */
   cm?: string;
+  /** Cell value (a string for t="str" / t="inlineStr", {richText} for inline runs). */
+  value?: unknown;
+  /** Cached result of a formula (a string for t="str"). */
+  result?: unknown;
 }
 
 /** Cell value holder (NumberValue, FormulaValue, ...): `type` is a getter. */
@@ -589,6 +614,8 @@ const VT = {
 
 const MAX_ROWS = 1_048_576;
 const MAX_COLS = 16_384;
+/** Longest sheet name Excel allows. */
+const SHEET_NAME_MAX = 31;
 /** Maximum digit width (px) of the default font (Calibri 11): Excel's column-width unit. */
 const MDW = 7;
 const DEFAULT_COL_WIDTH_PX = 64;
@@ -1141,20 +1168,40 @@ function formatAffectsText(fmt: string): boolean {
   return sections.some((section) => section.replace(/"[^"]*"|\\./g, '').includes('@'));
 }
 
-/** Excel "General" for numbers (up to 11 characters, else 6-digit scientific). */
+/**
+ * Excel "General" for numbers: up to 11 characters (a minus sign not counted), else 6-digit scientific. Digits are
+ * rounded half away from zero on the 15-digit decimal value, as Excel does (8238230.9475 -> '8238230.948', where
+ * ssf's binary rounding gave '8238230.947'). Below 0.0001 a value is shown in full when 9 decimals hold it exactly
+ * ('0.000012345'), else in scientific ('1.23456E-05'; 0.000099999999995 -> '1E-04').
+ */
 function formatGeneral(value: number): string {
   const abs = Math.abs(value);
   if (Number.isInteger(value) && abs < 1e11) {
     return String(value);
   }
-  if (abs >= 1e9 && abs < 1e11) {
-    // 10 or 11 integer digits leave no room for decimals: Excel rounds to an integer and goes
-    // scientific only when that needs 12 digits (ssf truncates 12345678901.6, and turns
-    // 9999999999.95 into 1E+10 instead of 10000000000).
-    const rounded = Math.sign(value) * Math.round(abs);
-    return Math.abs(rounded) < 1e11 ? String(rounded) : SSF.format('General', rounded);
+  const dec = toDecimal15(abs);
+  if (!dec.digits) {
+    return '0';
   }
-  return SSF.format('General', value);
+  const sign = value < 0 ? '-' : '';
+  const e = dec.point - 1; // abs = d.ddd x 10^e
+  if (e < 11 && (e >= -4 || dec.digits.length - dec.point <= 9)) {
+    // 10 significant digits fit (9 decimals below 1); 10 or 11 integer digits leave no room for decimals, and
+    // only a value that rounds to 12 integer digits goes scientific.
+    const r = roundDecimal(dec, 0, Math.max(0, 9 - Math.max(e, 0)));
+    if (r.int.length <= 11) {
+      const frac = r.frac.replace(/0+$/, '');
+      return `${sign}${r.int || '0'}${frac ? `.${frac}` : ''}`;
+    }
+  }
+  let exp = e;
+  let r = roundDecimal(dec, -exp, 5);
+  if (r.int.length > 1) {
+    exp++; // 9.999995E+20 -> 1E+21
+    r = roundDecimal(dec, -exp, 5);
+  }
+  const frac = r.frac.replace(/0+$/, '');
+  return `${sign}${r.int}${frac ? `.${frac}` : ''}E${exp < 0 ? '-' : '+'}${String(Math.abs(exp)).padStart(2, '0')}`;
 }
 
 // ----- numeric sections -----
@@ -1300,7 +1347,7 @@ function roundFixed(abs: number, shift: number, decimals: number): { int: string
 const NUM_CONDITION_RE = /^(<=|>=|<>|<|>|=)\s*(-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)$/;
 const NUM_COLOR_RE = /^(?:black|white|red|green|blue|yellow|magenta|cyan|color\s*\d+)$/i;
 
-/** Parses one number section; undefined for anything else (dates, fractions, '@', unknown codes). */
+/** Parses one number section; undefined for anything else (dates, fractions, '@', unknown codes, letters Excel rejects). */
 function compileNumberSection(src: string): NumSection | undefined {
   const s: NumSection = { tokens: [], ints: [], decs: [], exps: [], group: false, shift: 0, general: false, fill: false };
   const commas: { at: number; zone: 'int' | 'dec' | 'exp' }[] = [];
@@ -1390,7 +1437,9 @@ function compileNumberSection(src: string): NumSection | undefined {
           i += 7;
           break;
         }
-        if (/[A-Za-z@/]/.test(ch)) return undefined; // date parts, fractions, text placeholder
+        // Date / time codes (y m d h s, e g b era years) and 'n' do not go with digits; '@' text, '/' fractions. Excel
+        // takes any other letter as a literal ('0.0x', '0.0 °C', '#,##0 K'; it escapes them only when it saves).
+        if (/[BDEGHMNSYbdeghmnsy@/]/.test(ch)) return undefined;
         lit(ch);
         i++;
         break;
@@ -1626,6 +1675,96 @@ function renderNumberSection(s: NumSection, abs: number, fill?: FillLayout): { t
   return { text, zero: !s.sci && !r.int && !/[1-9]/.test(r.frac) };
 }
 
+// ----- date / time sections -----
+
+/** Characters ssf reads in a date section as codes ('a' only in AM/PM and A/P) or as plain literals. */
+const SSF_DATE_CHARS: ReadonlySet<string> = new Set('yYmMdDhHsSeEbBaA0123456789#?@ ,$-+/():!^&\'~{}<>=€cfijklopqrtuvwxzP');
+
+/**
+ * A date / time format as ssf can read it. Excel takes every character that is not a code as a literal (and escapes
+ * it when it saves the file: 'dd\.mm\.yyyy'), but ExcelJS, openpyxl and pandas store the code as it was typed
+ * ('dd.mm.yyyy', 'yyyy-mm-ddThh:mm:ss', 'yyyy年m月d日'), and ssf throws on such literals ("bad second format: .").
+ * In each date section, a '.' that does not start sub-seconds ('ss.00') and every character ssf knows neither as a
+ * code nor as a literal (T, CJK, '|', ...) are quoted; the era code g / ggg is dropped (empty for the Gregorian
+ * calendar, as Excel 16 shows it). Number and text sections are left as they are.
+ */
+function normalizeDateFormat(fmt: string): string {
+  return splitFormatSections(fmt)
+    .map((section) => {
+      let date = false;
+      try {
+        date = !isTextSection(section) && SSF.is_date(section);
+      } catch {
+        // not a date section
+      }
+      return date ? normalizeDateSection(section) : section;
+    })
+    .join(';');
+}
+
+function normalizeDateSection(section: string): string {
+  let out = '';
+  let literal = '';
+  const flush = (): void => {
+    if (literal) out += `"${literal}"`;
+    literal = '';
+  };
+  for (let i = 0; i < section.length; ) {
+    const ch = section[i];
+    if (ch === '"' || ch === '[') {
+      const end = section.indexOf(ch === '"' ? '"' : ']', i + 1);
+      const stop = end < 0 ? section.length : end + 1;
+      flush();
+      out += section.slice(i, stop);
+      i = stop;
+    } else if (ch === '\\' || ch === '_') {
+      // '\x' literal, '_x' blank: ssf takes one UTF-16 unit for x, so a character outside the BMP is quoted / padded as a space
+      const next = String.fromCodePoint(section.codePointAt(i + 1) ?? 32);
+      flush();
+      out += next.length === 1 ? section.slice(i, i + 2) : ch === '\\' ? `"${next}"` : '_ ';
+      i += 1 + next.length;
+    } else if (ch === '*') {
+      // '*x' fill: dates get no fill layout, so x shows once, as ssf shows most fill characters ('* ' and '**' none)
+      const next = i + 1 < section.length ? String.fromCodePoint(section.codePointAt(i + 1) ?? 32) : '';
+      if (next === ' ' || next === '*' || next === '"') {
+        flush();
+        out += next === '"' ? '\\"' : `*${next}`; // kept: dropping it could join two codes ('dddd* d')
+      } else {
+        literal += next;
+      }
+      i += 1 + next.length;
+    } else if (ch === '.' && section[i + 1] !== '0') {
+      literal += '.';
+      i++;
+    } else if (/^general/i.test(section.slice(i, i + 7)) || section.startsWith('上午/下午', i)) {
+      const n = ch === '上' ? 5 : 7;
+      flush();
+      out += section.slice(i, i + n);
+      i += n;
+    } else if (ch === 'g' || ch === 'G') {
+      i++; // era
+    } else if (ch === '.' || SSF_DATE_CHARS.has(ch)) {
+      flush();
+      out += ch;
+      i++;
+    } else {
+      const cp = String.fromCodePoint(section.codePointAt(i) ?? 32);
+      literal += cp;
+      i += cp.length;
+    }
+  }
+  flush();
+  return out;
+}
+
+/** ssf's last serial (9999-12-31 0:00); Excel's last day goes on to 23:59:59.999. */
+const SSF_LAST_SERIAL = 2_958_465;
+/** Days in 400 Gregorian years: after them, months, days and weekdays repeat. */
+const GREGORIAN_CYCLE_DAYS = 146_097;
+/** NumberFormatter.lastDay: the marks put around [h] / [m] / [s] (control characters no format shows) and their units per day. */
+const ELAPSED_MARKS = { h: '\u0001', m: '\u0002', s: '\u0003' };
+const ELAPSED_PER_DAY = [24, 1_440, 86_400];
+
 /**
  * Number formatting: number sections are laid out by compileNumberFormat /
  * renderNumberFormat, dates / times / fractions / text sections by ssf (dates
@@ -1638,7 +1777,8 @@ class NumberFormatter {
   private readonly textFlags = new Map<string, boolean>();
   private readonly compiled = new Map<string, NumFormat | null>();
   private readonly textFills = new Map<string, string | null>();
-  private readonly subseconds = new Map<string, number>();
+  /** Date formats as ssf reads them (normalizeDateFormat) + their sub-second digits. */
+  private readonly dateFormats = new Map<string, { code: string; digits: number }>();
   private readonly dateCache = new Map<string, Map<number, string>>();
   private readonly broken = new Set<string>();
 
@@ -1646,12 +1786,15 @@ class NumberFormatter {
     this.opts = { date1904 };
   }
 
-  /** True when the format displays a date and/or time. */
+  /**
+   * True when the format displays a date and/or time. A format that compiles as a number format never does, even
+   * when ssf thinks so: ssf reads the 'E' of an exponent after a literal ('0.00\ E+00', as Excel saves it) as a date code.
+   */
   isDate(fmt: string): boolean {
     let flag = this.dateFlags.get(fmt);
     if (flag === undefined) {
       try {
-        flag = fmt !== 'General' && SSF.is_date(fmt);
+        flag = fmt !== 'General' && !this.compile(fmt) && SSF.is_date(fmt);
       } catch {
         flag = false;
       }
@@ -1688,12 +1831,7 @@ class NumberFormatter {
    * Values repeat a lot (one date per day), so results are cached per format.
    */
   private date(fmt: string, value: number): string {
-    let digits = this.subseconds.get(fmt);
-    if (digits === undefined) {
-      const m = /\.(0+)/.exec(fmt.replace(/"[^"]*"|\\.|\[[^\]]*\]/g, ''));
-      digits = m ? Math.min(3, m[1].length) : 0;
-      this.subseconds.set(fmt, digits);
-    }
+    const { code, digits } = this.dateFormat(fmt);
     if (value < 0) {
       return this.opts.date1904 ? `-${this.date(fmt, -value)}` : DATE_OVERFLOW_TEXT;
     }
@@ -1709,7 +1847,7 @@ class NumberFormatter {
     let text = cache.get(serial);
     if (text === undefined) {
       try {
-        text = SSF.format(fmt, serial, this.opts);
+        text = serial > SSF_LAST_SERIAL ? this.lastDay(code, serial) : SSF.format(code, serial, this.opts);
       } catch {
         this.checkBroken(fmt);
         return formatGeneral(value);
@@ -1720,9 +1858,47 @@ class NumberFormatter {
     return text;
   }
 
+  /** The format as ssf reads it (normalizeDateFormat) and its sub-second digits ('ss.00' -> 2). */
+  private dateFormat(fmt: string): { code: string; digits: number } {
+    let info = this.dateFormats.get(fmt);
+    if (!info) {
+      const code = normalizeDateFormat(fmt);
+      const m = /\.(0+)/.exec(code.replace(/"[^"]*"|\\.|\[[^\]]*\]/g, ''));
+      info = { code, digits: m ? Math.min(3, m[1].length) : 0 };
+      this.dateFormats.set(fmt, info);
+    }
+    return info;
+  }
+
+  /**
+   * A time on 9999-12-31 (1900 system), past ssf's last serial (ssf returns ''). The value is formatted 400 and 800
+   * years earlier - same month, day, weekday and time - and the characters that differ between the two texts (the
+   * year digits 9599 / 9199) are the 9s of 9999. Elapsed times ([h], [m], [s]) count from serial 0, so each one is
+   * formatted between two marks (quoted, so ssf reads the format the same way) and gets the hours / minutes /
+   * seconds of the shift back.
+   */
+  private lastDay(code: string, serial: number): string {
+    const marked = code.replace(/"[^"]*"|\\.|\[(h+|m+|s+)\]/gi, (all: string, unit?: string) => {
+      const mark = unit ? ELAPSED_MARKS[unit.charAt(0).toLowerCase() as keyof typeof ELAPSED_MARKS] : '';
+      return mark ? `"${mark}"${all}"${mark}"` : all;
+    });
+    const shifted = (days: number): string =>
+      SSF.format(marked, serial - days, this.opts).replace(/([\u0001-\u0003])(\d+)\1/g, (_all, mark: string, count: string) =>
+        String(Number(count) + days * ELAPSED_PER_DAY[mark.charCodeAt(0) - 1]),
+      );
+    const a = shifted(GREGORIAN_CYCLE_DAYS);
+    const b = shifted(2 * GREGORIAN_CYCLE_DAYS);
+    if (a.length !== b.length) {
+      return a;
+    }
+    let text = '';
+    for (let i = 0; i < a.length; i++) text += a[i] === b[i] ? a[i] : '9';
+    return text;
+  }
+
   /** Does a number shown with this format get a FillLayout ('*' fill in its number sections)? Dates do not. */
   numberHasFill(fmt: string): boolean {
-    return fmt !== 'General' && !this.isDate(fmt) && !!this.compile(fmt)?.fill;
+    return fmt !== 'General' && !!this.compile(fmt)?.fill;
   }
 
   /** The text section of the format when it has a '*' fill (laid out here, not by ssf), else null. */
@@ -1774,7 +1950,7 @@ class NumberFormatter {
   /** After a failure: formats ssf cannot parse at all fall back to General from now on. */
   private checkBroken(fmt: string): void {
     try {
-      SSF.format(fmt, 1, this.opts);
+      SSF.format(this.isDate(fmt) ? this.dateFormat(fmt).code : fmt, 1, this.opts);
     } catch {
       this.broken.add(fmt);
     }
@@ -2141,6 +2317,8 @@ interface WorkbookExtras {
   externalBooks?: (ExternalBook | undefined)[];
   /** Array formulas per worksheet id (absent: none in the file). */
   arrayFormulas?: Map<number, ArrayFormulaInfo[]>;
+  /** Threaded-comment text per worksheet id and cell (row * MAX_COLS + col), shown instead of the legacy note. */
+  threadedNotes?: Map<number, Map<number, string>>;
   /** ExcelJS cell-style object -> cellXfs index (objects are shared per xf) + numFmt at load time. */
   xfByStyle: Map<object, { xf: number; numFmt: unknown }>;
   /** ExcelJS font object -> <fonts> index + size at load time. */
@@ -2184,6 +2362,8 @@ interface XRelationship {
 
 const HYPERLINK_REL_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink';
 const COMMENTS_REL_TYPE = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments';
+const THREADED_COMMENT_REL_TYPE = 'http://schemas.microsoft.com/office/2017/10/relationships/threadedComment';
+const PERSON_REL_TYPE = 'http://schemas.microsoft.com/office/2017/10/relationships/person';
 
 /** Optional facts about the file loadWorkbook cannot know from its bytes. */
 export interface LoadOptions {
@@ -2200,8 +2380,10 @@ export interface LoadOptions {
  * '#Sheet2!A1' links, the same form ExcelJS writes), the raw styles.xml data
  * needed for exact number formats, font sizes and custom indexed palettes, and
  * the original sqref of data validations. Sheet names ExcelJS' API refuses
- * ("History", see patchSheetNameCheck) are taken as they are in the file, and
- * notes are kept when written without runs or on cells absent from <sheetData>.
+ * ("History", see patchSheetNameCheck) are taken as they are in the file,
+ * notes are kept when written without runs or on cells absent from <sheetData>,
+ * threaded comments are read (readThreadedComments), and the _xHHHH_ escapes
+ * of inline strings and formula results are decoded (patchCellParser).
  */
 export async function loadWorkbook(data: Uint8Array, options?: LoadOptions): Promise<ExcelJS.Workbook> {
   const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
@@ -2224,7 +2406,7 @@ export async function loadWorkbook(data: Uint8Array, options?: LoadOptions): Pro
     loadingWorkbooks.delete(workbook);
     restore();
   }
-  const { styles, externalBooks, hasWorkbookPart, dynamicArrayCells } = await rawParts;
+  const { styles, externalBooks, hasWorkbookPart, dynamicArrayCells, threadedNotes } = await rawParts;
   if (hasWorkbookPart === false) throw new Error(NO_WORKBOOK_PART_MESSAGE);
   try {
     attachOrphanNotes(workbook, captured.comments ?? []);
@@ -2232,7 +2414,7 @@ export async function loadWorkbook(data: Uint8Array, options?: LoadOptions): Pro
     // best effort only: the workbook itself loaded
   }
   const arrayFormulas = captured.arrays ? arrayFormulasById(captured.arrays, dynamicArrayCells) : undefined;
-  workbookExtras.set(workbook, { ...buildExtras(styles, captured.styles), externalBooks, arrayFormulas });
+  workbookExtras.set(workbook, { ...buildExtras(styles, captured.styles), externalBooks, arrayFormulas, threadedNotes });
   return workbook;
 }
 
@@ -2257,16 +2439,29 @@ let cellParserPatched = false;
 
 /**
  * ExcelJS drops the `cm` attribute of <c> (the cell-metadata record that marks an Excel 365 dynamic-array formula,
- * which the formula bar shows without the {} of a legacy array formula). Its cell parser is wrapped once, for good,
- * to keep `cm` on the parsed cell model and to count array formulas, so the load only looks for them when there are.
+ * which the formula bar shows without the {} of a legacy array formula), and it decodes the _xHHHH_ escapes of
+ * cell text (see decodeXstring) only in shared strings and rich-text runs. Its cell parser is wrapped once, for
+ * good, to keep `cm` on the parsed cell model, to count array formulas (so the load only looks for them when there
+ * are), and to decode the escapes of plain inline strings and string formula results (t="inlineStr" / t="str":
+ * Excel stores ="x"&CHAR(13)&CHAR(10)&"y" as <v>x_x000D_\ny</v>).
  */
 function patchCellParser(): void {
   const proto = CellXform?.prototype;
   const parseOpen = proto?.parseOpen;
-  if (cellParserPatched || !proto || typeof parseOpen !== 'function') {
+  const parseClose = proto?.parseClose;
+  if (cellParserPatched || !proto || typeof parseOpen !== 'function' || typeof parseClose !== 'function') {
     return;
   }
   cellParserPatched = true;
+  proto.parseClose = function parseCloseDecodingText(this: XCellParser, name: string): boolean {
+    const handled = parseClose.call(this, name);
+    const model = this.model;
+    if (name === 'c' && model && (this.t === 'str' || this.t === 'inlineStr')) {
+      if (typeof model.value === 'string') model.value = decodeXstring(model.value);
+      if (typeof model.result === 'string') model.result = decodeXstring(model.result);
+    }
+    return handled;
+  };
   proto.parseOpen = function parseOpenWithMetadata(this: XCellParser, node): boolean {
     const nested = this.parser !== undefined;
     const handled = parseOpen.call(this, node);
@@ -2279,6 +2474,15 @@ function patchCellParser(): void {
     }
     return handled;
   };
+}
+
+/**
+ * Cell text as Excel reads it from the file (an ST_Xstring): each _xHHHH_ escape is the UTF-16 code unit HHHH, in
+ * one left-to-right pass ('_x005F_x000D_' is the literal text '_x000D_'). Excel 16 takes the hex digits in either
+ * case; ExcelJS' shared-string reader only upper case.
+ */
+function decodeXstring(text: string): string {
+  return text.includes('_x') ? text.replace(/_x([0-9A-Fa-f]{4})_/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16))) : text;
 }
 
 /** The array-formula cells of every worksheet of the load model (a walk over all parsed cells). */
@@ -2609,13 +2813,15 @@ function injectInternalHyperlinks(model: XLoadModel): void {
 }
 
 /**
- * Package parts read straight from the zip: styles.xml details, the external workbooks and the cell-metadata records
- * of dynamic arrays. `hasWorkbookPart` is undefined when the zip itself cannot be read (ExcelJS reports that).
+ * Package parts read straight from the zip: styles.xml details, the external workbooks, the cell-metadata records
+ * of dynamic arrays and the threaded comments. `hasWorkbookPart` is undefined when the zip itself cannot be read
+ * (ExcelJS reports that).
  */
 async function readRawParts(buffer: Uint8Array, folder?: string): Promise<{
   styles?: RawStyles;
   externalBooks?: (ExternalBook | undefined)[];
   dynamicArrayCells?: Set<number>;
+  threadedNotes?: Map<number, Map<number, string>>;
   hasWorkbookPart?: boolean;
 }> {
   let zip: JSZip;
@@ -2633,7 +2839,7 @@ async function readRawParts(buffer: Uint8Array, folder?: string): Promise<{
       return undefined; // best effort only: ExcelJS reports broken packages itself
     }
   };
-  const [styles, externalBooks, dynamicArrayCells] = await Promise.all([
+  const [styles, externalBooks, dynamicArrayCells, threadedNotes] = await Promise.all([
     read(async () => {
       const file = zip.file('xl/styles.xml');
       return file ? parseRawStyles(await file.async('string')) : undefined;
@@ -2643,8 +2849,9 @@ async function readRawParts(buffer: Uint8Array, folder?: string): Promise<{
       const file = zip.file('xl/metadata.xml');
       return file ? dynamicArrayMetadata(await file.async('string')) : undefined;
     }),
+    read(() => readThreadedComments(zip)),
   ]);
-  return { styles, externalBooks, dynamicArrayCells, hasWorkbookPart: true };
+  return { styles, externalBooks, dynamicArrayCells, threadedNotes, hasWorkbookPart: true };
 }
 
 /**
@@ -2709,16 +2916,74 @@ function relationshipId(attributes: string): string | undefined {
   return key ? attrs[key] : undefined;
 }
 
-/** Relationship id -> target of a part's .rels (targets as written). */
-async function readRelationships(zip: JSZip, partPath: string): Promise<Map<string, string>> {
+/** Relationship id -> target of a part's .rels (targets as written); only relationships of `type` when given. */
+async function readRelationships(zip: JSZip, partPath: string, type?: string): Promise<Map<string, string>> {
   const slash = partPath.lastIndexOf('/');
   const xml = await zip.file(`${partPath.slice(0, slash + 1)}_rels/${partPath.slice(slash + 1)}.rels`)?.async('string');
   const out = new Map<string, string>();
   for (const m of xml?.matchAll(/<(?:\w+:)?Relationship\b([^>]*?)\/?>/g) ?? []) {
     const attrs = parseXmlAttributes(m[1]);
-    if (attrs.Id && attrs.Target !== undefined) out.set(attrs.Id, attrs.Target);
+    if (attrs.Id && attrs.Target !== undefined && (type === undefined || attrs.Type === type)) out.set(attrs.Id, attrs.Target);
   }
   return out;
+}
+
+/**
+ * Threaded comments (Excel 365) as note text, per worksheet id (sheetId) and cell (row * MAX_COLS + col): one
+ * 'Author: text' line per comment, the thread's first comment, then its replies. Excel also writes a legacy note for
+ * each thread whose text only tells older versions about it ("[Threaded comment] Your version of Excel allows you to
+ * read this threaded comment; ..."); like Excel 365, the grid shows the thread instead.
+ */
+async function readThreadedComments(zip: JSZip): Promise<Map<number, Map<number, string>> | undefined> {
+  if (!Object.keys(zip.files).some((name) => /^\/?xl\/threadedComments\//i.test(name))) {
+    return undefined;
+  }
+  const workbookXml = await zip.file('xl/workbook.xml')?.async('string');
+  if (!workbookXml) {
+    return undefined;
+  }
+  const persons = new Map<string, string>();
+  for (const target of (await readRelationships(zip, 'xl/workbook.xml', PERSON_REL_TYPE)).values()) {
+    const xml = await zip.file(resolvePartPath('xl/workbook.xml', target))?.async('string');
+    for (const m of xml?.matchAll(/<(?:\w+:)?person\b([^>]*?)\/?>/g) ?? []) {
+      const { id, displayName } = parseXmlAttributes(m[1]);
+      if (id && displayName) persons.set(id, displayName);
+    }
+  }
+  const workbookRels = await readRelationships(zip, 'xl/workbook.xml');
+  const out = new Map<number, Map<number, string>>();
+  for (const m of (xmlSection(workbookXml, 'sheets') ?? '').matchAll(/<(?:\w+:)?sheet\b([^>]*?)\/?>/g)) {
+    const sheetId = parseInt(parseXmlAttributes(m[1]).sheetId ?? '', 10);
+    const target = workbookRels.get(relationshipId(m[1]) ?? '');
+    if (!Number.isFinite(sheetId) || !target) continue;
+    const sheetPath = resolvePartPath('xl/workbook.xml', target);
+    const threads = new Map<number, { root: boolean; line: string }[]>();
+    for (const part of (await readRelationships(zip, sheetPath, THREADED_COMMENT_REL_TYPE)).values()) {
+      const xml = await zip.file(resolvePartPath(sheetPath, part))?.async('string');
+      for (const c of xml?.matchAll(/<(?:\w+:)?threadedComment\b([^>]*?)(?:\/>|>([\s\S]*?)<\/(?:\w+:)?threadedComment>)/g) ?? []) {
+        const attrs = parseXmlAttributes(c[1]);
+        const at = decodeCell(attrs.ref ?? '');
+        if (!at) continue;
+        // line breaks normalized as an XML parser does (Excel writes CR LF inside the text)
+        const raw = /<(?:\w+:)?text\b[^>]*>([\s\S]*?)<\/(?:\w+:)?text>/.exec(c[2] ?? '')?.[1] ?? '';
+        const text = decodeXmlEntities(raw.replace(/\r\n?/g, '\n'));
+        const author = persons.get(attrs.personId ?? '');
+        const key = at.r * MAX_COLS + at.c;
+        let thread = threads.get(key);
+        if (!thread) threads.set(key, (thread = []));
+        thread.push({ root: !attrs.parentId, line: author ? `${author}: ${text}` : text });
+      }
+    }
+    if (threads.size) {
+      // the first comment of the thread first (Excel writes it first anyway), replies in file order
+      const notes = new Map<number, string>();
+      for (const [key, thread] of threads) {
+        notes.set(key, [...thread.filter((c) => c.root), ...thread.filter((c) => !c.root)].map((c) => c.line).join('\n'));
+      }
+      out.set(sheetId, notes);
+    }
+  }
+  return out.size ? out : undefined;
 }
 
 /** Zip path of a relationship target ('externalLinks/externalLink1.xml' from 'xl/workbook.xml'). */
@@ -2912,6 +3177,8 @@ interface SheetContext {
   dynamicArrays: Set<number>;
   /** Legacy array formulas spanning several cells, by first row: their other cells show the formula too. */
   arrayRanges: ArrayFormulaInfo[];
+  /** Threaded comments by cell (row * MAX_COLS + col): shown instead of the cell's legacy note. */
+  threadedNotes?: ReadonlyMap<number, string>;
 }
 
 /**
@@ -2938,6 +3205,8 @@ export class WorkbookModel implements GridSource {
   private readonly externalBooks: readonly (ExternalBook | undefined)[];
   /** Array formulas found while loading, per worksheet id (see loadWorkbook). */
   private readonly arrayFormulas: ReadonlyMap<number, ArrayFormulaInfo[]> | undefined;
+  /** Threaded comments found while loading, per worksheet id (see readThreadedComments). */
+  private readonly threadedNotes: ReadonlyMap<number, ReadonlyMap<number, string>> | undefined;
   private sheets: SheetContext[] = [];
   private meta: Omit<WorkbookMeta, 'styles'> = { sheets: [], activeSheet: 0, defaultFont: { name: 'Calibri', size: 11 }, date1904: false };
 
@@ -2952,6 +3221,7 @@ export class WorkbookModel implements GridSource {
     this.formatter = new NumberFormatter(this.date1904);
     this.externalBooks = extras?.externalBooks ?? [];
     this.arrayFormulas = extras?.arrayFormulas;
+    this.threadedNotes = extras?.threadedNotes;
     this.converter = new StyleConverter(this.palette, this.defaultFont, extras);
     this.styleTable = new StyleTable((style) => this.converter.cellStyle(style));
     this.refresh();
@@ -2980,6 +3250,7 @@ export class WorkbookModel implements GridSource {
         arrayRanges: arrays
           .filter((a) => !a.dynamic && (a.range.r0 !== a.range.r1 || a.range.c0 !== a.range.c1))
           .sort((a, b) => a.range.r0 - b.range.r0),
+        threadedNotes: typeof ws.id === 'number' ? this.threadedNotes?.get(ws.id) : undefined,
       };
     });
     const sheets = this.sheets.map((ctx) => this.safeSheetMeta(ctx));
@@ -3068,7 +3339,48 @@ export class WorkbookModel implements GridSource {
       }
       return true;
     });
-    return acc.result();
+    if (acc.hasNumbers) {
+      acc.numFmt = this.firstNumberFormat(ctx, ranges);
+    }
+    return acc.result((fmt, value) => this.formatter.number(fmt, value));
+  }
+
+  /**
+   * Number format of the first numeric cell in the selection's own order (range by range, each one row by row), in
+   * which Excel 16 shows Sum / Average / Min / Max: 'D1,D4' with a date in D1 sums as a date, 'D4,D1' as D4's General.
+   * Undefined when the search passes the stats' work cap.
+   */
+  private firstNumberFormat(ctx: SheetContext, ranges: readonly Range[]): string | undefined {
+    const xrows = ctx.ws._rows;
+    let work = 0;
+    for (const g of ranges) {
+      if (!g || ![g.r0, g.r1, g.c0, g.c1].every((n) => typeof n === 'number' && Number.isFinite(n))) {
+        continue;
+      }
+      const r1 = Math.min(xrows.length - 1, Math.floor(Math.max(g.r0, g.r1)));
+      const c0 = Math.max(0, Math.floor(Math.min(g.c0, g.c1)));
+      const c1 = Math.min(MAX_COLS - 1, Math.floor(Math.max(g.c0, g.c1)));
+      for (let r = Math.max(0, Math.floor(Math.min(g.r0, g.r1))); r <= r1; r++) {
+        if (++work > STATS_CELL_CAP) {
+          return undefined;
+        }
+        const cells = xrows[r]?._cells;
+        if (!cells) {
+          continue;
+        }
+        const hi = Math.min(c1, cells.length - 1);
+        for (let c = c0; c <= hi; c++) {
+          const cell = cells[c];
+          if (++work > STATS_CELL_CAP) {
+            return undefined;
+          }
+          if (cell && typeof this.statValue(cell) === 'number') {
+            return this.statNumFmt(cell);
+          }
+        }
+      }
+    }
+    return undefined;
   }
 
   // ----- sheet meta -----
@@ -3430,7 +3742,7 @@ export class WorkbookModel implements GridSource {
         break;
     }
     if (s) out.s = s;
-    const note = noteText(cell);
+    const note = ctx.threadedNotes?.get(r * MAX_COLS + c) ?? noteText(cell);
     if (note) out.note = note;
     if (out.t === 'z' && !out.s && !out.note) {
       return undefined;
@@ -3604,8 +3916,11 @@ export class WorkbookModel implements GridSource {
     }
   }
 
-  /** Stats contribution: undefined = empty, null = non-numeric value, number = numeric. */
-  private statValue(cell: XCell): number | null | undefined {
+  /**
+   * Stats contribution: undefined = empty, null = non-numeric value, 'error' = a cell the grid shows as an error
+   * (#N/A, #DIV/0! ..., also #NUM! for a non-finite number and #VALUE! for an unreadable date), number = numeric.
+   */
+  private statValue(cell: XCell): StatValue {
     const xv = cell._value;
     const m = xv.model;
     switch (xv.type) {
@@ -3613,13 +3928,16 @@ export class WorkbookModel implements GridSource {
       case VT.Merge:
         return undefined;
       case VT.Number:
-        return typeof m.value === 'number' && Number.isFinite(m.value) ? m.value : null;
+        return typeof m.value === 'number' ? (Number.isFinite(m.value) ? m.value : 'error') : null;
       case VT.Date:
-        return m.value instanceof Date ? this.dateSerial(m.value) ?? null : null;
+        return m.value instanceof Date ? this.dateSerial(m.value) ?? 'error' : null;
+      case VT.Error:
+        return 'error';
       case VT.Formula: {
         const result = m.result;
-        if (typeof result === 'number') return Number.isFinite(result) ? result : null;
-        if (result instanceof Date) return this.dateSerial(result) ?? null;
+        if (typeof result === 'number') return Number.isFinite(result) ? result : 'error';
+        if (result instanceof Date) return this.dateSerial(result) ?? 'error';
+        if (isErrorValue(result)) return 'error';
         return null;
       }
       case VT.Hyperlink:
@@ -3627,6 +3945,16 @@ export class WorkbookModel implements GridSource {
       default:
         return null;
     }
+  }
+
+  /** Number format a numeric cell is shown in (as cellData: a date without a format shows as a date). */
+  private statNumFmt(cell: XCell): string {
+    const fmt = this.styleTable.styles[this.styleTable.indexOf(cell.style)].numFmt ?? 'General';
+    if (fmt !== 'General') return fmt;
+    const xv = cell._value;
+    const date = xv.type === VT.Date ? xv.model.value : xv.type === VT.Formula ? xv.model.result : undefined;
+    if (!(date instanceof Date)) return fmt;
+    return Number.isInteger(this.dateSerial(date)) ? BUILTIN_NUMFMTS[14] : BUILTIN_NUMFMTS[22];
   }
 
   // ----- data validation -----
@@ -3898,10 +4226,21 @@ function clampInt(value: unknown, min: number, max: number): number {
 
 // ===== SELECTION STATS =====
 
+/** One cell's part in the stats: undefined = empty, null = not numeric, 'error' = an error value, number = numeric. */
+type StatValue = number | null | undefined | 'error';
+
+/** An ExcelJS error value ({ error: '#N/A' }), e.g. a formula's cached result. */
+function isErrorValue(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && (value as { error?: unknown }).error !== undefined;
+}
+
 /** Aggregates Count / Sum / Average / Min / Max with a work cap (a capped result says so: `partial`). */
 class StatsAccumulator {
+  /** Number format of the selection's first numeric cell (set by the caller); Sum / Average / Min / Max are shown in it. */
+  numFmt: string | undefined;
   private count = 0;
   private numCount = 0;
+  private errors = 0;
   private sum = 0;
   private min = Infinity;
   private max = -Infinity;
@@ -3915,23 +4254,45 @@ class StatsAccumulator {
     return false;
   }
 
-  /** undefined = empty (ignored), null = non-empty but not numeric, number = numeric. */
-  add(value: number | null | undefined): void {
+  get hasNumbers(): boolean {
+    return this.numCount > 0;
+  }
+
+  /** undefined = empty (ignored), null = non-empty but not numeric, 'error' = an error value, number = numeric. */
+  add(value: StatValue): void {
     if (value === undefined) return;
     this.count++;
     if (value === null) return;
+    if (value === 'error') {
+      this.errors++;
+      return;
+    }
     this.numCount++;
     this.sum += value;
     if (value < this.min) this.min = value;
     if (value > this.max) this.max = value;
   }
 
-  result(): SelectionStats {
+  /** `format` (workbooks): formats a value in `numFmt` for SelectionStats.text. */
+  result(format?: (fmt: string, value: number) => string): SelectionStats {
     const out: SelectionStats = { count: this.count, numCount: this.numCount, sum: this.sum };
     if (this.numCount) {
       out.avg = this.sum / this.numCount;
       out.min = this.min;
       out.max = this.max;
+      const fmt = this.numFmt;
+      if (format && fmt !== undefined && fmt !== 'General') {
+        try {
+          // Without the layout the grid uses: the padding of '_)' / '* ' formats is not wanted in the status bar.
+          const text = (value: number): string => format(fmt, value).trim();
+          out.text = { sum: text(this.sum), avg: text(out.avg), min: text(this.min), max: text(this.max) };
+        } catch {
+          // The numbers are still shown, in the viewer's own format.
+        }
+      }
+    }
+    if (this.errors) {
+      out.errors = this.errors;
     }
     if (this.stopped) {
       out.partial = true;
@@ -4028,12 +4389,18 @@ const NUMERIC_TEXT_RE = /^[ \t]*[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?[ \t]*$
 const GROUPED_NUMBER_RE = /^[ \t]*[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?[ \t]*$/;
 const DECIMAL_COMMA_RE = /^[ \t]*[-+]?\d+,\d+[ \t]*$/;
 const PERCENT_TEXT_RE = /^[ \t]*[-+]?(?:\d+\.?\d*|\.\d+)%[ \t]*$/;
+/**
+ * Excel's delimiter directive: a first line 'sep=' + one character (any case, spaces around it and surrounding quotes
+ * allowed, also as the whole file), checked against Excel 16. Group 1 = the delimiter.
+ */
+const CSV_SEP_LINE_RE = /^[ \t]*"?sep=([^\r\n])"?[ \t]*(?:\r\n|\n|\r|$)/i;
 
 /**
  * Parses CSV/TSV text with papaparse (Excel's rules where papaparse reads
  * malformed quoting differently, see readCsvRecords). Detects BOM, delimiter
- * (, ; tab |), dominant line ending and trailing newline so serializeCsv can
- * reproduce the file. `delimiter` fixes the delimiter (PSV: '|').
+ * (Excel's 'sep=' first line, else , ; tab |), dominant line ending and
+ * trailing newline so serializeCsv can reproduce the file. `delimiter` fixes
+ * the delimiter (PSV: '|'); a 'sep=' line is then still not a row.
  *
  * `delimiter: ' '` with `collapseSpaces` reads space-separated text like
  * Excel's "treat consecutive delimiters as one" (checked against Excel 16
@@ -4052,9 +4419,14 @@ export function parseCsv(text: string, opts?: { delimiter?: string; collapseSpac
     hasBom = true;
     body = body.slice(1);
   }
+  // Excel's 'sep=;' first line names the delimiter and is not data (see CSV_SEP_LINE_RE).
+  const sep = CSV_SEP_LINE_RE.exec(body);
+  if (sep) {
+    body = body.slice(sep[0].length);
+  }
   const collapse = opts?.delimiter === ' ' && !!opts.collapseSpaces;
   const scan = scanCsv(body, collapse);
-  const delimiter = opts?.delimiter || scan.delimiter;
+  const delimiter = opts?.delimiter || sep?.[1] || scan.delimiter;
   const newline = scan.newline;
   // Whether the last record is terminated by a line break (decided after parsing: an
   // unterminated quote can swallow the final line break into the last field).
@@ -4079,6 +4451,9 @@ export function parseCsv(text: string, opts?: { delimiter?: string; collapseSpac
   if (collapse) {
     model.collapseSpaces = true;
   }
+  if (sep) {
+    model.sepLine = sep[0];
+  }
   const source = describeCsvSource(model, body, ends);
   if (source) {
     csvSources.set(model, source);
@@ -4101,7 +4476,7 @@ export function serializeCsv(model: CsvModel): string {
     lines[i] =
       raw !== undefined && rawRecordMatches(raw, row, delimiter, newline, collapse) ? raw : serializeCsvRow(row, delimiter, policy, collapse);
   }
-  let out = lines.join(newline);
+  let out = (model.sepLine ?? '') + lines.join(newline);
   if (model.trailingNewline && model.rows.length) {
     out += newline;
   }
@@ -4575,6 +4950,16 @@ function csvNumber(text: string, delimiter: string): number | undefined {
 }
 
 /**
+ * The sheet name Excel 16 gives a CSV file: its base name without the extension, '[' and ']' (not allowed in sheet
+ * names) turned into '(' and ')', cut to 31 characters (never inside a surrogate pair).
+ */
+function csvSheetName(fileName: string): string {
+  const base = fileName.replace(/^.*[\\/]/, '').replace(/\.[^.]*$/, '').replace(/\[/g, '(').replace(/\]/g, ')');
+  const cut = base.length > SHEET_NAME_MAX && /[\uD800-\uDBFF]/.test(base[SHEET_NAME_MAX - 1]) ? SHEET_NAME_MAX - 1 : SHEET_NAME_MAX;
+  return base.slice(0, cut) || 'Sheet1';
+}
+
+/**
  * CSV rows as a one-sheet grid. All cells are text, except numeric-looking
  * fields which are numbers (v) that keep their original text (w). With
  * `hasHeader` the first row stays text and is frozen. Column widths are sized
@@ -4597,7 +4982,7 @@ export class CsvGridModel implements GridSource {
     }
     const sheet: SheetMeta = {
       index: 0,
-      name: fileName.replace(/^.*[\\/]/, '').replace(/\.[^.]*$/, '') || 'Sheet1',
+      name: csvSheetName(fileName),
       state: 'visible',
       rowCount: Math.max(1, rows.length),
       colCount: Math.max(1, colCount),
@@ -4693,6 +5078,8 @@ function csvColumnWidths(rows: readonly string[][], colCount: number): Record<nu
 
 const LOSSY = {
   charts: 'Charts',
+  dialogSheets: 'Dialog sheets',
+  macroSheets: 'Macro sheets (Excel 4.0)',
   pivots: 'Pivot tables',
   macros: 'Macros (VBA project)',
   slicers: 'Slicers / timelines',
@@ -4724,6 +5111,9 @@ async function scanLossyFeatures(data: Uint8Array): Promise<string[]> {
   const names = Object.keys(zip.files).filter((name) => !zip.files[name].dir);
   const has = (re: RegExp): boolean => names.some((name) => re.test(name.replace(/^\//, '')));
   if (has(/^xl\/charts\/chart[^/]*\.xml$/i) || has(/^xl\/chartsheets\//i)) found.add(LOSSY.charts);
+  // sheets that are not worksheets: ExcelJS loads neither, so they get no tab
+  if (has(/^xl\/dialogsheets\//i)) found.add(LOSSY.dialogSheets);
+  if (has(/^xl\/macrosheets\//i)) found.add(LOSSY.macroSheets);
   if (has(/^xl\/pivot(Tables|Cache)\//i)) found.add(LOSSY.pivots);
   if (has(/^xl\/vbaProject\.bin$/i)) found.add(LOSSY.macros);
   if (has(/^xl\/(slicers|slicerCaches|timelines|timelineCaches)\//i)) found.add(LOSSY.slicers);
