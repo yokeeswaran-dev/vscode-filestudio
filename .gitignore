@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.vsix
+.vscode-test/
+test/.out/
+test/samples/large.xlsx
+test/samples/*.bak
+*.bak

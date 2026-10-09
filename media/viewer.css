@@ -1,0 +1,3493 @@
+/*
+ * FileStudio — webview styles (loaded next to dist/viewer.css, which carries the npm-package CSS such as KaTeX).
+ *
+ * Only --vscode-* theme variables are used for colours, so every view follows the light, dark and high-contrast
+ * themes. Workbook content keeps the workbook's own fonts and explicit colours; the chrome (headers, tabs, bars,
+ * menus) uses the VS Code UI font.
+ *
+ * Sections: BASE · ERROR VIEW · BANNER · CONTROLS · GRID (layout, panes, cells, selection, headers) ·
+ * FORMULA BAR · SHEET TABS · STATUS BAR · TOOLTIP & MENUS · HIGH CONTRAST · MARKDOWN · DOCX · PDF · PPTX
+ */
+
+/* ===== BASE ===== */
+
+:root {
+  /* Grid palette, derived from the theme. Cells without a fill use the editor colours (readable in dark themes). */
+  --fv-cell-bg: var(--vscode-editor-background, #ffffff);
+  --fv-cell-fg: var(--vscode-editor-foreground, #1f1f1f);
+  --fv-auto-border: var(--vscode-editor-foreground, #1f1f1f);
+  --fv-gridline: color-mix(in srgb, var(--fv-cell-fg) 13%, var(--fv-cell-bg));
+  --fv-frozen-line: color-mix(in srgb, var(--fv-cell-fg) 45%, var(--fv-cell-bg));
+  --fv-chrome-bg: var(--vscode-editorGroupHeader-tabsBackground, var(--vscode-sideBar-background, #f3f3f3));
+  --fv-chrome-border: var(--vscode-editorGroupHeader-tabsBorder, var(--vscode-panel-border, rgba(128, 128, 128, 0.35)));
+  --fv-hdr-bg: var(--fv-chrome-bg);
+  /*
+   * Header labels: the line-number colour pulled halfway to the foreground. The line-number colour alone is below
+   * 4.5:1 on the header background in the default themes (Dark Modern 3.9:1, Light Modern 4.3:1).
+   */
+  --fv-hdr-fg: color-mix(in srgb, var(--vscode-editorLineNumber-foreground, #6e7681), var(--vscode-foreground, var(--fv-cell-fg)));
+  --fv-hdr-border: color-mix(in srgb, var(--fv-cell-fg) 18%, var(--fv-hdr-bg));
+  /* Header highlight: the theme's list selection over the header colour, tinted towards the accent. */
+  --fv-hdr-sel-bg: color-mix(
+    in srgb,
+    var(--vscode-focusBorder, #0078d4) 10%,
+    color-mix(in srgb, var(--vscode-list-activeSelectionBackground, #0060c0) 55%, var(--fv-hdr-bg))
+  );
+  --fv-hdr-sel-fg: var(--vscode-editorLineNumber-activeForeground, var(--fv-cell-fg));
+  --fv-hdr-full-bg: color-mix(in srgb, var(--vscode-focusBorder, #0078d4) 30%, var(--fv-hdr-bg));
+  --fv-accent: var(--vscode-focusBorder, #0078d4);
+  /* Selection fill: translucent accent, visible over any cell fill in light and dark themes. */
+  --fv-sel-bg: color-mix(in srgb, var(--vscode-focusBorder, #0078d4) 15%, transparent);
+  --fv-loading-a: color-mix(in srgb, var(--fv-cell-fg) 4%, var(--fv-cell-bg));
+  --fv-loading-b: color-mix(in srgb, var(--fv-cell-fg) 8%, var(--fv-cell-bg));
+  --fv-ui-font: var(--vscode-font-family, system-ui, -apple-system, 'Segoe UI', sans-serif);
+  --fv-ui-size: var(--vscode-font-size, 13px);
+  --fv-mono-font: var(--vscode-editor-font-family, Consolas, 'Courier New', monospace);
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-foreground);
+  font-family: var(--fv-ui-font);
+  font-size: var(--fv-ui-size);
+}
+
+body[data-kind='sheet'],
+body[data-kind='csv'] {
+  overflow: hidden;
+}
+
+#app {
+  min-height: 100%;
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+.fv-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.fv-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  line-height: 0;
+}
+
+.fv-icon svg {
+  display: block;
+}
+
+/* Static loading message from the extension's HTML (spinner added once this stylesheet loads). */
+.fv-boot-message::before {
+  content: '';
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 8px;
+  vertical-align: -2px;
+  border: 2px solid color-mix(in srgb, currentColor 25%, transparent);
+  border-top-color: var(--vscode-progressBar-background, var(--fv-accent));
+  border-radius: 50%;
+  animation: fv-spin 0.8s linear infinite;
+}
+
+@keyframes fv-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.fv-empty {
+  padding: 24px;
+  color: var(--vscode-descriptionForeground);
+}
+
+/* ===== ERROR VIEW ===== */
+
+#app.fv-error-app {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 48px 24px;
+}
+
+.fv-error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: 640px;
+  width: 100%;
+}
+
+.fv-error-icon {
+  color: var(--vscode-errorForeground, #f14c4c);
+  margin-bottom: 4px;
+}
+
+.fv-error-title {
+  margin: 0;
+  font-size: 1.35em;
+  font-weight: 600;
+  color: var(--vscode-foreground);
+}
+
+.fv-error-message {
+  margin: 0;
+  color: var(--vscode-foreground);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.fv-error-detail {
+  width: 100%;
+  color: var(--vscode-descriptionForeground);
+}
+
+.fv-error-detail summary {
+  cursor: pointer;
+  user-select: none;
+  padding: 2px 0;
+}
+
+.fv-error-detail summary:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+
+.fv-error-detail pre {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  max-height: 40vh;
+  overflow: auto;
+  font-family: var(--fv-mono-font);
+  font-size: var(--vscode-editor-font-size, 12px);
+  background: var(--vscode-textCodeBlock-background, rgba(128, 128, 128, 0.12));
+  border-radius: 3px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.fv-error-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+/* ===== BANNER ===== */
+
+.fv-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  min-height: 26px;
+  padding: 2px 4px 2px 10px;
+  box-sizing: border-box;
+  background: var(--vscode-inputValidation-infoBackground, var(--vscode-editorWidget-background));
+  color: var(--vscode-foreground);
+  border-bottom: 1px solid var(--vscode-inputValidation-infoBorder, var(--fv-chrome-border));
+  font-size: var(--fv-ui-size);
+}
+
+.fv-banner > .fv-icon {
+  color: var(--vscode-notificationsInfoIcon-foreground, var(--fv-accent));
+}
+
+.fv-banner-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ===== CONTROLS ===== */
+
+.fv-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 26px;
+  padding: 4px 14px;
+  box-sizing: border-box;
+  border: 1px solid var(--vscode-button-border, transparent);
+  border-radius: 2px;
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #ffffff);
+  font: inherit;
+  line-height: 18px;
+  cursor: pointer;
+}
+
+.fv-btn:hover {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+.fv-btn:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+
+.fv-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 3px;
+  box-sizing: border-box;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--vscode-icon-foreground, var(--vscode-foreground));
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.fv-icon-btn:hover:not(:disabled) {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+
+.fv-icon-btn:active:not(:disabled) {
+  background: var(--vscode-toolbar-activeBackground, rgba(128, 128, 128, 0.3));
+}
+
+.fv-icon-btn:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+.fv-icon-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ===== GRID ===== */
+
+/* ----- app layout: [banner] / formula bar / grid / sheet tabs / status bar ----- */
+
+#app.fv-grid-app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--fv-cell-bg);
+}
+
+.fv-grid-host {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+}
+
+/* The single native scroll container. Headers and frozen panes are sticky bands inside it. */
+.fv-scroller {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: auto;
+  outline: none;
+  background: var(--fv-cell-bg);
+  contain: strict;
+  overscroll-behavior: contain;
+  cursor: cell;
+}
+
+/*
+ * Keyboard focus (F6, Escape from the name box, opening the file): VS Code's focus border just inside the grid's
+ * edge, so the focused region is visible. Focus moved by a mouse click keeps Excel's look (the active cell alone).
+ * Drawn by the host, not as the scroller's outline: the sticky header bands would paint over that.
+ */
+.fv-grid-host:has(> .fv-scroller:focus-visible)::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--vscode-focusBorder);
+  pointer-events: none;
+}
+
+.fv-scroller::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.fv-scroller::-webkit-scrollbar-thumb {
+  background-color: var(--vscode-scrollbarSlider-background, rgba(121, 121, 121, 0.4));
+}
+
+.fv-scroller::-webkit-scrollbar-thumb:hover {
+  background-color: var(--vscode-scrollbarSlider-hoverBackground, rgba(100, 100, 100, 0.7));
+}
+
+.fv-scroller::-webkit-scrollbar-thumb:active {
+  background-color: var(--vscode-scrollbarSlider-activeBackground, rgba(191, 191, 191, 0.4));
+}
+
+.fv-scroller::-webkit-scrollbar-corner,
+.fv-scroller::-webkit-scrollbar-track {
+  background: var(--fv-hdr-bg);
+}
+
+/* Sheet-sized box; overflow: clip (not hidden) so it does not become the sticky bands' scroll container. */
+.fv-content {
+  position: relative;
+  overflow: clip;
+  color: var(--fv-cell-fg);
+  line-height: 1.2;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ----- bands & panes ----- */
+
+/* Column headers + frozen rows: stick to the top, scroll horizontally. */
+.fv-band-top {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  overflow: clip;
+  background: var(--fv-cell-bg);
+}
+
+/* Row headers + frozen columns: stick to the left, scroll vertically (follows the top band in the flow). */
+.fv-band-left {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  overflow: clip;
+  background: var(--fv-cell-bg);
+}
+
+/* Select-all corner + frozen rows × frozen columns: sticks to the top-left (inside the top band). */
+.fv-band-corner {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  overflow: clip;
+  background: var(--fv-cell-bg);
+}
+
+.fv-layer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 0;
+  width: 0;
+  height: 0;
+}
+
+/* Paint order inside a pane: gridlines/placeholders < cells < images < selection < headers. */
+.fv-sub {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+}
+
+.fv-sub-grid {
+  z-index: 0;
+}
+
+.fv-sub-cells {
+  z-index: 1;
+}
+
+.fv-sub-imgs {
+  z-index: 2;
+}
+
+.fv-sub-sel {
+  z-index: 3;
+  pointer-events: none;
+}
+
+.fv-sub-hdrs {
+  z-index: 4;
+}
+
+/* Frozen-pane separator lines. */
+.fv-frz {
+  position: absolute;
+  z-index: 1;
+  background: var(--fv-frozen-line);
+  pointer-events: none;
+}
+
+.fv-frz-h {
+  height: 1px;
+}
+
+.fv-frz-v {
+  width: 1px;
+}
+
+/* ----- gridlines & placeholders ----- */
+
+.fv-gl {
+  position: absolute;
+  background: var(--fv-gridline);
+}
+
+.fv-loading-rows {
+  position: absolute;
+  background-color: var(--fv-loading-a);
+  background-image: linear-gradient(90deg, transparent 0, var(--fv-loading-b) 50%, transparent 100%);
+  background-size: 600px 100%;
+  background-repeat: no-repeat;
+  animation: fv-shimmer 1.2s ease-in-out infinite;
+}
+
+@keyframes fv-shimmer {
+  from {
+    background-position: -600px 0;
+  }
+  to {
+    background-position: calc(100% + 600px) 0;
+  }
+}
+
+/* ----- cells ----- */
+
+/*
+ * One absolutely positioned box per cell (or merged area). Excel's default vertical alignment is bottom;
+ * a column flexbox makes the (anonymous) text block span the cell width so text-align works. Fixed size +
+ * overflow: hidden already make each cell a relayout boundary (no `contain`, which would also turn every
+ * cell into a stacking context and cost more in layerization).
+ */
+.fv-c {
+  position: absolute;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  padding: 0 2px;
+  overflow: hidden;
+  white-space: pre;
+  text-align: left;
+}
+
+.fv-c.fv-vt {
+  justify-content: flex-start;
+}
+
+.fv-c.fv-vm {
+  justify-content: center;
+}
+
+.fv-c.fv-wrap {
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+.fv-tx {
+  flex: none;
+  min-width: 0;
+}
+
+/*
+ * Text that may be wider than its box (right-aligned / centred text with no room, overflow layers): a shrink-wrapped
+ * block aligned with align-self, so it overflows its flex container at the START side — the end (right) or middle
+ * (centre) of the text stays visible like in Excel. text-align cannot do this: an overlong line always overflows
+ * at its end.
+ */
+.fv-tx.fv-clip {
+  width: max-content;
+}
+
+/*
+ * Repeat-to-fill number formats (accounting `_("$"* #,##0.00_)`, `@*-`): the text before the fill at the left edge,
+ * the text after it at the right edge, the fill characters in between (paintCell / fillHtml). '_x' paddings are
+ * invisible copies of x (exactly its width).
+ */
+.fv-tx.fv-fill {
+  display: flex;
+  min-width: 0;
+}
+
+.fv-fill > span {
+  flex: none;
+}
+
+.fv-fill > .fv-fillc {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.fv-pad {
+  visibility: hidden;
+}
+
+/* Text overflowing into empty neighbours: the cell lets its overflow box out and sits above its row. */
+.fv-c.fv-ovc {
+  overflow: visible;
+  z-index: 1;
+}
+
+.fv-ov {
+  position: absolute;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+
+/* One text layer (optionally two, stacked, each clipped to the cells whose colours it uses); follows the cell's
+   vertical alignment. */
+.fv-ovi {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  white-space: pre;
+}
+
+.fv-c.fv-vt .fv-ovi {
+  justify-content: flex-start;
+}
+
+.fv-c.fv-vm .fv-ovi {
+  justify-content: center;
+}
+
+/* Hides the gridlines under overflowing text: painted below every cell (z-index -1 inside the cells layer), so the
+   neighbours' fills and borders stay visible over it. */
+.fv-ovmask {
+  position: absolute;
+  z-index: -1;
+  background-color: var(--fv-cell-bg);
+  pointer-events: none;
+}
+
+/* Border segments of a merged area whose side is not uniform (one per edge cell, see mergeBorders). */
+.fv-bseg {
+  position: absolute;
+  box-sizing: border-box;
+  pointer-events: none;
+}
+
+.fv-bseg-gl {
+  background-color: var(--fv-gridline);
+}
+
+/* Strikethrough under a double underline (one text-decoration has one line style). */
+.fv-strike {
+  text-decoration: line-through;
+}
+
+/* Rotated text. 90° reads bottom-to-top (Excel's counter-clockwise), -90° top-to-bottom. */
+.fv-tx.fv-r90 {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+}
+
+.fv-tx.fv-r-90 {
+  writing-mode: vertical-rl;
+}
+
+.fv-tx.fv-stack {
+  writing-mode: vertical-lr;
+  text-orientation: upright;
+  letter-spacing: -0.1em;
+}
+
+/*
+ * Vertical text keeps its natural length (an orthogonal flex item would otherwise get the cell height as its
+ * line length and overflow from one end instead of following the vertical alignment); wrapped vertical text
+ * wraps at the cell height.
+ */
+.fv-tx.fv-r90,
+.fv-tx.fv-r-90,
+.fv-tx.fv-stack {
+  height: max-content;
+}
+
+.fv-c.fv-wrap > .fv-tx.fv-r90,
+.fv-c.fv-wrap > .fv-tx.fv-r-90,
+.fv-c.fv-wrap > .fv-tx.fv-stack {
+  height: 100%;
+}
+
+/*
+ * Other angles: .fv-rotw is the rotated text's bounding box (sized by the script), aligned in the cell like any
+ * text block; the line inside is rotated about the box's centre.
+ */
+.fv-tx.fv-rotw {
+  position: relative;
+}
+
+.fv-rot {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: max-content;
+  white-space: pre;
+}
+
+.fv-c > .fv-tx.fv-r90,
+.fv-c > .fv-tx.fv-r-90,
+.fv-c > .fv-tx.fv-stack {
+  width: max-content;
+}
+
+.fv-va-sup,
+.fv-va-sub {
+  font-size: 0.75em;
+}
+
+.fv-va-sup {
+  vertical-align: super;
+}
+
+.fv-va-sub {
+  vertical-align: sub;
+}
+
+/* Comment / note marker: Excel's red triangle in the top-right corner, above text overflowing from a neighbour. */
+.fv-c.fv-note::after {
+  content: '';
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  right: 0;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 0 6px 6px 0;
+  border-color: transparent #e02020 transparent transparent;
+  pointer-events: none;
+}
+
+/* Hyperlinks keep the cell style; Ctrl/Cmd held shows that they can be followed. */
+#app.fv-ctrl .fv-c.fv-link {
+  cursor: pointer;
+}
+
+/* max-width/height: VS Code's default webview styles cap images at 100% of a (here 0×0) containing block. */
+.fv-img {
+  position: absolute;
+  display: block;
+  max-width: none;
+  max-height: none;
+  object-fit: fill;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+/*
+ * Right-to-left sheets: the scroller is mirrored as a whole (column A on the right, frozen columns and the
+ * vertical scrollbar on the right/left like Excel); glyph runs (.fv-g), images and rotated text flip back. Cell
+ * text is laid out with the mirrored alignment (paintCell), so inside its cell it reads as on an LTR sheet (Excel).
+ */
+.fv-scroller.fv-rtl {
+  transform: scaleX(-1);
+}
+
+.fv-rtl .fv-g {
+  display: inline-block;
+  transform: scaleX(-1);
+  white-space: inherit;
+}
+
+.fv-rtl .fv-img,
+.fv-rtl .fv-tx.fv-r-90,
+.fv-rtl .fv-tx.fv-stack,
+.fv-rtl .fv-tx.fv-fill {
+  transform: scaleX(-1);
+}
+
+.fv-rtl .fv-tx.fv-r90 {
+  transform: scaleX(-1) rotate(180deg);
+}
+
+/* ----- selection ----- */
+
+.fv-sel-fill {
+  position: absolute;
+  background: var(--fv-sel-bg);
+}
+
+.fv-sel-border,
+.fv-sel-active {
+  position: absolute;
+  box-sizing: border-box;
+  border-style: solid;
+  border-color: var(--fv-accent);
+}
+
+.fv-sel-border {
+  border-width: 2px;
+}
+
+.fv-sel-active {
+  border-width: 1px;
+}
+
+.fv-scroller:not(:focus) .fv-sel-border,
+.fv-scroller:not(:focus) .fv-sel-active {
+  border-color: color-mix(in srgb, var(--fv-accent) 60%, var(--fv-hdr-fg));
+}
+
+/* ----- headers ----- */
+
+.fv-ch,
+.fv-rh,
+.fv-corner {
+  position: absolute;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  white-space: nowrap;
+  background: var(--fv-hdr-bg);
+  color: var(--fv-hdr-fg);
+  font-family: var(--fv-ui-font);
+  font-size: var(--fv-hdr-font, 11px);
+  font-weight: 400;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  border-right: 1px solid var(--fv-hdr-border);
+  border-bottom: 1px solid var(--fv-hdr-border);
+  cursor: default;
+}
+
+/*
+ * Excel's "select this column / row" cursors: a black arrow pointing down over the column headers and right over the
+ * row headers (left on a right-to-left sheet, whose row headers are on the right; CSS transforms do not mirror
+ * cursors). The white outline keeps them visible on light, dark and high-contrast headers; the hotspot is the arrow
+ * tip. Columns and rows cannot be resized in this read-only view, so never a resize cursor (fallback: the arrow).
+ */
+.fv-ch {
+  cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Cpath d='M6 1h3v7h3l-4.5 4.5L3 8h3z' fill='%23000' stroke='%23fff' stroke-width='2' stroke-linejoin='round' paint-order='stroke'/%3E%3C/svg%3E") 7 12, default;
+}
+
+.fv-rh {
+  justify-content: center;
+  cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Cpath d='M1 6v3h7v3l4.5-4.5L8 3v3z' fill='%23000' stroke='%23fff' stroke-width='2' stroke-linejoin='round' paint-order='stroke'/%3E%3C/svg%3E") 12 7, default;
+}
+
+.fv-rtl .fv-rh {
+  cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16'%3E%3Cpath d='M14 6v3H7v3L2.5 7.5 7 3v3z' fill='%23000' stroke='%23fff' stroke-width='2' stroke-linejoin='round' paint-order='stroke'/%3E%3C/svg%3E") 2 7, default;
+}
+
+.fv-ch.fv-hsel,
+.fv-rh.fv-hsel {
+  background: var(--fv-hdr-sel-bg);
+  color: var(--fv-hdr-sel-fg);
+}
+
+.fv-ch.fv-hsel {
+  border-bottom: 2px solid var(--fv-accent);
+}
+
+.fv-rh.fv-hsel {
+  border-right: 2px solid var(--fv-accent);
+}
+
+.fv-ch.fv-hfull,
+.fv-rh.fv-hfull {
+  background: var(--fv-hdr-full-bg);
+  color: var(--fv-hdr-sel-fg);
+  font-weight: 600;
+}
+
+.fv-ch.fv-hfull {
+  border-bottom: 2px solid var(--fv-accent);
+}
+
+.fv-rh.fv-hfull {
+  border-right: 2px solid var(--fv-accent);
+}
+
+/* Select-all corner with Excel's triangle; Excel's plain arrow cursor (it is part of the sheet, not a link). */
+.fv-corner {
+  left: 0;
+  top: 0;
+  z-index: 5;
+  cursor: default;
+}
+
+.fv-corner::after {
+  content: '';
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 0 0 9px 9px;
+  border-color: transparent transparent color-mix(in srgb, var(--fv-hdr-fg) 55%, transparent) transparent;
+}
+
+.fv-corner:hover::after {
+  border-bottom-color: var(--fv-hdr-sel-fg);
+}
+
+/* ----- cell text box (double-click) ----- */
+
+/*
+ * Read-only in-cell box with the cell's text (openCellBox). Lies over the scroller in the grid host; the script sets
+ * its place, size, font, colours and alignment. The accent frame is drawn outside the box like Excel's active-cell
+ * border, so the box keeps the cell's size.
+ */
+.fv-cellbox {
+  position: absolute;
+  z-index: 4;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0 2px;
+  border: none;
+  border-radius: 0;
+  outline: 2px solid var(--fv-accent);
+  outline-offset: 0;
+  resize: none;
+  overflow: auto;
+  overscroll-behavior: contain;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--fv-cell-bg);
+  color: var(--fv-cell-fg);
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.25));
+  scrollbar-width: thin;
+}
+
+/* VS Code's default webview styles give every focused textarea a thin focus outline: keep the frame instead. */
+.fv-cellbox:focus {
+  outline: 2px solid var(--fv-accent);
+  outline-offset: 0;
+}
+
+/* ===== FORMULA BAR ===== */
+
+.fv-formula-bar {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: 0;
+  height: 28px;
+  padding: 0 6px;
+  box-sizing: border-box;
+  background: var(--fv-chrome-bg);
+  border-bottom: 1px solid var(--fv-chrome-border);
+  font-family: var(--fv-ui-font);
+  font-size: var(--fv-ui-size);
+}
+
+.fv-namebox {
+  flex: none;
+  width: 112px;
+  height: 22px;
+  padding: 0 6px;
+  box-sizing: border-box;
+  border: 1px solid var(--vscode-input-border, var(--fv-chrome-border));
+  border-radius: 2px;
+  background: var(--vscode-input-background, var(--fv-cell-bg));
+  color: var(--vscode-input-foreground, var(--vscode-foreground));
+  font-family: var(--fv-ui-font);
+  font-size: var(--fv-ui-size);
+  font-variant-numeric: tabular-nums;
+}
+
+.fv-namebox:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+  border-color: var(--vscode-focusBorder);
+}
+
+.fv-namebox.fv-invalid {
+  border-color: var(--vscode-inputValidation-errorBorder, #be1100);
+  outline-color: var(--vscode-inputValidation-errorBorder, #be1100);
+}
+
+.fv-fx-sep {
+  flex: none;
+  width: 1px;
+  height: 16px;
+  margin: 0 8px;
+  background: var(--fv-chrome-border);
+}
+
+.fv-fx {
+  flex: none;
+  padding-right: 8px;
+  color: var(--vscode-descriptionForeground);
+  font-family: Georgia, 'Times New Roman', serif;
+  font-style: italic;
+  font-weight: 600;
+  user-select: none;
+}
+
+.fv-formula {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 22px;
+  padding: 0 6px;
+  box-sizing: border-box;
+  line-height: 20px;
+  border: 1px solid var(--vscode-input-border, var(--fv-chrome-border));
+  border-radius: 2px;
+  background: var(--vscode-input-background, var(--fv-cell-bg));
+  color: var(--vscode-input-foreground, var(--vscode-foreground));
+  overflow: hidden;
+  white-space: pre;
+  text-overflow: ellipsis;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+.fv-formula.fv-formula-f {
+  font-family: var(--fv-mono-font);
+  font-size: var(--vscode-editor-font-size, var(--fv-ui-size));
+}
+
+.fv-formula:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+  border-color: var(--vscode-focusBorder);
+}
+
+/* ===== SHEET TABS ===== */
+
+.fv-tabbar {
+  display: flex;
+  align-items: stretch;
+  flex: none;
+  height: 30px;
+  box-sizing: border-box;
+  background: var(--fv-chrome-bg);
+  border-top: 1px solid var(--fv-chrome-border);
+  font-family: var(--fv-ui-font);
+  font-size: var(--fv-ui-size);
+}
+
+.fv-tab-nav {
+  display: none;
+  align-items: center;
+  flex: none;
+  padding: 0 2px;
+  border-inline-end: 1px solid var(--fv-chrome-border);
+}
+
+.fv-tab-nav.fv-tab-nav-active {
+  display: flex;
+}
+
+/* Mirrored tab bar (right-to-left sheet): the scroll arrows sit at the far right and still read ‹ ›, like Excel. */
+.fv-tabbar[dir='rtl'] .fv-tab-nav {
+  flex-direction: row-reverse;
+}
+
+.fv-tabs {
+  display: flex;
+  align-items: stretch;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.fv-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.fv-tab {
+  --fv-tab-ind: transparent;
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: none;
+  max-width: 220px;
+  padding: 0 14px;
+  margin: 0;
+  box-sizing: border-box;
+  border: none;
+  border-inline-end: 1px solid var(--fv-chrome-border);
+  border-radius: 0;
+  background: transparent;
+  color: var(--vscode-tab-inactiveForeground, var(--vscode-descriptionForeground));
+  font: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+  box-shadow: inset 0 -3px 0 var(--fv-tab-ind);
+}
+
+.fv-tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fv-tab:hover {
+  background: var(--vscode-tab-hoverBackground, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.15)));
+  color: var(--vscode-tab-hoverForeground, var(--vscode-foreground));
+}
+
+.fv-tab:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+/* The tint moves the background away from the tab bar's, so the label uses the full foreground (the inactive tab
+   colour falls below 4.5:1 on many tints). */
+.fv-tab.fv-tab-colored {
+  --fv-tab-ind: var(--fv-tab-color);
+  background: color-mix(in srgb, var(--fv-tab-color) 22%, transparent);
+  color: var(--vscode-foreground);
+}
+
+.fv-tab.fv-tab-active {
+  --fv-tab-ind: var(--fv-accent);
+  background: var(--vscode-tab-activeBackground, var(--fv-cell-bg));
+  color: var(--vscode-tab-activeForeground, var(--vscode-foreground));
+  font-weight: 600;
+}
+
+.fv-tab.fv-tab-active.fv-tab-colored {
+  --fv-tab-ind: var(--fv-tab-color);
+  background: linear-gradient(to top, color-mix(in srgb, var(--fv-tab-color) 16%, transparent), transparent 70%),
+    var(--vscode-tab-activeBackground, var(--fv-cell-bg));
+}
+
+.fv-tab.fv-tab-hidden .fv-tab-label {
+  font-style: italic;
+  opacity: 0.85;
+}
+
+.fv-tab.fv-tab-hidden::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  margin-inline-end: 6px;
+  border: 1px dashed currentColor;
+  border-radius: 50%;
+  opacity: 0.7;
+}
+
+.fv-hidden-btn {
+  align-self: center;
+  margin: 0 4px;
+}
+
+/* ===== STATUS BAR ===== */
+
+.fv-statusbar {
+  display: flex;
+  align-items: center;
+  flex: none;
+  height: 24px;
+  padding: 0 4px;
+  box-sizing: border-box;
+  background: var(--fv-chrome-bg);
+  border-top: 1px solid var(--fv-chrome-border);
+  color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+  font-family: var(--fv-ui-font);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.fv-status-item {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  padding: 0 8px;
+  min-width: 0;
+}
+
+.fv-status-mode {
+  color: var(--vscode-foreground);
+}
+
+.fv-status-dims {
+  font-variant-numeric: tabular-nums;
+}
+
+.fv-status-msg {
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fv-status-msg:empty,
+.fv-status-dims:empty {
+  display: none;
+}
+
+.fv-status-msg.fv-status-info {
+  color: var(--vscode-foreground);
+}
+
+.fv-status-msg.fv-status-warn {
+  color: var(--vscode-editorWarning-foreground, var(--vscode-errorForeground));
+}
+
+.fv-status-spacer {
+  flex: 1 1 auto;
+}
+
+/*
+ * In a narrow bar the selection stats give way so the zoom controls stay reachable: the stats that do not fit wrap
+ * onto a second line, which is clipped (whole stats drop off from the end).
+ */
+.fv-status-stats {
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  align-self: stretch;
+  align-content: flex-start;
+  gap: 0 14px;
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+  transition: opacity 0.12s;
+}
+
+.fv-stat {
+  line-height: 23px;
+}
+
+.fv-status-stats.fv-pending {
+  opacity: 0.55;
+}
+
+/* Aggregates of a selection too large to read completely: the labels say "(partial)", the tooltip explains it. */
+.fv-status-stats.fv-stats-partial {
+  cursor: help;
+}
+
+.fv-stat-label {
+  color: var(--vscode-descriptionForeground);
+}
+
+.fv-stat-value {
+  color: var(--vscode-foreground);
+}
+
+.fv-zoom {
+  gap: 2px;
+  padding-right: 2px;
+}
+
+.fv-zoom-btn {
+  min-width: 20px;
+  height: 20px;
+  font-size: 14px;
+}
+
+.fv-zoom-label {
+  min-width: 44px;
+  height: 20px;
+  padding: 0 4px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--vscode-foreground);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.fv-zoom-label:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2));
+}
+
+.fv-zoom-label:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+/* ===== TOOLTIP & MENUS ===== */
+
+.fv-tooltip {
+  position: fixed;
+  z-index: 1000;
+  max-width: min(380px, calc(100vw - 16px));
+  padding: 6px 9px;
+  box-sizing: border-box;
+  background: var(--vscode-editorHoverWidget-background, var(--vscode-editorWidget-background, #f3f3f3));
+  color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground));
+  border: 1px solid var(--vscode-editorHoverWidget-border, var(--fv-chrome-border));
+  border-radius: 3px;
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.25));
+  font-family: var(--fv-ui-font);
+  font-size: var(--fv-ui-size);
+  line-height: 1.4;
+  pointer-events: none;
+}
+
+.fv-tip-note {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 40vh;
+  overflow: hidden;
+}
+
+.fv-tip-note + .fv-tip-link {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--vscode-editorHoverWidget-border, var(--fv-chrome-border));
+}
+
+.fv-tip-link {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.fv-tip-href {
+  color: var(--vscode-textLink-foreground, #3794ff);
+  overflow-wrap: anywhere;
+}
+
+.fv-tip-hint {
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.92em;
+}
+
+.fv-menu {
+  position: fixed;
+  z-index: 1001;
+  display: flex;
+  flex-direction: column;
+  min-width: 180px;
+  max-width: min(360px, calc(100vw - 8px));
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 4px 0;
+  box-sizing: border-box;
+  background: var(--vscode-menu-background, var(--vscode-editorWidget-background));
+  color: var(--vscode-menu-foreground, var(--vscode-foreground));
+  border: 1px solid var(--vscode-menu-border, var(--fv-chrome-border));
+  border-radius: 5px;
+  box-shadow: 0 2px 8px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.3));
+  font-family: var(--fv-ui-font);
+  font-size: var(--fv-ui-size);
+}
+
+.fv-menu-title {
+  padding: 4px 12px 6px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.9em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.fv-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 4px;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.fv-menu-item:hover,
+.fv-menu-item:focus {
+  outline: none;
+  background: var(--vscode-menu-selectionBackground, var(--vscode-list-activeSelectionBackground));
+  color: var(--vscode-menu-selectionForeground, var(--vscode-list-activeSelectionForeground));
+}
+
+.fv-menu-label {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fv-menu-hint {
+  flex: none;
+  opacity: 0.7;
+  font-size: 0.9em;
+}
+
+.fv-menu-sep {
+  flex: none;
+  height: 1px;
+  margin: 4px 8px;
+  background: var(--vscode-menu-separatorBackground, var(--fv-chrome-border));
+}
+
+/* ===== HIGH CONTRAST ===== */
+
+body.vscode-high-contrast,
+body.vscode-high-contrast-light {
+  --fv-gridline: color-mix(in srgb, var(--fv-cell-fg) 40%, var(--fv-cell-bg));
+  --fv-hdr-border: var(--vscode-contrastBorder, var(--fv-cell-fg));
+  --fv-chrome-border: var(--vscode-contrastBorder, var(--fv-cell-fg));
+  --fv-frozen-line: var(--vscode-contrastBorder, var(--fv-cell-fg));
+  --fv-accent: var(--vscode-contrastActiveBorder, var(--vscode-focusBorder));
+  --fv-hdr-sel-bg: var(--fv-hdr-bg);
+  --fv-hdr-full-bg: var(--fv-hdr-bg);
+  --fv-sel-bg: color-mix(in srgb, var(--vscode-contrastActiveBorder, var(--vscode-focusBorder)) 18%, transparent);
+}
+
+body.vscode-high-contrast .fv-ch.fv-hsel,
+body.vscode-high-contrast .fv-rh.fv-hsel,
+body.vscode-high-contrast-light .fv-ch.fv-hsel,
+body.vscode-high-contrast-light .fv-rh.fv-hsel {
+  text-decoration: underline;
+}
+
+body.vscode-high-contrast .fv-tab,
+body.vscode-high-contrast-light .fv-tab {
+  border-inline-end-color: var(--vscode-contrastBorder);
+}
+
+body.vscode-high-contrast .fv-tab.fv-tab-active,
+body.vscode-high-contrast-light .fv-tab.fv-tab-active {
+  outline: 1px solid var(--vscode-contrastActiveBorder, var(--vscode-focusBorder));
+  outline-offset: -1px;
+}
+
+body.vscode-high-contrast .fv-tab:hover,
+body.vscode-high-contrast-light .fv-tab:hover,
+body.vscode-high-contrast .fv-menu-item:hover,
+body.vscode-high-contrast-light .fv-menu-item:hover,
+body.vscode-high-contrast .fv-menu-item:focus,
+body.vscode-high-contrast-light .fv-menu-item:focus {
+  outline: 1px dashed var(--vscode-contrastActiveBorder, var(--vscode-focusBorder));
+  outline-offset: -1px;
+}
+
+body.vscode-high-contrast .fv-btn,
+body.vscode-high-contrast-light .fv-btn {
+  border-color: var(--vscode-contrastBorder, var(--vscode-button-border, transparent));
+}
+
+body.vscode-high-contrast .fv-banner,
+body.vscode-high-contrast-light .fv-banner,
+body.vscode-high-contrast .fv-tooltip,
+body.vscode-high-contrast-light .fv-tooltip,
+body.vscode-high-contrast .fv-menu,
+body.vscode-high-contrast-light .fv-menu {
+  border-color: var(--vscode-contrastBorder);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fv-loading-rows,
+  .fv-boot-message::before {
+    animation: none;
+  }
+}
+
+/* ===== MARKDOWN ===== */
+/* GitHub-like article for the markdown preview. Colors come from --vscode-* theme variables only (light, dark and
+   high contrast); the --md-* custom properties below are derived from them. Everything is scoped to .md-view. */
+
+/* ----- MARKDOWN: VIEW & THEME TOKENS ----- */
+.md-view {
+  /* Borders: the theme's contrast border in high contrast, a soft foreground tint otherwise. */
+  --md-border: var(--vscode-contrastBorder, color-mix(in srgb, var(--vscode-editor-foreground) 22%, transparent));
+  --md-border-muted: var(--vscode-contrastBorder, color-mix(in srgb, var(--vscode-editor-foreground) 13%, transparent));
+  --md-subtle-bg: color-mix(in srgb, var(--vscode-editor-foreground) 5%, transparent);
+  /* Muted text derived from foreground/background: readable in every theme kind (some themes, e.g. Light Modern,
+     set descriptionForeground equal to the foreground, so it cannot be relied on to look muted). */
+  --md-muted: color-mix(in srgb, var(--vscode-editor-foreground) 70%, var(--vscode-editor-background));
+  --md-code-font: var(--vscode-editor-font-family, monospace);
+  /* highlight.js token colors (Dark+/Light+-like hues that VS Code defines for every theme kind). */
+  --md-hl-comment: var(--md-muted);
+  --md-hl-keyword: var(--vscode-debugTokenExpression-boolean, var(--vscode-editor-foreground));
+  --md-hl-string: var(--vscode-debugTokenExpression-string, var(--vscode-editor-foreground));
+  --md-hl-number: var(--vscode-debugTokenExpression-number, var(--vscode-editor-foreground));
+  --md-hl-function: var(--vscode-symbolIcon-functionForeground, var(--vscode-editor-foreground));
+  --md-hl-type: var(--vscode-gitDecoration-modifiedResourceForeground, var(--vscode-symbolIcon-classForeground, var(--vscode-editor-foreground)));
+  --md-hl-variable: var(--vscode-symbolIcon-variableForeground, var(--vscode-editor-foreground));
+  --md-hl-meta: var(--vscode-debugTokenExpression-name, var(--vscode-editor-foreground));
+  --md-hl-regexp: var(--vscode-debugTokenExpression-error, var(--vscode-errorForeground, var(--vscode-editor-foreground)));
+  --md-hl-added: var(--vscode-gitDecoration-addedResourceForeground, var(--vscode-editor-foreground));
+  --md-hl-added-bg: var(--vscode-diffEditor-insertedTextBackground, transparent);
+  --md-hl-deleted: var(--vscode-gitDecoration-deletedResourceForeground, var(--vscode-editor-foreground));
+  --md-hl-deleted-bg: var(--vscode-diffEditor-removedTextBackground, transparent);
+
+  position: fixed;
+  inset: 0;
+  overflow: auto;
+  scroll-padding-top: 16px;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-editor-foreground);
+  font-family: var(--vscode-font-family, system-ui, sans-serif);
+  font-size: 14px;
+  line-height: 1.6;
+  overflow-wrap: break-word;
+  outline: none;
+}
+body.vscode-dark .md-view,
+body.vscode-high-contrast:not(.vscode-high-contrast-light) .md-view {
+  color-scheme: dark; /* native checkboxes and scrollbars */
+}
+body.vscode-light .md-view,
+body.vscode-high-contrast-light .md-view {
+  color-scheme: light;
+}
+
+/* ----- MARKDOWN: ARTICLE ----- */
+.md-view .md-article {
+  box-sizing: border-box;
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 32px 48px 72px;
+}
+.md-view .md-article > :first-child {
+  margin-top: 0 !important;
+}
+.md-view .md-article > :last-child {
+  margin-bottom: 0 !important;
+}
+.md-view .md-empty {
+  color: var(--md-muted);
+  font-style: italic;
+}
+/* Very large documents: blocks away from the viewport skip layout, paint and accessibility work. Sizes of blocks
+   that were on screen once are remembered (auto); the others use an estimate. */
+.md-view .md-article.md-large > * {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 48px;
+}
+
+/* Block spacing */
+.md-view .md-article p,
+.md-view .md-article blockquote,
+.md-view .md-article ul,
+.md-view .md-article ol,
+.md-view .md-article dl,
+.md-view .md-article table,
+.md-view .md-article pre,
+.md-view .md-article details,
+.md-view .md-article .md-code-block,
+.md-view .md-article .mermaid,
+.md-view .md-article .markdown-alert {
+  margin-top: 0;
+  margin-bottom: 16px;
+}
+
+/* Headings */
+.md-view .md-article h1,
+.md-view .md-article h2,
+.md-view .md-article h3,
+.md-view .md-article h4,
+.md-view .md-article h5,
+.md-view .md-article h6 {
+  margin-top: 24px;
+  margin-bottom: 16px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--vscode-editor-foreground);
+}
+.md-view .md-article h1 {
+  font-size: 2em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--md-border-muted);
+}
+.md-view .md-article h2 {
+  font-size: 1.5em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--md-border-muted);
+}
+.md-view .md-article h3 {
+  font-size: 1.25em;
+}
+.md-view .md-article h4 {
+  font-size: 1em;
+}
+.md-view .md-article h5 {
+  font-size: 0.875em;
+}
+.md-view .md-article h6 {
+  font-size: 0.85em;
+  color: var(--md-muted);
+}
+.md-view .md-article h1 code,
+.md-view .md-article h2 code,
+.md-view .md-article h3 code,
+.md-view .md-article h4 code,
+.md-view .md-article h5 code,
+.md-view .md-article h6 code {
+  font-size: inherit;
+  padding: 0 0.2em;
+}
+
+/* Inline text. Links are underlined only when the user turned on accessibility.underlineLinks (VS Code passes it to
+   webviews as --text-link-decoration: underline / none). */
+.md-view .md-article a {
+  color: var(--vscode-textLink-foreground);
+  text-decoration: var(--text-link-decoration, none);
+}
+.md-view .md-article a:hover {
+  color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
+  text-decoration: underline;
+}
+.md-view .md-article a:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+.md-view .md-article strong,
+.md-view .md-article b {
+  font-weight: 600;
+}
+.md-view .md-article mark {
+  background: var(--vscode-editor-findMatchHighlightBackground, var(--md-subtle-bg));
+  color: inherit;
+}
+.md-view .md-article sub,
+.md-view .md-article sup {
+  line-height: 0;
+}
+.md-view .md-article abbr[title] {
+  text-decoration: underline dotted;
+  cursor: help;
+}
+
+/* Lists */
+.md-view .md-article ul,
+.md-view .md-article ol {
+  padding-left: 2em;
+}
+.md-view .md-article ul ul,
+.md-view .md-article ul ol,
+.md-view .md-article ol ol,
+.md-view .md-article ol ul {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+/* Nested ordered lists are numbered i, ii, iii and then a, b, c (GitHub); an explicit type="…" wins. */
+.md-view .md-article ol ol:not([type]),
+.md-view .md-article ul ol:not([type]) {
+  list-style-type: lower-roman;
+}
+.md-view .md-article ul ul ol:not([type]),
+.md-view .md-article ul ol ol:not([type]),
+.md-view .md-article ol ul ol:not([type]),
+.md-view .md-article ol ol ol:not([type]) {
+  list-style-type: lower-alpha;
+}
+.md-view .md-article li + li {
+  margin-top: 0.25em;
+}
+.md-view .md-article li > p {
+  margin-top: 16px;
+}
+.md-view .md-article li > p:first-child {
+  margin-top: 0;
+}
+.md-view .md-article dl {
+  padding: 0;
+}
+.md-view .md-article dl dt {
+  margin-top: 16px;
+  font-weight: 600;
+  font-style: italic;
+}
+.md-view .md-article dl dd {
+  margin: 0 0 16px;
+  padding: 0 16px;
+}
+
+/* Task lists: no bullets, checkbox in the bullet gutter */
+.md-view .md-article .task-list-item {
+  list-style-type: none;
+}
+.md-view .md-article .task-list-item-checkbox {
+  margin: 0 0.35em 0.25em -1.5em;
+  vertical-align: middle;
+  cursor: pointer;
+  accent-color: var(--vscode-button-background, var(--vscode-focusBorder));
+}
+.md-view .md-article .task-list-item-checkbox:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+
+/* Blockquote */
+.md-view .md-article blockquote {
+  margin-left: 0;
+  margin-right: 0;
+  padding: 0.5em 1em;
+  color: var(--vscode-editor-foreground);
+  background: var(--vscode-textBlockQuote-background, transparent);
+  border-left: 0.25em solid var(--vscode-textBlockQuote-border, var(--md-border));
+}
+.md-view .md-article blockquote > :first-child {
+  margin-top: 0;
+}
+.md-view .md-article blockquote > :last-child {
+  margin-bottom: 0;
+}
+
+/* Horizontal rule */
+.md-view .md-article hr {
+  box-sizing: content-box;
+  height: 0.25em;
+  margin: 24px 0;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  background-color: var(--md-border-muted);
+}
+
+/* kbd (keybinding label look) */
+.md-view .md-article kbd {
+  display: inline-block;
+  padding: 3px 5px;
+  font: 11px/10px var(--md-code-font);
+  vertical-align: middle;
+  color: var(--vscode-keybindingLabel-foreground, var(--vscode-editor-foreground));
+  background-color: var(--vscode-keybindingLabel-background, var(--md-subtle-bg));
+  border: 1px solid var(--vscode-keybindingLabel-border, var(--md-border));
+  border-bottom-color: var(--vscode-keybindingLabel-bottomBorder, var(--md-border));
+  border-radius: 3px;
+  box-shadow: inset 0 -1px 0 var(--vscode-widget-shadow, transparent);
+}
+
+/* Images & media */
+.md-view .md-article img,
+.md-view .md-article video {
+  max-width: 100%;
+  box-sizing: content-box;
+}
+.md-view .md-article img[align='right'] {
+  padding-left: 20px;
+}
+.md-view .md-article img[align='left'] {
+  padding-right: 20px;
+}
+
+/* Tables (scroll horizontally when wider than the article) */
+.md-view .md-article table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow: auto;
+  border-spacing: 0;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+.md-view .md-article th {
+  font-weight: 600;
+}
+.md-view .md-article th,
+.md-view .md-article td {
+  padding: 6px 13px;
+  border: 1px solid var(--md-border);
+}
+.md-view .md-article td > :last-child {
+  margin-bottom: 0;
+}
+.md-view .md-article tr {
+  background-color: transparent;
+}
+.md-view .md-article tbody tr:nth-child(2n) {
+  background-color: var(--md-subtle-bg);
+}
+.md-view .md-article table img {
+  background-color: transparent;
+}
+
+/* Front matter (YAML block rendered as a key/value table) */
+.md-view .md-article table.front-matter {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--md-muted);
+}
+.md-view .md-article table.front-matter th,
+.md-view .md-article table.front-matter td {
+  padding: 4px 10px;
+  vertical-align: top;
+  text-align: left;
+}
+.md-view .md-article table.front-matter th,
+.md-view .md-article table.front-matter tr > td:first-child:not(:only-child) {
+  font-weight: 600;
+  white-space: nowrap;
+  color: var(--vscode-editor-foreground);
+  background-color: var(--md-subtle-bg);
+}
+.md-view .md-article table.front-matter tbody tr:nth-child(2n) {
+  background-color: transparent;
+}
+
+/* Details */
+.md-view .md-article details summary {
+  cursor: pointer;
+}
+.md-view .md-article details summary:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+}
+
+/* ----- MARKDOWN: CODE ----- */
+.md-view .md-article code,
+.md-view .md-article tt,
+.md-view .md-article samp {
+  font-family: var(--md-code-font);
+  font-size: 0.9em;
+}
+.md-view .md-article :not(pre) > code {
+  padding: 0.2em 0.4em;
+  margin: 0;
+  white-space: break-spaces;
+  border-radius: 4px;
+  color: var(--vscode-textPreformat-foreground, var(--vscode-editor-foreground));
+  background-color: var(--vscode-textPreformat-background, var(--md-subtle-bg));
+  /* High contrast themes have a black code background: outline the span instead (no layout change). */
+  box-shadow: inset 0 0 0 1px var(--vscode-contrastBorder, transparent);
+}
+.md-view .md-article pre {
+  padding: 16px;
+  overflow: auto;
+  font-family: var(--md-code-font);
+  font-size: 0.9em;
+  line-height: 1.45;
+  color: var(--vscode-editor-foreground);
+  background-color: var(--vscode-textCodeBlock-background, var(--md-subtle-bg));
+  border: 1px solid var(--vscode-contrastBorder, transparent);
+  border-radius: 6px;
+  tab-size: 4;
+}
+.md-view .md-article pre code {
+  display: inline;
+  padding: 0;
+  margin: 0;
+  font-size: 100%;
+  white-space: pre;
+  word-break: normal;
+  overflow-wrap: normal;
+  color: inherit;
+  background: transparent;
+  border: 0;
+}
+
+/* Copy button (sits outside the horizontally scrolling <pre>) */
+.md-view .md-code-block {
+  position: relative;
+}
+.md-view .md-code-block > pre {
+  margin-bottom: 0;
+}
+.md-view .md-copy-button {
+  --md-copy-tint: var(--vscode-button-secondaryBackground, var(--vscode-editorWidget-background, transparent));
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  font: 12px/16px var(--vscode-font-family, system-ui, sans-serif);
+  color: var(--vscode-button-secondaryForeground, var(--vscode-editor-foreground));
+  /* Always opaque, the button sits over the code: the theme's button tint over the code block's own background
+     (some themes, e.g. Dark Modern, make the secondary button background fully transparent). */
+  background-color: var(--vscode-editor-background, Canvas);
+  background-image:
+    linear-gradient(var(--md-copy-tint), var(--md-copy-tint)),
+    linear-gradient(var(--vscode-textCodeBlock-background, transparent), var(--vscode-textCodeBlock-background, transparent));
+  border: 1px solid var(--vscode-button-border, var(--md-border-muted));
+  border-radius: 4px;
+  cursor: pointer;
+  user-select: none;
+  opacity: 0;
+  transition: opacity 120ms ease-in-out;
+}
+/* The label is generated content (data-label): never part of a text selection, a copy or find-in-page. */
+.md-view .md-copy-button::after {
+  content: attr(data-label);
+}
+.md-view .md-copy-button::before {
+  content: '';
+  flex: none;
+  width: 14px;
+  height: 14px;
+  background-color: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z'/%3E%3Cpath d='M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M0 6.75C0 5.784.784 5 1.75 5h1.5a.75.75 0 0 1 0 1.5h-1.5a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-1.5a.75.75 0 0 1 1.5 0v1.5A1.75 1.75 0 0 1 9.25 16h-7.5A1.75 1.75 0 0 1 0 14.25Z'/%3E%3Cpath d='M5 1.75C5 .784 5.784 0 6.75 0h7.5C15.216 0 16 .784 16 1.75v7.5A1.75 1.75 0 0 1 14.25 11h-7.5A1.75 1.75 0 0 1 5 9.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h7.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+.md-view .md-copy-button.is-copied::before {
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z'/%3E%3C/svg%3E");
+}
+.md-view .md-code-block:hover .md-copy-button,
+.md-view .md-copy-button:focus-visible,
+.md-view .md-copy-button.is-copied,
+.md-view .md-copy-button.is-failed {
+  opacity: 1;
+}
+.md-view .md-copy-button:hover {
+  --md-copy-tint: var(--vscode-button-secondaryHoverBackground, var(--vscode-toolbar-hoverBackground, var(--md-subtle-bg)));
+}
+.md-view .md-copy-button:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+.md-view .md-copy-button.is-copied {
+  color: var(--vscode-charts-green, var(--vscode-button-secondaryForeground));
+}
+.md-view .md-copy-button.is-failed {
+  color: var(--vscode-errorForeground, var(--vscode-button-secondaryForeground));
+}
+@media (hover: none) {
+  .md-view .md-copy-button {
+    opacity: 1;
+  }
+}
+
+/* highlight.js tokens */
+.md-view .md-article .hljs {
+  color: var(--vscode-editor-foreground);
+  background: transparent;
+}
+.md-view .md-article .hljs-comment,
+.md-view .md-article .hljs-quote {
+  color: var(--md-hl-comment);
+  font-style: italic;
+}
+.md-view .md-article .hljs-keyword,
+.md-view .md-article .hljs-selector-tag,
+.md-view .md-article .hljs-literal,
+.md-view .md-article .hljs-doctag,
+.md-view .md-article .hljs-template-tag,
+.md-view .md-article .hljs-variable.language_,
+.md-view .md-article .hljs-tag .hljs-name,
+.md-view .md-article .hljs-name {
+  color: var(--md-hl-keyword);
+}
+.md-view .md-article .hljs-string,
+.md-view .md-article .hljs-char.escape_,
+.md-view .md-article .hljs-meta .hljs-string,
+.md-view .md-article .hljs-link {
+  color: var(--md-hl-string);
+}
+.md-view .md-article .hljs-regexp {
+  color: var(--md-hl-regexp);
+}
+.md-view .md-article .hljs-number,
+.md-view .md-article .hljs-symbol,
+.md-view .md-article .hljs-bullet,
+.md-view .md-article .hljs-variable.constant_ {
+  color: var(--md-hl-number);
+}
+.md-view .md-article .hljs-title,
+.md-view .md-article .hljs-title.function_,
+.md-view .md-article .hljs-section {
+  color: var(--md-hl-function);
+}
+.md-view .md-article .hljs-title.class_,
+.md-view .md-article .hljs-title.class_.inherited__,
+.md-view .md-article .hljs-class .hljs-title,
+.md-view .md-article .hljs-type,
+.md-view .md-article .hljs-built_in {
+  color: var(--md-hl-type);
+}
+.md-view .md-article .hljs-attr,
+.md-view .md-article .hljs-attribute,
+.md-view .md-article .hljs-variable,
+.md-view .md-article .hljs-template-variable,
+.md-view .md-article .hljs-property,
+.md-view .md-article .hljs-selector-id,
+.md-view .md-article .hljs-selector-class,
+.md-view .md-article .hljs-selector-attr,
+.md-view .md-article .hljs-selector-pseudo {
+  color: var(--md-hl-variable);
+}
+.md-view .md-article .hljs-meta,
+.md-view .md-article .hljs-meta .hljs-keyword {
+  color: var(--md-hl-meta);
+}
+.md-view .md-article .hljs-params,
+.md-view .md-article .hljs-subst,
+.md-view .md-article .hljs-operator,
+.md-view .md-article .hljs-punctuation,
+.md-view .md-article .hljs-tag {
+  color: inherit;
+}
+.md-view .md-article .hljs-section,
+.md-view .md-article .hljs-strong {
+  font-weight: 600;
+}
+.md-view .md-article .hljs-emphasis {
+  font-style: italic;
+}
+.md-view .md-article .hljs-link {
+  text-decoration: underline;
+}
+/* Diff lines: the git decoration hue pulled halfway to the foreground, readable on the diff editor's red / green line
+   backgrounds (the pure decoration colour is below 3:1 on them in Dark Modern). */
+.md-view .md-article .hljs-addition {
+  color: color-mix(in srgb, var(--md-hl-added) 50%, var(--vscode-editor-foreground));
+  background-color: var(--md-hl-added-bg);
+}
+.md-view .md-article .hljs-deletion {
+  color: color-mix(in srgb, var(--md-hl-deleted) 50%, var(--vscode-editor-foreground));
+  background-color: var(--md-hl-deleted-bg);
+}
+
+/* ----- MARKDOWN: FOOTNOTES ----- */
+.md-view .md-article .footnote-ref a,
+.md-view .md-article .footnote-backref {
+  text-decoration: var(--text-link-decoration, none);
+}
+.md-view .md-article .footnote-ref a:hover,
+.md-view .md-article .footnote-backref:hover {
+  text-decoration: underline;
+}
+.md-view .md-article hr.footnotes-sep {
+  height: 1px;
+  margin: 32px 0 16px;
+  background-color: var(--md-border-muted);
+}
+.md-view .md-article .footnotes {
+  font-size: 12px;
+  color: var(--md-muted);
+}
+.md-view .md-article .footnotes ol {
+  padding-left: 16px;
+}
+.md-view .md-article .footnotes li {
+  position: relative;
+}
+.md-view .md-article .footnotes li > p:last-child {
+  margin-bottom: 0;
+}
+
+/* ----- MARKDOWN: GITHUB ALERTS ----- */
+.md-view .md-article .markdown-alert {
+  --md-alert-color: var(--vscode-charts-blue, var(--vscode-editorInfo-foreground));
+  padding: 8px 16px;
+  color: inherit;
+  border-left: 0.25em solid var(--md-alert-color);
+}
+.md-view .md-article .markdown-alert > :first-child {
+  margin-top: 0;
+}
+.md-view .md-article .markdown-alert > :last-child {
+  margin-bottom: 0;
+}
+.md-view .md-article .markdown-alert .markdown-alert-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  line-height: 1;
+  /* Title text: the alert hue pulled towards the foreground so it stays readable (warning yellow alone is ~3:1 on
+     Light Modern); the bar and the icon keep the pure hue. */
+  color: color-mix(in srgb, var(--md-alert-color) 60%, var(--vscode-editor-foreground));
+}
+.md-view .md-article .markdown-alert .markdown-alert-title::before {
+  content: '';
+  flex: none;
+  width: 16px;
+  height: 16px;
+  background-color: var(--md-alert-color);
+  -webkit-mask: var(--md-alert-icon) center / contain no-repeat;
+  mask: var(--md-alert-icon) center / contain no-repeat;
+}
+.md-view .md-article .markdown-alert-note {
+  --md-alert-color: var(--vscode-charts-blue, var(--vscode-editorInfo-foreground));
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z'/%3E%3C/svg%3E");
+}
+.md-view .md-article .markdown-alert-tip {
+  --md-alert-color: var(--vscode-charts-green, var(--vscode-editorInfo-foreground));
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1.5c-2.363 0-4 1.69-4 3.75 0 .984.424 1.625.984 2.304l.214.253c.223.264.47.556.673.848.284.411.537.896.621 1.49a.75.75 0 0 1-1.484.211c-.04-.282-.163-.547-.37-.847a8.456 8.456 0 0 0-.542-.68c-.084-.1-.173-.205-.268-.32C3.201 7.75 2.5 6.766 2.5 5.25 2.5 2.31 4.863 0 8 0s5.5 2.31 5.5 5.25c0 1.516-.701 2.5-1.328 3.259-.095.115-.184.22-.268.319-.207.245-.383.453-.541.681-.208.3-.33.565-.37.847a.751.751 0 0 1-1.485-.212c.084-.593.337-1.078.621-1.489.203-.292.45-.584.673-.848.075-.088.147-.173.213-.253.561-.679.985-1.32.985-2.304 0-2.06-1.637-3.75-4-3.75ZM5.75 12h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5ZM6 15.25a.75.75 0 0 1 .75-.75h2.5a.75.75 0 0 1 0 1.5h-2.5a.75.75 0 0 1-.75-.75Z'/%3E%3C/svg%3E");
+}
+.md-view .md-article .markdown-alert-important {
+  --md-alert-color: var(--vscode-charts-purple, var(--vscode-editorInfo-foreground));
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M0 1.75C0 .784.784 0 1.75 0h12.5C15.216 0 16 .784 16 1.75v9.5A1.75 1.75 0 0 1 14.25 13H8.06l-2.573 2.573A1.458 1.458 0 0 1 3 14.543V13H1.75A1.75 1.75 0 0 1 0 11.25Zm1.75-.25a.25.25 0 0 0-.25.25v9.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h6.5a.25.25 0 0 0 .25-.25v-9.5a.25.25 0 0 0-.25-.25Zm7 2.25v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 9a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z'/%3E%3C/svg%3E");
+}
+.md-view .md-article .markdown-alert-warning {
+  --md-alert-color: var(--vscode-editorWarning-foreground, var(--vscode-charts-yellow));
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z'/%3E%3C/svg%3E");
+}
+.md-view .md-article .markdown-alert-caution {
+  --md-alert-color: var(--vscode-editorError-foreground, var(--vscode-charts-red));
+  --md-alert-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.47.22A.749.749 0 0 1 5 0h6c.199 0 .389.079.53.22l4.25 4.25c.141.14.22.331.22.53v6a.749.749 0 0 1-.22.53l-4.25 4.25A.749.749 0 0 1 11 16H5a.749.749 0 0 1-.53-.22L.22 11.53A.749.749 0 0 1 0 11V5c0-.199.079-.389.22-.53Zm.84 1.28L1.5 5.31v5.38l3.81 3.81h5.38l3.81-3.81V5.31L10.69 1.5ZM8 4a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0v-3.5A.75.75 0 0 1 8 4Zm0 8a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z'/%3E%3C/svg%3E");
+}
+
+/* ----- MARKDOWN: MATH (KaTeX) ----- */
+/* Block math: <div class="math math-block"><span class="katex-display">…; wide formulas scroll horizontally. */
+.md-view .md-article .math-block {
+  margin: 0 0 16px;
+}
+.md-view .md-article .katex-display {
+  margin: 0.5em 0;
+  padding: 4px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.md-view .md-article .math-block > .katex-display {
+  margin: 0;
+}
+.md-view .md-article .katex {
+  color: inherit;
+}
+/* Invalid TeX source (KaTeX sets an inline colour): error hue pulled towards the foreground, readable in light themes. */
+.md-view .md-article .katex-error {
+  color: color-mix(in srgb, var(--vscode-errorForeground) 70%, var(--vscode-editor-foreground)) !important;
+}
+
+/* ----- MARKDOWN: MERMAID ----- */
+.md-view .md-article .mermaid {
+  overflow-x: auto;
+  text-align: center;
+}
+.md-view .md-article .mermaid svg {
+  height: auto;
+}
+/* Not rendered yet: an empty box as tall as the diagram is expected to be (inline height, see mdCollectDiagrams).
+   The label is generated content and the source is not in the DOM: find-in-page does not match either. */
+.md-view .md-article .mermaid.md-mermaid-pending {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  color: var(--md-muted);
+  background-color: var(--vscode-textCodeBlock-background, var(--md-subtle-bg));
+  border-radius: 6px;
+}
+.md-view .md-article .mermaid.md-mermaid-pending::before {
+  content: 'Rendering diagram\2026';
+  font-style: italic;
+}
+.md-view .md-article .mermaid.md-mermaid-failed {
+  text-align: left;
+}
+.md-view .md-mermaid-error {
+  padding: 12px 16px;
+  color: var(--vscode-inputValidation-errorForeground, var(--vscode-editor-foreground));
+  background-color: var(--vscode-inputValidation-errorBackground, transparent);
+  border: 1px solid var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));
+  border-radius: 6px;
+}
+.md-view .md-mermaid-error-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  color: inherit; /* errorForeground on the error background is too faint in dark themes: only the icon is red */
+}
+.md-view .md-mermaid-error-title::before {
+  content: '';
+  flex: none;
+  width: 16px;
+  height: 16px;
+  background-color: var(--vscode-editorError-foreground, var(--vscode-errorForeground, currentColor));
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.47.22A.749.749 0 0 1 5 0h6c.199 0 .389.079.53.22l4.25 4.25c.141.14.22.331.22.53v6a.749.749 0 0 1-.22.53l-4.25 4.25A.749.749 0 0 1 11 16H5a.749.749 0 0 1-.53-.22L.22 11.53A.749.749 0 0 1 0 11V5c0-.199.079-.389.22-.53Zm.84 1.28L1.5 5.31v5.38l3.81 3.81h5.38l3.81-3.81V5.31L10.69 1.5ZM8 4a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0v-3.5A.75.75 0 0 1 8 4Zm0 8a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4.47.22A.749.749 0 0 1 5 0h6c.199 0 .389.079.53.22l4.25 4.25c.141.14.22.331.22.53v6a.749.749 0 0 1-.22.53l-4.25 4.25A.749.749 0 0 1 11 16H5a.749.749 0 0 1-.53-.22L.22 11.53A.749.749 0 0 1 0 11V5c0-.199.079-.389.22-.53Zm.84 1.28L1.5 5.31v5.38l3.81 3.81h5.38l3.81-3.81V5.31L10.69 1.5ZM8 4a.75.75 0 0 1 .75.75v3.5a.75.75 0 0 1-1.5 0v-3.5A.75.75 0 0 1 8 4Zm0 8a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+/* Plain monospace text, not a code block (beats `.md-article pre`). */
+.md-view .md-article .md-mermaid-error pre.md-mermaid-error-message {
+  margin: 8px 0 12px;
+  padding: 0;
+  overflow: visible;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--md-code-font);
+  font-size: 0.9em;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+.md-view .md-mermaid-error-label {
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: var(--md-muted);
+}
+.md-view .md-article .md-mermaid-error .md-code-block {
+  margin: 0;
+}
+.md-view .md-article pre.md-mermaid-error-source {
+  margin: 0;
+  padding: 8px 12px;
+}
+.md-view .md-mermaid-error .md-copy-button {
+  top: 4px;
+  right: 4px;
+}
+
+/* Renderer failure block (markdown.ts never throws; it returns this with the raw source) */
+.md-view .md-article .markdown-render-error {
+  margin-bottom: 16px;
+  padding: 12px 16px;
+  color: var(--vscode-inputValidation-errorForeground, var(--vscode-editor-foreground));
+  background-color: var(--vscode-inputValidation-errorBackground, transparent);
+  border: 1px solid var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));
+  border-radius: 6px;
+}
+.md-view .md-article .markdown-render-error > p:first-child {
+  color: var(--vscode-errorForeground, inherit);
+}
+.md-view .md-article .markdown-render-error .md-code-block,
+.md-view .md-article .markdown-render-error pre {
+  margin-bottom: 0;
+}
+
+/* ----- MARKDOWN: IN-PAGE NAVIGATION FEEDBACK ----- */
+/* Shared with the DOCX view. The target of an in-page link flashes (background, plus an outline in high contrast,
+   where the find-match background is not defined) and gets keyboard focus without a focus ring of its own. */
+@keyframes md-target-flash {
+  from {
+    background-color: var(--md-flash-bg);
+    outline-color: var(--md-flash-outline);
+  }
+  to {
+    background-color: transparent;
+    outline-color: transparent;
+  }
+}
+.md-view .md-target-flash,
+.docx-view .md-target-flash {
+  --md-flash-bg: var(
+    --vscode-editor-findMatchHighlightBackground,
+    color-mix(in srgb, var(--vscode-editor-foreground) 12%, transparent)
+  );
+  --md-flash-outline: transparent;
+  outline: 2px solid transparent;
+  outline-offset: 2px;
+  animation: md-target-flash 1.5s ease-out;
+}
+body.vscode-high-contrast .md-target-flash,
+body.vscode-high-contrast-light .md-target-flash {
+  --md-flash-outline: var(--vscode-contrastActiveBorder, var(--vscode-focusBorder));
+}
+body.vscode-reduce-motion .md-view .md-target-flash,
+body.vscode-reduce-motion .docx-view .md-target-flash {
+  animation-duration: 0.01s;
+}
+.md-view .md-focus-target:focus,
+.docx-view .md-focus-target:focus {
+  outline: 2px solid transparent; /* no focus ring; the flash animation still colours this outline */
+  outline-offset: 2px;
+}
+
+/* Highlighted text (<mark>, Word highlight): high contrast themes have no find-match background, so it is outlined. */
+body.vscode-high-contrast .md-view .md-article mark,
+body.vscode-high-contrast-light .md-view .md-article mark,
+body.vscode-high-contrast .docx-view .docx-page mark,
+body.vscode-high-contrast-light .docx-view .docx-page mark {
+  outline: 1px dashed var(--vscode-contrastActiveBorder, var(--vscode-focusBorder));
+  outline-offset: 1px;
+}
+
+@media (max-width: 720px) {
+  .md-view .md-article {
+    padding: 16px 16px 48px;
+  }
+}
+
+/* ===== DOCX ===== */
+/* Read-only Word preview: a page-like sheet centered on the editor-background canvas. */
+
+/* ----- DOCX: CANVAS & PAGE ----- */
+.docx-view {
+  --docx-border: var(--vscode-contrastBorder, color-mix(in srgb, var(--vscode-editor-foreground) 25%, transparent));
+  --docx-border-muted: var(--vscode-contrastBorder, color-mix(in srgb, var(--vscode-editor-foreground) 14%, transparent));
+
+  position: fixed;
+  inset: 0;
+  overflow: auto;
+  /* Editor background, very slightly tinted so the sheet reads as paper in both light and dark themes. */
+  background: color-mix(in srgb, var(--vscode-editor-background) 95%, var(--vscode-editor-foreground));
+  color: var(--vscode-editor-foreground);
+  font-family: var(--vscode-font-family, system-ui, sans-serif);
+  outline: none;
+}
+body.vscode-dark .docx-view,
+body.vscode-high-contrast:not(.vscode-high-contrast-light) .docx-view {
+  color-scheme: dark;
+}
+body.vscode-light .docx-view,
+body.vscode-high-contrast-light .docx-view {
+  color-scheme: light;
+}
+.docx-view .docx-stack {
+  max-width: 816px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+}
+.docx-view .docx-page {
+  box-sizing: border-box;
+  min-height: 1056px; /* US Letter 11in at 96dpi: short documents still look like a page */
+  padding: 72px 80px;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-editor-foreground);
+  border: 1px solid var(--docx-border-muted);
+  border-radius: 2px;
+  box-shadow: 0 2px 10px var(--vscode-widget-shadow, transparent);
+  font-family: Calibri, Carlito, 'Segoe UI', var(--vscode-font-family, system-ui), sans-serif;
+  font-size: 11pt;
+  line-height: 1.5;
+  overflow-wrap: break-word;
+}
+.docx-view .docx-page > :first-child {
+  margin-top: 0;
+}
+.docx-view .docx-page > :last-child {
+  margin-bottom: 0;
+}
+.docx-view .docx-empty {
+  color: var(--vscode-descriptionForeground);
+  font-style: italic;
+}
+
+/* ----- DOCX: CONTENT ----- */
+.docx-view .docx-page p {
+  margin: 0 0 8pt;
+}
+/*
+ * Text blocks as Word lays them out: tabs and runs of spaces are kept (mammoth passes them through as text; tab stops
+ * every 0.5in, Word's default), and each paragraph takes its direction from its own text: mammoth drops the
+ * paragraph's right-to-left flag (w:bidi), so an Arabic or Hebrew paragraph is right-aligned with its punctuation
+ * in place only through unicode-bidi: plaintext. mammoth's HTML has no formatting whitespace between tags.
+ */
+.docx-view .docx-page :is(p, li, td, th, h1, h2, h3, h4, h5, h6, dt, dd, caption) {
+  white-space: pre-wrap;
+  tab-size: 36pt;
+  unicode-bidi: plaintext;
+}
+.docx-view .docx-page h1,
+.docx-view .docx-page h2,
+.docx-view .docx-page h3,
+.docx-view .docx-page h4,
+.docx-view .docx-page h5,
+.docx-view .docx-page h6 {
+  margin: 18pt 0 6pt;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--vscode-editor-foreground);
+}
+.docx-view .docx-page h1 {
+  font-size: 20pt;
+}
+.docx-view .docx-page h2 {
+  font-size: 16pt;
+}
+.docx-view .docx-page h3 {
+  font-size: 13.5pt;
+}
+.docx-view .docx-page h4 {
+  font-size: 12pt;
+}
+.docx-view .docx-page h5 {
+  font-size: 11pt;
+}
+.docx-view .docx-page h6 {
+  font-size: 11pt;
+  font-style: italic;
+}
+/* Paragraph styles from the docx.ts style map (Title, Subtitle, TOC Heading, Caption) */
+.docx-view .docx-page .doc-title {
+  margin: 0 0 6pt;
+  padding-bottom: 6pt;
+  font-size: 28pt;
+  font-weight: 400;
+  line-height: 1.15;
+  border-bottom: 1px solid var(--docx-border-muted);
+}
+.docx-view .docx-page .doc-subtitle {
+  margin: 0 0 16pt;
+  font-size: 14pt;
+  color: var(--vscode-descriptionForeground);
+}
+.docx-view .docx-page .doc-toc-heading {
+  font-size: 14pt;
+}
+.docx-view .docx-page .doc-caption {
+  margin-top: -4pt;
+  font-size: 9pt;
+  font-style: italic;
+  color: var(--vscode-descriptionForeground);
+}
+.docx-view .docx-page .doc-empty {
+  color: var(--vscode-descriptionForeground);
+}
+.docx-view .docx-page a {
+  color: var(--vscode-textLink-foreground);
+  text-decoration: underline;
+}
+.docx-view .docx-page a:hover {
+  color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
+}
+.docx-view .docx-page a:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+.docx-view .docx-page a:not([href]) {
+  color: inherit;
+  text-decoration: none;
+}
+.docx-view .docx-page ul,
+.docx-view .docx-page ol {
+  margin: 0 0 8pt;
+  padding-left: 2em;
+}
+.docx-view .docx-page li > p {
+  margin-bottom: 2pt;
+}
+.docx-view .docx-page blockquote {
+  margin: 0 0 8pt;
+  padding: 4pt 12pt;
+  font-style: italic;
+  border-left: 3px solid var(--vscode-textBlockQuote-border, var(--docx-border));
+  background: var(--vscode-textBlockQuote-background, transparent);
+}
+.docx-view .docx-page blockquote.intense,
+.docx-view .docx-page blockquote.intense-quote {
+  border-left-color: var(--vscode-textLink-foreground);
+  color: var(--vscode-textLink-foreground);
+}
+.docx-view .docx-page pre,
+.docx-view .docx-page code {
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.9em;
+}
+.docx-view .docx-page pre {
+  margin: 0 0 8pt;
+  padding: 8pt 10pt;
+  overflow: auto;
+  background: var(--vscode-textCodeBlock-background, transparent);
+  border: 1px solid var(--vscode-contrastBorder, transparent);
+  border-radius: 4px;
+}
+.docx-view .docx-page table {
+  margin: 0 0 8pt;
+  max-width: 100%;
+  border-collapse: collapse;
+}
+.docx-view .docx-page th,
+.docx-view .docx-page td {
+  padding: 4px 8px;
+  vertical-align: top;
+  border: 1px solid var(--docx-border);
+  /* Like Word, a long unbreakable word (URL, path) wraps inside its cell instead of widening the table past the page. */
+  overflow-wrap: anywhere;
+}
+.docx-view .docx-page th {
+  font-weight: 600;
+  text-align: start;
+}
+.docx-view .docx-page td > :last-child,
+.docx-view .docx-page th > :last-child {
+  margin-bottom: 0;
+}
+.docx-view .docx-page img {
+  max-width: 100%;
+  height: auto;
+}
+.docx-view .docx-page hr {
+  height: 1px;
+  margin: 12pt 0;
+  border: 0;
+  background: var(--docx-border-muted);
+}
+.docx-view .docx-page sup,
+.docx-view .docx-page sub {
+  line-height: 0;
+}
+.docx-view .docx-page mark {
+  color: inherit;
+  background: var(--vscode-editor-findMatchHighlightBackground, transparent);
+}
+.docx-view .docx-page kbd {
+  padding: 1px 4px;
+  font: 0.85em var(--vscode-editor-font-family, monospace);
+  border: 1px solid var(--docx-border);
+  border-radius: 3px;
+}
+/* mammoth footnotes/endnotes (<li id="footnote-1">, ids possibly prefixed by the sanitizer) and comments (<dl>) */
+.docx-view .docx-page li[id*='footnote-'],
+.docx-view .docx-page li[id*='endnote-'],
+.docx-view .docx-page dt[id*='comment-'],
+.docx-view .docx-page dt[id*='comment-'] + dd {
+  font-size: 9pt;
+  color: var(--vscode-descriptionForeground);
+}
+.docx-view .docx-page dt[id*='comment-'] {
+  margin-top: 6pt;
+  font-weight: 600;
+}
+.docx-view .docx-page dt[id*='comment-'] + dd {
+  margin-left: 16pt;
+}
+
+/* ----- DOCX: WARNINGS ----- */
+.docx-view .docx-warnings {
+  margin: 0 0 16px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--vscode-inputValidation-warningForeground, var(--vscode-editor-foreground));
+  background: var(--vscode-inputValidation-warningBackground, var(--vscode-editorWidget-background));
+  border: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-editorWarning-foreground));
+  border-radius: 4px;
+}
+.docx-view .docx-warnings summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.docx-view .docx-warnings summary::-webkit-details-marker {
+  display: none;
+}
+.docx-view .docx-warnings summary::before {
+  content: '';
+  flex: none;
+  width: 16px;
+  height: 16px;
+  background-color: var(--vscode-editorWarning-foreground, currentColor);
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+.docx-view .docx-warnings summary::after {
+  content: '';
+  flex: none;
+  width: 6px;
+  height: 6px;
+  margin-left: auto;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 120ms ease-in-out;
+}
+.docx-view .docx-warnings[open] summary::after {
+  transform: rotate(45deg);
+}
+.docx-view .docx-warnings summary:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+.docx-view .docx-warnings-title {
+  font-weight: 600;
+}
+.docx-view .docx-warnings-hint {
+  color: var(--vscode-descriptionForeground);
+}
+.docx-view .docx-warnings-list {
+  max-height: 240px;
+  margin: 0;
+  padding: 0 16px 10px 40px;
+  overflow: auto;
+}
+.docx-view .docx-warnings-list li + li {
+  margin-top: 2px;
+}
+.docx-view .docx-warning-count {
+  margin-left: 6px;
+  color: var(--vscode-descriptionForeground);
+}
+
+@media (max-width: 720px) {
+  .docx-view .docx-stack {
+    padding: 12px 8px 24px;
+  }
+  .docx-view .docx-page {
+    min-height: 0;
+    padding: 24px 20px;
+  }
+}
+
+/* ===== PDF ===== */
+/*
+ * Read-only PDF view: toolbar / [outline sidebar | pages], find bar floating over the pages. The pages are pdf.js's
+ * (white in every theme, like paper); everything around them uses the theme. pdf.js's own styles (text, annotation
+ * layers) come from pdfjs-dist/web/pdf_viewer.css in dist/viewer.css.
+ */
+
+/*
+ * pdf_viewer.css sets `:root { color-scheme: light dark }` for its light-dark() colours, which would switch native
+ * controls and scrollbars of every view to the OS scheme. VS Code sets no colour scheme in webviews: restore that, and
+ * give the PDF view the theme's scheme below (as the DOCX view does).
+ */
+:root {
+  color-scheme: normal;
+}
+
+/* ----- PDF: LAYOUT ----- */
+#app.pdf-app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-height: 0;
+  overflow: hidden;
+}
+body.vscode-dark #app.pdf-app,
+body.vscode-high-contrast:not(.vscode-high-contrast-light) #app.pdf-app {
+  color-scheme: dark;
+}
+body.vscode-light #app.pdf-app,
+body.vscode-high-contrast-light #app.pdf-app {
+  color-scheme: light;
+}
+.pdf-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.pdf-main {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+/* ----- PDF: TOOLBAR ----- */
+.pdf-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+  min-height: 30px;
+  padding: 2px 6px;
+  box-sizing: border-box;
+  background: var(--fv-chrome-bg);
+  border-bottom: 1px solid var(--fv-chrome-border);
+  color: var(--vscode-foreground);
+  font-family: var(--fv-ui-font);
+  font-size: var(--fv-ui-size);
+  white-space: nowrap;
+  overflow: hidden;
+  user-select: none;
+}
+.pdf-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+.pdf-sep {
+  flex: none;
+  width: 1px;
+  height: 16px;
+  margin: 0 4px;
+  background: var(--fv-chrome-border);
+}
+.pdf-spacer {
+  flex: 1;
+}
+.pdf-toolbar .fv-icon-btn[aria-pressed='true'],
+.pdf-toolbar .fv-icon-btn[aria-expanded='true'] {
+  background: var(--vscode-inputOption-activeBackground, rgba(128, 128, 128, 0.25));
+  color: var(--vscode-inputOption-activeForeground, var(--vscode-foreground));
+  border-color: var(--vscode-inputOption-activeBorder, transparent);
+}
+.pdf-page-input {
+  width: 4.5ch;
+  min-width: 36px;
+  height: 22px;
+  margin-left: 4px;
+  padding: 0 4px;
+  box-sizing: border-box;
+  border: 1px solid var(--vscode-input-border, var(--fv-chrome-border));
+  border-radius: 2px;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+.pdf-page-input:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+  border-color: var(--vscode-focusBorder);
+}
+.pdf-page-input:disabled {
+  opacity: 0.4;
+}
+.pdf-page-count {
+  margin: 0 4px;
+  color: var(--vscode-descriptionForeground);
+  font-variant-numeric: tabular-nums;
+}
+.pdf-zoom-label:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.pdf-zoom-label:disabled:hover {
+  background: transparent;
+}
+
+/* ----- PDF: PAGES ----- */
+/* PDFViewer's container must be absolutely positioned (pdf.js checks it). */
+.pdf-container {
+  /* pdf.js page frame (pdf_viewer.css defaults to a 9px transparent border: white pages would vanish on a light editor). */
+  --page-margin: 10px auto 0;
+  --page-border: 1px solid var(--pdf-page-edge);
+  --pdfViewer-padding-bottom: 10px;
+  --pdf-page-edge: var(--vscode-contrastBorder, color-mix(in srgb, var(--vscode-editor-foreground) 22%, transparent));
+
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  /* Room for the vertical scroll bar is kept, so fitting a page to the width cannot make it come and go in turn. */
+  scrollbar-gutter: stable;
+  /* Editor background, slightly tinted towards the foreground (as the DOCX view), so white pages stand out. */
+  background: color-mix(in srgb, var(--vscode-editor-background) 92%, var(--vscode-editor-foreground));
+  outline: none;
+}
+.pdf-container:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+.pdf-container .pdfViewer .page {
+  box-shadow: 0 1px 4px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.2));
+}
+
+/* ----- PDF: OVERLAY (loading, password) ----- */
+.pdf-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 48px 24px;
+  box-sizing: border-box;
+  overflow: auto;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-foreground);
+}
+.pdf-loading {
+  margin: 0;
+  color: var(--vscode-descriptionForeground);
+}
+.pdf-password {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 420px;
+}
+.pdf-password-title {
+  margin: 0;
+  font-size: 1.35em;
+  font-weight: 600;
+}
+.pdf-password-message {
+  margin: 0;
+  line-height: 1.5;
+}
+.pdf-password-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+.pdf-password-input {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  padding: 0 6px;
+  box-sizing: border-box;
+  border: 1px solid var(--vscode-input-border, var(--fv-chrome-border));
+  border-radius: 2px;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  font: inherit;
+}
+.pdf-password-input:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+  border-color: var(--vscode-focusBorder);
+}
+.pdf-password-input[aria-invalid='true'] {
+  border-color: var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground, #f14c4c));
+}
+
+/* ----- PDF: FIND BAR (floats over the pages, like the editor's find widget) ----- */
+.pdf-findbar {
+  position: absolute;
+  top: 0;
+  right: 18px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  max-width: calc(100% - 36px);
+  padding: 4px 4px 4px 6px;
+  box-sizing: border-box;
+  background: var(--vscode-editorWidget-background, var(--fv-chrome-bg));
+  color: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+  border: 1px solid var(--vscode-editorWidget-border, var(--vscode-contrastBorder, transparent));
+  border-top: none;
+  border-radius: 0 0 4px 4px;
+  box-shadow: 0 0 8px 2px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.16));
+  font-family: var(--fv-ui-font);
+  font-size: var(--fv-ui-size);
+}
+.pdf-find-input {
+  width: 220px;
+  min-width: 80px;
+  flex: 0 1 auto;
+  height: 24px;
+  padding: 0 6px;
+  box-sizing: border-box;
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 2px;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  font: inherit;
+}
+.pdf-find-input::placeholder {
+  color: var(--vscode-input-placeholderForeground);
+}
+.pdf-find-input:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+  border-color: var(--vscode-focusBorder);
+}
+.pdf-find-input.pdf-find-none,
+.pdf-find-input.pdf-find-none:focus {
+  border-color: var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground, #f14c4c));
+  outline-color: var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground, #f14c4c));
+}
+/* Match Case toggle ("Aa"), styled like the editor's find options. */
+.pdf-find-option {
+  flex: none;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 3px;
+  box-sizing: border-box;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--vscode-icon-foreground, var(--vscode-foreground));
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.pdf-find-option:hover {
+  background: var(--vscode-inputOption-hoverBackground, var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.2)));
+}
+.pdf-find-option[aria-pressed='true'] {
+  background: var(--vscode-inputOption-activeBackground, rgba(128, 128, 128, 0.25));
+  color: var(--vscode-inputOption-activeForeground, var(--vscode-foreground));
+  border-color: var(--vscode-inputOption-activeBorder, transparent);
+}
+.pdf-find-option:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+.pdf-find-status {
+  min-width: 64px;
+  margin: 0 4px;
+  color: var(--vscode-descriptionForeground);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ----- PDF: OUTLINE SIDEBAR ----- */
+.pdf-sidebar {
+  flex: none;
+  width: 260px;
+  max-width: 40%;
+  overflow: auto;
+  background: var(--vscode-sideBar-background, var(--fv-chrome-bg));
+  color: var(--vscode-sideBar-foreground, var(--vscode-foreground));
+  border-right: 1px solid var(--vscode-sideBar-border, var(--fv-chrome-border));
+  font-family: var(--fv-ui-font);
+  font-size: var(--fv-ui-size);
+}
+.pdf-outline {
+  padding: 4px 0;
+}
+.pdf-outline-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pdf-outline-list .pdf-outline-list {
+  padding-left: 12px;
+}
+.pdf-outline-row {
+  display: flex;
+  align-items: center;
+  min-height: 22px;
+  padding-left: 4px;
+}
+.pdf-outline-row:hover {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+.pdf-outline-toggle {
+  min-width: 18px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+}
+.pdf-outline-toggle .fv-icon {
+  transition: transform 0.1s ease;
+}
+.pdf-outline-toggle[aria-expanded='true'] .fv-icon {
+  transform: rotate(90deg);
+}
+.pdf-outline-indent {
+  flex: none;
+  width: 18px;
+}
+.pdf-outline-link {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 6px 2px 2px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.pdf-outline-link:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+.pdf-outline-bold {
+  font-weight: 600;
+}
+.pdf-outline-italic {
+  font-style: italic;
+}
+
+/* ----- PDF: HIGH CONTRAST ----- */
+body.vscode-high-contrast .pdf-container .pdfViewer .page,
+body.vscode-high-contrast-light .pdf-container .pdfViewer .page {
+  box-shadow: none;
+}
+body.vscode-high-contrast .pdf-outline-row:hover,
+body.vscode-high-contrast-light .pdf-outline-row:hover {
+  outline: 1px dashed var(--vscode-contrastActiveBorder, var(--vscode-focusBorder));
+  outline-offset: -1px;
+  background: transparent;
+}
+
+/* ===== PPTX ===== */
+/*
+ * Read-only presentation view: toolbar, thumbnail strip, the current slide centred on a tinted canvas, notes pane.
+ * The chrome follows the VS Code theme; slides keep their own colours (white paper by default) in every theme, like
+ * the pages of the PDF view. Slide content is laid out in points and scaled by a CSS transform (see viewer.js).
+ */
+
+body[data-kind='pptx'] {
+  overflow: hidden;
+}
+
+/* ----- PPTX: LAYOUT ----- */
+.pptx-app {
+  --pptx-canvas: color-mix(in srgb, var(--vscode-editor-background) 92%, var(--vscode-editor-foreground));
+  --pptx-page-border: var(--vscode-contrastBorder, color-mix(in srgb, var(--vscode-editor-foreground) 22%, transparent));
+  --pptx-thumb-border: var(--vscode-contrastBorder, color-mix(in srgb, var(--vscode-foreground) 22%, transparent));
+
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  color: var(--vscode-foreground);
+  outline: none;
+}
+
+.pptx-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.pptx-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ----- PPTX: TOOLBAR ----- */
+.pptx-toolbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 30px;
+  padding: 2px 6px;
+  box-sizing: border-box;
+  background: var(--fv-chrome-bg);
+  border-bottom: 1px solid var(--fv-chrome-border);
+  font-size: var(--fv-ui-size);
+  user-select: none;
+}
+
+.pptx-toolbar .fv-icon-btn[aria-pressed='true'] {
+  background: var(--vscode-inputOption-activeBackground, rgba(0, 120, 212, 0.2));
+  border-color: var(--vscode-inputOption-activeBorder, transparent);
+  color: var(--vscode-inputOption-activeForeground, var(--vscode-icon-foreground, var(--vscode-foreground)));
+}
+
+.pptx-sep {
+  flex: none;
+  width: 1px;
+  height: 16px;
+  margin: 0 4px;
+  background: var(--fv-chrome-border);
+}
+
+.pptx-page {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 2px;
+  color: var(--vscode-descriptionForeground);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.pptx-page-input {
+  min-width: 2.6em;
+  height: 22px;
+  box-sizing: border-box;
+  padding: 0 4px;
+  border: 1px solid var(--vscode-input-border, var(--fv-chrome-border));
+  border-radius: 2px;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.pptx-page-input:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+.pptx-title-wrap {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+}
+
+.pptx-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pptx-hidden-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 18px;
+  padding: 0 7px 0 5px;
+  border-radius: 9px;
+  background: var(--vscode-badge-background, rgba(128, 128, 128, 0.3));
+  color: var(--vscode-badge-foreground, var(--vscode-foreground));
+  font-size: 11px;
+}
+
+.pptx-hidden-badge svg {
+  width: 13px;
+  height: 13px;
+}
+
+.pptx-zoom-label {
+  flex: none;
+  min-width: 3.4em;
+  text-align: center;
+  color: var(--vscode-descriptionForeground);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 480px) {
+  .pptx-title,
+  .pptx-zoom-label {
+    display: none;
+  }
+}
+
+/* ----- PPTX: THUMBNAILS ----- */
+.pptx-thumbs {
+  flex: none;
+  width: calc(var(--pptx-thumb-w, 152px) + 50px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  background: var(--fv-chrome-bg);
+  border-right: 1px solid var(--fv-chrome-border);
+  outline: none;
+}
+
+.pptx-thumbs:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+.pptx-thumbs-inner {
+  position: relative;
+}
+
+.pptx-thumb {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 0 12px 0 4px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.pptx-thumb-num {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  width: 22px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  line-height: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pptx-thumb-num svg {
+  width: 13px;
+  height: 13px;
+}
+
+.pptx-thumb-pic {
+  position: relative;
+  flex: none;
+  width: var(--pptx-thumb-w, 152px);
+  height: var(--pptx-thumb-h, 86px);
+  overflow: hidden;
+  background: var(--fv-loading-a);
+  outline: 1px solid var(--pptx-thumb-border);
+}
+
+.pptx-thumb:hover .pptx-thumb-pic {
+  outline-color: var(--vscode-list-hoverForeground, var(--vscode-foreground));
+}
+
+.pptx-thumb-current .pptx-thumb-pic {
+  outline: 2px solid var(--fv-accent);
+  outline-offset: 1px;
+}
+
+.pptx-thumb-current .pptx-thumb-num {
+  color: var(--vscode-foreground);
+  font-weight: 600;
+}
+
+/* Hidden slides: faded picture and a struck-through number (as in PowerPoint). */
+.pptx-thumb-hidden .pptx-thumb-pic > .pptx-slide {
+  opacity: 0.45;
+}
+
+.pptx-thumb-hidden .pptx-thumb-num {
+  text-decoration: line-through;
+}
+
+.pptx-thumb-pic > .pptx-slide {
+  pointer-events: none;
+  user-select: none;
+}
+
+/* ----- PPTX: STAGE & SLIDE ----- */
+.pptx-stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: auto;
+  padding: 16px;
+  box-sizing: border-box;
+  background: var(--pptx-canvas);
+  outline: none;
+}
+
+/* margin: auto centres the slide and, unlike align-items: center, keeps an oversized slide fully scrollable. */
+.pptx-frame {
+  position: relative;
+  flex: none;
+  margin: auto;
+  overflow: hidden;
+  background: #ffffff;
+  outline: 1px solid var(--pptx-page-border);
+  box-shadow: 0 2px 10px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.3));
+}
+
+.pptx-empty {
+  margin: auto;
+}
+
+/* The slide: points, unscaled; viewer.js sets transform: scale(k). Paper colours in every theme. */
+.pptx-slide {
+  position: absolute;
+  left: 0;
+  top: 0;
+  overflow: hidden;
+  transform-origin: 0 0;
+  background: #ffffff;
+  color: #000000;
+  color-scheme: light;
+  forced-color-adjust: none;
+  font-family: Calibri, Carlito, 'Segoe UI', Arial, sans-serif;
+  font-size: 18pt;
+  font-weight: normal;
+  line-height: 1.2;
+  text-align: left;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: default;
+}
+
+.pptx-slide.pptx-loading::after {
+  content: '';
+  position: absolute;
+  left: calc(50% - 14pt);
+  top: calc(50% - 14pt);
+  width: 28pt;
+  height: 28pt;
+  box-sizing: border-box;
+  border: 3pt solid rgba(0, 0, 0, 0.12);
+  border-top-color: rgba(0, 0, 0, 0.45);
+  border-radius: 50%;
+  animation: fv-spin 0.8s linear infinite;
+}
+
+.pptx-el {
+  position: absolute;
+  box-sizing: border-box;
+  transform-origin: 50% 50%;
+}
+
+.pptx-svg {
+  position: absolute;
+  left: 0;
+  top: 0;
+  overflow: visible;
+}
+
+.pptx-has-link {
+  cursor: pointer;
+}
+
+/* ----- PPTX: TEXT ----- */
+.pptx-text {
+  position: absolute;
+  inset: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  tab-size: 36pt;
+}
+
+.pptx-text.pptx-anchor-mid {
+  justify-content: center;
+}
+
+.pptx-text.pptx-anchor-down {
+  justify-content: flex-end;
+}
+
+.pptx-text.pptx-nowrap {
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.pptx-text.pptx-vertical {
+  writing-mode: vertical-rl;
+}
+
+.pptx-text-body {
+  flex: none;
+  min-width: 0;
+}
+
+.pptx-slide p {
+  margin: 0;
+}
+
+.pptx-slide ul,
+.pptx-slide ol {
+  margin: 0;
+  padding-left: 1.4em;
+}
+
+.pptx-slide li > p {
+  display: block;
+}
+
+.pptx-slide a {
+  color: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+/* ----- PPTX: PICTURES ----- */
+.pptx-img-clip {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.pptx-img {
+  position: absolute;
+  max-width: none;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+
+.pptx-image-missing {
+  background: repeating-linear-gradient(45deg, #eeeeee 0 6pt, #dddddd 6pt 12pt);
+  outline: 1pt dashed #999999;
+  outline-offset: -1pt;
+}
+
+.pptx-math {
+  display: flex;
+  align-items: center;
+}
+
+.pptx-math-img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  user-select: none;
+}
+
+.pptx-math-text {
+  font-family: 'Cambria Math', Cambria, serif;
+  white-space: pre-wrap;
+}
+
+/* ----- PPTX: TABLES ----- */
+.pptx-table {
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 18pt;
+}
+
+.pptx-table td {
+  padding: 3.6pt 7.2pt;
+  box-sizing: border-box;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  line-height: 1.2;
+}
+
+/* ----- PPTX: MEDIA ----- */
+.pptx-media {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3em;
+  overflow: hidden;
+  border-radius: 2pt;
+  background: rgba(0, 0, 0, 0.6);
+  color: #ffffff;
+  font-family: 'Segoe UI', Calibri, Arial, sans-serif;
+  line-height: 1.2;
+  text-align: center;
+}
+
+.pptx-media-icon svg {
+  width: 2.2em;
+  height: 2.2em;
+}
+
+.pptx-media-note {
+  font-size: 0.7em;
+  opacity: 0.85;
+}
+
+/* ----- PPTX: CHARTS ----- */
+.pptx-chart-host {
+  position: absolute;
+  inset: 0;
+}
+
+.pptx-chart-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #7f7f7f;
+  font-size: 10pt;
+}
+
+.pptx-chart-fallback {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4pt;
+  padding: 6pt;
+  box-sizing: border-box;
+  overflow: hidden;
+  border: 1pt dashed #a6a6a6;
+  background: rgba(242, 242, 242, 0.92);
+  color: #404040;
+  font-family: Calibri, Carlito, 'Segoe UI', Arial, sans-serif;
+  font-size: 9pt;
+}
+
+.pptx-chart-fallback-title {
+  display: flex;
+  align-items: center;
+  gap: 4pt;
+  font-size: 10pt;
+  font-weight: 600;
+}
+
+.pptx-chart-fallback-title svg {
+  width: 14pt;
+  height: 14pt;
+}
+
+.pptx-chart-thumb {
+  align-items: center;
+  justify-content: center;
+}
+
+.pptx-chart-thumb .pptx-chart-fallback-title {
+  flex-direction: column;
+  font-size: 16pt;
+}
+
+.pptx-chart-thumb .pptx-chart-fallback-title svg {
+  width: 48pt;
+  height: 48pt;
+}
+
+.pptx-chart-data-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.pptx-chart-data {
+  border-collapse: collapse;
+  font-size: 8pt;
+}
+
+.pptx-chart-data th,
+.pptx-chart-data td {
+  padding: 1pt 4pt;
+  border: 0.5pt solid #bfbfbf;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.pptx-chart-data th {
+  background: #e7e7e7;
+  font-weight: 600;
+  text-align: left;
+}
+
+/* ----- PPTX: NOTES ----- */
+.pptx-notes {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  height: clamp(72px, 24%, 280px);
+  border-top: 1px solid var(--fv-chrome-border);
+  background: var(--vscode-editor-background);
+}
+
+.pptx-notes-title {
+  flex: none;
+  padding: 5px 12px 0;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  user-select: none;
+}
+
+.pptx-notes-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 12px 10px;
+  color: var(--vscode-editor-foreground);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  outline: none;
+}
+
+.pptx-notes-body:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+.pptx-notes-body.pptx-notes-empty {
+  color: var(--vscode-descriptionForeground);
+  font-style: italic;
+}
+
+/* ----- PPTX: HIGH CONTRAST & MOTION ----- */
+body.vscode-high-contrast .pptx-frame,
+body.vscode-high-contrast-light .pptx-frame {
+  box-shadow: none;
+}
+
+body.vscode-high-contrast .pptx-thumb:hover .pptx-thumb-pic,
+body.vscode-high-contrast-light .pptx-thumb:hover .pptx-thumb-pic {
+  outline: 1px dashed var(--vscode-contrastActiveBorder, var(--vscode-focusBorder));
+}
+
+body.vscode-high-contrast .pptx-thumb-current .pptx-thumb-pic,
+body.vscode-high-contrast-light .pptx-thumb-current .pptx-thumb-pic {
+  outline: 2px solid var(--vscode-contrastActiveBorder, var(--vscode-focusBorder));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pptx-slide.pptx-loading::after {
+    animation: none;
+  }
+}

@@ -1,0 +1,13 @@
+rank  name                 born        city                     field                      score  note                        
+   1  "Ada Lovelace"       1815-12-10  London                   Mathematics                 98.5  "First published algorithm" 
+   2  "Alan Turing"        1912-06-23  London                   "Computer science"         97.25  ""                          
+   3  "Grace Hopper"       1906-12-09  "New York"               Compilers                     96  "Popularised ""debugging""" 
+   4  "Katherine Johnson"  1918-08-26  "White Sulphur Springs"  Mathematics                95.75  "Orbital mechanics"         
+   5  "Edsger Dijkstra"    1930-05-11  Rotterdam                Algorithms                    94  "Shortest paths; semaphores"
+   6  "Barbara Liskov"     1939-11-07  "Los Angeles"            "Programming languages"     93.5  Substitution                
+   7  "Donald Knuth"       1938-01-10  Milwaukee                Algorithms                    93  TeX                         
+   8  "Margaret Hamilton"  1936-08-17  Paoli                    "Software engineering"     92.25  Apollo                      
+   9  "John McCarthy"      1927-09-04  Boston                   "Artificial intelligence"     91  Lisp                        
+  10  "Kurt Gödel"         1906-04-28  Brno                     Logic                       90.5  "Incompleteness theorems"   
+  11  "Ole-Johan Dahl"     1931-10-12  Mandal                   "Programming languages"       ""  "Simula (no score)"         
+  12  Euclid               ""          Alexandria               Geometry                      89  "Birth date unknown"        

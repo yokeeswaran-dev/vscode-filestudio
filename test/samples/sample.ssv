@@ -1,0 +1,17 @@
+﻿Référence;Libellé;Quantité;Prix unitaire (€);Montant (€);Date;Entrepôt;Remarque
+FR-001;Café moulu 250 g;12;4,95;59,40;15/03/2024;Paris Nord;
+FR-002;"Thé vert; vrac";5;7,20;36,00;16/03/2024;Lyon;Point-virgule dans le libellé
+FR-003;"Chocolat ""Noir 70 %""";40;2,15;86,00;17/03/2024;Lille;Guillemets dans le libellé
+FR-004;Baguette tradition;1 200;1,30;1 560,00;18/03/2024;Paris Sud;Grosse commande
+FR-005;Fromage (Comté 18 mois);7;24,90;174,30;19/03/2024;Besançon;
+FR-006;Pommes Golden;-3;2,49;-7,47;20/03/2024;Rouen;Retour client
+FR-007;Vin rouge 0,75 l;24;8,75;210,00;21/03/2024;Bordeaux;
+FR-008;Farine T55;0;1,09;0,00;22/03/2024;Toulouse;Rupture de stock
+FR-009;;15;;;23/03/2024;Nantes;Libellé et prix manquants
+FR-010;"Huile d’olive
+vierge extra";9;11,50;103,50;24/03/2024;Marseille;Retour à la ligne (CRLF) dans le libellé
+FR-011;Confiture abricot;18;3,60;64,80;25/03/2024;Avignon;
+FR-012;Yaourt nature x 4;60;1,85;111,00;26/03/2024;Rennes;
+FR-013;Moutarde de Dijon;22;2,30;50,60;27/03/2024;Dijon;
+FR-014;Crème fraîche 30 %;14;2,05;28,70;28/03/2024;Caen;
+TOTAL;Total général;1 423;;2 476,83;29/03/2024;Siège;Séparateur de milliers : espace

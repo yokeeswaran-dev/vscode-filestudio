@@ -1,0 +1,21 @@
+# Everything the packaged extension does not need at run time.
+.github/**
+.vscode/**
+.vscode-test/**
+src/**
+test/**
+node_modules/**
+assets/screenshots/**
+media/viewer.js
+esbuild.js
+tsconfig.json
+.editorconfig
+.gitignore
+CONTRIBUTING.md
+CODE_OF_CONDUCT.md
+SECURITY.md
+SUPPORT.md
+CLAUDE.md
+**/*.map
+**/*.ts
+*.vsix

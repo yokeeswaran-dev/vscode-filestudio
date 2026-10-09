@@ -1,0 +1,32 @@
+id|service|endpoint|method|status|latency_ms|checked_at|region|notes
+1|search|"/api/search?q=a|b"|GET|200|12.5|2024-03-15T09:30:00Z|eu-west|Query string contains a pipe
+2|auth|/api/login|POST|401|48.0|2024-03-15T09:30:04Z|us-east|"Rejected: ""bad password"""
+3|billing|/api/invoices|GET|500|1203.75|2024-03-15T09:30:09Z|us-east|"TimeoutError
+retried twice (embedded LF)"
+4|reports|/api/export|GET|200||2024-03-15T09:30:15Z|ap-south|
+5|"gateway | edge"|/|HEAD|204|0.9|2024-03-15T09:30:16Z|eu-west|Service name contains a pipe
+6|données|/api/données/été|GET|200|33.3|2024-03-15T09:30:21Z|eu-central|Unicode path: café, 東京
+7|"  padded  "|/api/padded|GET|200|7|2024-03-15T09:30:25Z|eu-west|Leading/trailing spaces kept (quoted)
+8|regex|/api/match|POST|422|15.25|2024-03-15T09:30:31Z|us-west|"Pattern ""^(a|b|c)$"" failed"
+9|cache|/api/cache|DELETE|202|-1|2024-03-15T09:30:38Z|us-west|Negative latency marks a skipped check
+10|metrics|/metrics|GET|200|1e2|2024-03-15T09:30:44Z|ap-south|"Quoted although nothing needs quoting"
+11|search|/api/search/632|GET|200|461.10|2024-03-15T09:30:45Z|ap-south|"Timeout after ""30s"""
+12|search|/api/search/209|GET|503|425.28|2024-03-15T09:30:52Z|us-west|
+13|reports|/api/reports/985|GET|500|172.10|2024-03-15T09:30:58Z|us-west|
+14|metrics|/api/metrics/509|DELETE|404|821.78|2024-03-15T09:31:02Z|us-west|"Timeout after ""30s"""
+15|metrics|/api/metrics/311|POST|500|728.88|2024-03-15T09:31:04Z|us-west|
+16|mail|/api/mail/394|PUT|200|806.68|2024-03-15T09:31:06Z|us-west|
+17|cache|/api/cache/751|GET|200|10.30|2024-03-15T09:31:11Z|eu-central|"Retry 1|2|3"
+18|search|/api/search/937|PUT|200|658.80|2024-03-15T09:31:17Z|us-east|
+19|search|/api/search/732|DELETE|404|150.20|2024-03-15T09:31:25Z|us-west|"Retry 1|2|3"
+20|auth|/api/auth/240|GET|204|20.98|2024-03-15T09:31:29Z|us-west|OK
+21|search|/api/search/580|PUT|503|759.52|2024-03-15T09:31:38Z|eu-west|
+22|storage|/api/storage/588|PUT|404|534.94|2024-03-15T09:31:44Z|eu-central|"Retry 1|2|3"
+23|auth|/api/auth/718|GET|200|142.30|2024-03-15T09:31:53Z|us-east|
+24|billing|/api/billing/831|POST|200|820.82|2024-03-15T09:31:54Z|eu-west|
+25|cache|/api/cache/492|GET|301|16.30|2024-03-15T09:31:55Z|eu-west|"Retry 1|2|3"
+26|reports|/api/reports/487|GET|500|221.73|2024-03-15T09:32:00Z|us-west|Slow response
+27|billing|/api/billing/461|GET|204|110.50|2024-03-15T09:32:03Z|eu-west|"Timeout after ""30s"""
+28|billing|/api/billing/782|PUT|200|754.09|2024-03-15T09:32:10Z|us-west|Cache hit
+29|search|/api/search/167|PUT|500|477.80|2024-03-15T09:32:17Z|us-west|"Retry 1|2|3"
+30|mail|/api/mail/11|GET|500|858.97|2024-03-15T09:32:20Z|eu-west|

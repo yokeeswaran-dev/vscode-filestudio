@@ -1,0 +1,3 @@
+# Sample files keep their exact bytes (CRLF / LF line endings, BOM, trailing spaces): the unit tests compare them
+# byte for byte, so git must never convert their line endings (core.autocrlf).
+test/samples/** -text

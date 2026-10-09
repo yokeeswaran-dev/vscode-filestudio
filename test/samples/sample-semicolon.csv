@@ -1,0 +1,17 @@
+﻿Artikel;Beschreibung;Menge;Preis (€);Datum;Lager
+A-1001;Kaffeebohnen, gemahlen;12;8,99;15.03.2024;Hamburg
+A-1002;"Grüner Tee; lose";5;4,50;16.03.2024;München
+A-1003;"Schokolade ""Zartbitter""";40;1,29;17.03.2024;Köln
+A-1004;Brötchen;120;0,35;18.03.2024;Düsseldorf
+A-1005;Käse (Gouda);7;12,75;19.03.2024;Bremen
+A-1006;Äpfel;-3;2,10;20.03.2024;Hamburg
+A-1007;Weißwein 0,75 l;24;6,49;21.03.2024;Mainz
+A-1008;Mehl Type 405;0;0,89;22.03.2024;Stuttgart
+A-1009;;15;;23.03.2024;Leipzig
+A-1010;"Olivenöl
+extra nativ";9;9,95;24.03.2024;Dresden
+A-1011;Müsli;18;3,49;25.03.2024;Nürnberg
+A-1012;Joghurt 1,5 %;60;0,59;26.03.2024;Hannover
+A-1013;Senf, mittelscharf;22;1,15;27.03.2024;Düsseldorf
+A-1014;Spätzle;14;1,99;28.03.2024;Stuttgart
+A-1015;Gesamtsumme;1.234;1.234,56;29.03.2024;Zentrale

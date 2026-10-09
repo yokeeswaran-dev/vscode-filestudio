@@ -1,0 +1,26 @@
+id	product	category	price	qty	updated	comment
+1	Thingamajig A	Garden	152.23	293	2024-09-13	"Size: 10"" x 12"""
+2	Widget B	Garden	152.13	222	2024-05-24	日本語のコメント
+3	Gizmo C	Kitchen	170.54	76	2024-02-23	Back-ordered
+4	Gizmo D	Toys	145.84	59	2024-06-28	Ships in 2–3 days
+5	Gizmo E	Office	201.44	384	2024-04-05	Ships in 2–3 days
+6	Doohickey F	Tools	185.36	489	2024-03-30	Back-ordered
+7	Whatsit G	Toys	138.58	286	2024-09-11	Back-ordered
+8	Sprocket H	Office	96.48	7	2024-01-24	日本語のコメント
+9	Gizmo I	Garden	67.97	249	2024-08-09	
+10	Whatsit J	Tools	111.41	316	2024-10-23	Contains, a comma
+11	Gizmo K	Toys	12.55	366	2024-05-06	日本語のコメント
+12	Doohickey L	Garden	87.28	421	2024-02-18	
+13	Whatsit M	Kitchen	31.81	181	2024-04-23	
+14	Sprocket N	Kitchen	103.01	459	2024-06-25	"Size: 10"" x 12"""
+15	Doohickey O	Garden	2.64	440	2024-03-31	Contains, a comma
+16	Widget P	Tools	186.40	270	2024-06-03	
+17	Thingamajig Q	Kitchen	221.16	481	2024-06-29	Ships in 2–3 days
+18	Thingamajig R	Garden	24.06	324	2024-07-14	
+19	Whatsit S	Tools	34.81	322	2024-10-19	Contains, a comma
+20	Flange T	Toys	190.29	325	2024-01-22	Contains, a comma
+21	Whatsit U	Garden	157.14	108	2024-08-04	Contains, a comma
+22	Widget V	Garden	95.54	86	2024-09-02	
+23	Sprocket W	Tools	108.54	425	2024-06-20	Ships in 2–3 days
+24	Whatsit X	Tools	124.27	243	2024-02-19	日本語のコメント
+25	"Tab	separated name"	Edge cases	0	0	2024-12-31	Quoted field containing a tab

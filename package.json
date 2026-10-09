@@ -1,0 +1,197 @@
+{
+  "name": "filestudio",
+  "displayName": "FileStudio - Universal File Viewer & Editor",
+  "description": "View and edit common document, spreadsheet, and presentation files directly in VS Code.",
+  "version": "0.1.0",
+  "publisher": "Yokeeswaran",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yokeeswaran-dev/vscode-filestudio.git"
+  },
+  "bugs": {
+    "url": "https://github.com/yokeeswaran-dev/vscode-filestudio/issues"
+  },
+  "homepage": "https://github.com/yokeeswaran-dev/vscode-filestudio",
+  "license": "MIT",
+  "icon": "assets/icon.png",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "xlsx",
+    "excel",
+    "csv",
+    "tsv",
+    "psv",
+    "ssv",
+    "spreadsheet",
+    "docx",
+    "word",
+    "pdf",
+    "pptx",
+    "powerpoint",
+    "markdown",
+    "viewer"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "fileStudio.sheet",
+        "displayName": "FileStudio: Spreadsheet",
+        "selector": [
+          { "filenamePattern": "*.xlsx" }
+        ],
+        "priority": "default"
+      },
+      {
+        "viewType": "fileStudio.csv",
+        "displayName": "FileStudio: CSV",
+        "selector": [
+          { "filenamePattern": "*.csv" },
+          { "filenamePattern": "*.tsv" },
+          { "filenamePattern": "*.psv" },
+          { "filenamePattern": "*.ssv" }
+        ],
+        "priority": "default"
+      },
+      {
+        "viewType": "fileStudio.markdown",
+        "displayName": "FileStudio: Markdown",
+        "selector": [
+          { "filenamePattern": "*.md" },
+          { "filenamePattern": "*.markdown" }
+        ],
+        "priority": "option"
+      },
+      {
+        "viewType": "fileStudio.docx",
+        "displayName": "FileStudio: Word Document",
+        "selector": [
+          { "filenamePattern": "*.docx" }
+        ],
+        "priority": "default"
+      },
+      {
+        "viewType": "fileStudio.pdf",
+        "displayName": "FileStudio: PDF",
+        "selector": [
+          { "filenamePattern": "*.pdf" }
+        ],
+        "priority": "default"
+      },
+      {
+        "viewType": "fileStudio.pptx",
+        "displayName": "FileStudio: Presentation",
+        "selector": [
+          { "filenamePattern": "*.pptx" }
+        ],
+        "priority": "default"
+      }
+    ],
+    "commands": [
+      {
+        "command": "fileStudio.openWith",
+        "title": "Open with FileStudio",
+        "category": "FileStudio",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "fileStudio.reopenAsText",
+        "title": "Reopen as Text",
+        "category": "FileStudio",
+        "icon": "$(go-to-file)"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "fileStudio.openWith",
+          "when": "resourceExtname =~ /^\\.(xlsx|csv|tsv|psv|ssv|md|markdown|docx|pdf|pptx)$/i",
+          "group": "navigation@20"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "fileStudio.openWith",
+          "when": "resourceExtname =~ /^\\.(xlsx|csv|tsv|psv|ssv|md|markdown|docx|pdf|pptx)$/i && activeCustomEditorId != fileStudio.sheet && activeCustomEditorId != fileStudio.csv && activeCustomEditorId != fileStudio.markdown && activeCustomEditorId != fileStudio.docx && activeCustomEditorId != fileStudio.pdf && activeCustomEditorId != fileStudio.pptx",
+          "group": "navigation@20"
+        },
+        {
+          "command": "fileStudio.reopenAsText",
+          "when": "activeCustomEditorId == fileStudio.csv || activeCustomEditorId == fileStudio.markdown",
+          "group": "navigation@21"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "fileStudio.openWith",
+          "when": "resourceExtname =~ /^\\.(xlsx|csv|tsv|psv|ssv|md|markdown|docx|pdf|pptx)$/i"
+        },
+        {
+          "command": "fileStudio.reopenAsText",
+          "when": "activeCustomEditorId == fileStudio.csv || activeCustomEditorId == fileStudio.markdown"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "FileStudio",
+      "properties": {
+        "fileStudio.markdown.defaultMode": {
+          "type": "string",
+          "enum": [
+            "preview",
+            "split",
+            "wysiwyg"
+          ],
+          "default": "preview",
+          "scope": "resource",
+          "description": "Mode used when a Markdown file is opened with FileStudio."
+        },
+        "fileStudio.xlsx.backupOnSave": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Write <name>.xlsx.bak (once) before the first save of a workbook."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "node esbuild.js --production",
+    "typecheck": "tsc --noEmit",
+    "vscode:prepublish": "npm run typecheck && npm run package",
+    "samples": "node test/generate-samples.js",
+    "test": "node test/build-tests.js && cd test/unit && node --test --test-reporter=spec"
+  },
+  "dependencies": {
+    "dompurify": "^3.4.16",
+    "echarts": "^6.1.0",
+    "exceljs": "^4.4.0",
+    "highlight.js": "^11.12.0",
+    "jszip": "3.10",
+    "katex": "^0.19.0",
+    "mammoth": "^1.13.0",
+    "markdown-it": "^15.0.2",
+    "markdown-it-emoji": "^3.1.0",
+    "markdown-it-footnote": "^4.0.0",
+    "mermaid": "^12.1.0",
+    "papaparse": "^5.7.0",
+    "pdfjs-dist": "^6.4.299",
+    "pptxtojson": "^2.2.0",
+    "ssf": "^0.11.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/papaparse": "^5.5.2",
+    "@types/vscode": "^1.90.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}

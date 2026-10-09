@@ -1,0 +1,53 @@
+id,name,email,city,country,amount,change_pct,joined,active,notes
+1,"Smith, John",john.smith@example.com,London,UK,1234.56,-2.5,2024-01-15,true,Comma inside the name
+2,Zoë Müller,zoe.muller@example.com,Zürich,Switzerland,-42.50,0.75,2023-11-02,false,"She said ""hello"" twice"
+3,"O'Brien, Seán",sean.obrien@example.com,Dublin,Ireland,0,0,2022-06-30,true,"Line one
+Line two (embedded LF)"
+4,李小龍,lee@example.com,香港,China,98765.4321,12.345,2021-02-03,true,CJK characters
+5,Αλέξανδρος,alex@example.com,Αθήνα,Greece,,,2020-08-08,,"Empty amount, change and active fields"
+6,مريم,maryam@example.com,القاهرة,Egypt,1e3,-0.001,2019-12-31,false,Right-to-left text and scientific notation
+7,"  Padded  ",pad@example.com,"New York, NY",USA,"1,234.56",5%,2018-04-01,true,Quoted thousands separator; leading/trailing spaces kept
+8,Emoji 🎉,party@example.com,São Paulo,Brazil,-0.01,-100,2017-07-07,true,"Multi-line
+with CRLF inside quotes"
+9,"""Quoted"" name",quote@example.com,Paris,France,3.14159,3.14159,2016-02-29,false,Field that starts with a quote
+10,Trailing Empty,te@example.com,Berlin,Germany,100,,2015-05-05,true,
+11,Zip Code,zip@example.com,Boston,USA,00123,0.5,2014-10-10,true,Leading zeros (numeric-looking text)
+12,"Tab	Inside",tab@example.com,Oslo,Norway,-1234567.891,-99.99,2013-03-03,false,Tab character inside a quoted field
+13,"Plain quoted","plain@example.com","Rome","Italy","42","1.5","2012-12-12","true","Every field quoted even when not needed"
+14,=SUM(A1:A2),formula@example.com,Madrid,Spain,7,7,2011-11-11,true,Formula-like text must stay text
+15,Long Note,long@example.com,Sydney,Australia,1,1,2010-10-10,true,"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris."
+16,Olivia Johnson,olivia.johnson@example.com,Montréal,Canada,23679.49,-3.4,2021-09-13,true,Prefers e-mail
+17,Ingrid Okafor,ingrid.okafor@example.com,Tokyo,Japan,23512.14,-13.2,2022-04-29,true,Prefers e-mail
+18,Mateo Haddad,mateo.haddad@example.com,Lagos,Nigeria,5493.54,-34.5,2023-06-01,true,Prefers e-mail
+19,Tomás García,tomas.garcia@example.com,Austin,USA,29189.37,46.599,2020-04-22,true,
+20,Chloé Johnson,chloe.johnson@example.com,Tokyo,Japan,18392.36,-41.2,2018-06-03,false,"Follow up, high priority"
+21,Mia Andersson,mia.andersson@example.com,Montréal,Canada,32856.36,-14.4,2021-09-28,true,
+22,Aisha Schmidt,aisha.schmidt@example.com,Lagos,Nigeria,13522.40,18.4,2021-01-22,false,Prefers e-mail
+23,Chloé Dubois,chloe.dubois@example.com,Austin,USA,24146.10,39.106,2016-02-14,false,"Requested ""express"" shipping"
+24,Kenji Haddad,kenji.haddad@example.com,Montréal,Canada,40018.49,1.6,2020-04-04,true,Paid in advance
+25,Amara Silva,amara.silva@example.com,Montréal,Canada,40273.77,14.2,2020-05-05,false,Prefers e-mail
+26,Sofia Okafor,sofia.okafor@example.com,Toronto,Canada,46886.83,13.06,2015-03-26,true,Prefers e-mail
+27,Kenji Novák,kenji.novak@example.com,Montréal,Canada,49245.14,30.492,2017-08-31,true,"Requested ""express"" shipping"
+28,Emma Haddad,emma.haddad@example.com,Lyon,France,3848.52,-28.9,2020-06-07,false,"Requested ""express"" shipping"
+29,Ingrid Dubois,ingrid.dubois@example.com,Montréal,Canada,35505.03,-1.078,2020-11-03,true,Prefers e-mail
+30,Tomás Kim,tomas.kim@example.com,Lagos,Nigeria,21273.77,-31.979,2020-04-26,true,VIP
+31,Ethan Nakamura,ethan.nakamura@example.com,Toronto,Canada,-3674.20,37.6,2016-08-29,false,
+32,Noah Kowalski,noah.kowalski@example.com,Stockholm,Sweden,15253.62,29.2,2022-01-07,false,"Requested ""express"" shipping"
+33,Amara Silva,amara.silva@example.com,Kraków,Poland,11095.54,27.648,2020-05-23,true,"Follow up, high priority"
+34,Chloé Kim,chloe.kim@example.com,Cork,Ireland,14630.16,-24.867,2019-02-13,true,VIP
+35,Chloé Kowalski,chloe.kowalski@example.com,Montréal,Canada,18997.30,3.7,2020-04-14,true,
+36,Kenji Haddad,kenji.haddad@example.com,Beirut,Lebanon,19024.36,43.107,2019-10-02,true,Paid in advance
+37,Noah Novák,noah.novak@example.com,Kraków,Poland,42081.57,-20.5,2020-11-04,true,Paid in advance
+38,Ingrid Haddad,ingrid.haddad@example.com,Milan,Italy,-1292.69,42.619,2017-06-27,false,"Requested ""express"" shipping"
+39,Wei Okafor,wei.okafor@example.com,Montréal,Canada,24613.71,21.4,2017-09-16,false,Prefers e-mail
+40,Ingrid Dubois,ingrid.dubois@example.com,Prague,Czechia,40756.98,-36,2017-08-09,false,VIP
+41,Kenji Patel,kenji.patel@example.com,Austin,USA,3431.24,-21.3,2024-02-19,true,VIP
+42,Aisha Kim,aisha.kim@example.com,Lyon,France,10330.21,42.6,2023-09-14,true,"Requested ""express"" shipping"
+43,Sofia Murphy,sofia.murphy@example.com,Montréal,Canada,-4852.82,25.3,2023-01-29,true,
+44,Aisha Schmidt,aisha.schmidt@example.com,Prague,Czechia,38665.20,-44.251,2017-07-06,true,
+45,Liam García,liam.garcia@example.com,Kraków,Poland,33022.30,-0.2,2022-07-26,true,VIP
+46,Mia Patel,mia.patel@example.com,Tokyo,Japan,11676.33,33.247,2022-05-27,true,
+47,Ingrid Murphy,ingrid.murphy@example.com,München,Germany,30439.59,-40.5,2023-01-19,true,
+48,Diego Okafor,diego.okafor@example.com,Lyon,France,23377.89,27.9,2015-09-05,true,Paid in advance
+49,Noah Okafor,noah.okafor@example.com,Lagos,Nigeria,-3305.85,44,2023-06-10,false,VIP
+50,Kenji Novák,kenji.novak@example.com,Tokyo,Japan,-903.02,22.15,2019-12-19,false,
