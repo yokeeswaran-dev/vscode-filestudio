@@ -117,7 +117,13 @@ The message types shared by the extension and the webview are defined in `src/vi
 
 ## Branches and pull requests
 
-1. **Fork** the repository and create a branch from `main` with a short, clear name, for example
+| Branch | Purpose |
+| --- | --- |
+| `main` | Released code only. Every release is a tag on `main` (`v0.1.0`, `v0.1.1`, …). |
+| `dev` | Day-to-day development. **All pull requests target `dev`** (it is the default branch). |
+| `fix/…`, `feat/…`, `docs/…` | Short-lived branches for one change each. |
+
+1. **Fork** the repository and create a branch from `dev` with a short, clear name, for example
    `fix/pdf-find-count` or `feat/xlsx-conditional-formatting`.
 2. Make your change. Keep the pull request **small and focused** on one topic.
 3. Add or update **unit tests** when you change a renderer.
@@ -131,9 +137,11 @@ The message types shared by the extension and the webview are defined in `src/vi
 
 5. Test the change by hand in the Extension Development Host (F5), in a light and a dark theme.
 6. Add a line to the `## [Unreleased]` section of **[CHANGELOG.md](CHANGELOG.md)** when users will notice the change.
-7. Open a pull request and fill in the template. Link the issue it fixes (for example `Fixes #12`).
+7. Open a pull request **into `dev`** and fill in the template. Link the issue it fixes (for example `Fixes #12`).
 
-A maintainer will review your pull request. Please answer review comments by pushing new commits to the same branch.
+The CI workflow builds and tests every pull request on Windows and Linux; it must be green before merging.
+A maintainer will review your pull request and **squash-merge** it. Please answer review comments by pushing new
+commits to the same branch.
 
 ### Commit messages
 
@@ -166,32 +174,37 @@ docs: explain the Markdown default editor setting
 
 ## Release steps (maintainers)
 
-1. Make sure `main` is green: `npm ci`, `npm run typecheck`, `npm test`.
-2. Bump the version in `package.json` and `package-lock.json`:
+Versions follow [Semantic Versioning](https://semver.org/): **patch** for fixes (0.1.0 → 0.1.1), **minor** for new
+features (0.1.x → 0.2.0), **major** for 1.0.0 and breaking changes.
 
-   ```bash
-   npm version X.Y.Z --no-git-tag-version
-   ```
+1. Make sure the `[Unreleased]` section of `CHANGELOG.md` on `dev` lists the changes.
+2. Open a pull request from `dev` into `main` (for example "Release 0.1.1"), wait for CI, and merge it
+   (use a merge commit, not squash, so `dev` and `main` keep the same history).
+3. Go to **Actions → Release → Run workflow**, keep the branch `main`, choose **patch / minor / major**, and run it.
+   The workflow:
+   - bumps the version in `package.json` / `package-lock.json`,
+   - moves the `[Unreleased]` notes into a new `## [X.Y.Z] - date` section of `CHANGELOG.md`,
+   - type-checks, tests and packages `filestudio-X.Y.Z.vsix`,
+   - commits `chore(release): vX.Y.Z`, tags `vX.Y.Z` and pushes to `main`,
+   - creates the GitHub release with the `.vsix` and the CHANGELOG notes,
+   - publishes to the VS Code Marketplace (needs the `VSCE_PAT` secret),
+   - merges `main` back into `dev`.
+4. Install the published version from the Marketplace and do a quick check of every format.
 
-3. In `CHANGELOG.md`, move the `## [Unreleased]` entries to a new `## [X.Y.Z] - YYYY-MM-DD` section and update the
-   compare links at the bottom.
-4. Create the package (this runs `vscode:prepublish`: type check and production build):
+**Urgent fix (hotfix):** branch from `main` (`hotfix/…`), open a pull request into `main`, run the Release workflow
+with **patch**, then make sure `main` is merged back into `dev`.
 
-   ```bash
-   npx @vscode/vsce package
-   ```
+**Repository secrets** (Settings → Secrets and variables → Actions):
 
-5. Install `filestudio-X.Y.Z.vsix` in VS Code and do a quick check of every format.
-6. Commit, tag and push:
+| Secret | Needed for |
+| --- | --- |
+| `VSCE_PAT` | Publishing. An Azure DevOps personal access token with the scope **Marketplace → Manage** (organisation: *All accessible organizations*). |
+| `RELEASE_TOKEN` | Only when branch rules block the workflow from pushing to `main` / `dev`: a fine-grained personal access token of a maintainer who is on the rules' bypass list, with **Contents: Read and write** on this repository. |
 
-   ```bash
-   git commit -am "chore(release): vX.Y.Z"
-   git tag vX.Y.Z
-   git push origin main --tags
-   ```
-
-7. Create a GitHub release for the tag, paste the CHANGELOG section and attach the `.vsix` file.
-8. Publish to the Marketplace with `npx @vscode/vsce publish --packagePath filestudio-X.Y.Z.vsix`.
+**Manual release (fallback):** `npm version patch --no-git-tag-version`, update `CHANGELOG.md`,
+`npx @vscode/vsce package --no-dependencies`, commit, `git tag vX.Y.Z`, `git push origin main --tags`, then upload
+the `.vsix` on the [Marketplace publisher page](https://marketplace.visualstudio.com/manage/publishers/yokeeswaran)
+or run `npx @vscode/vsce publish --no-dependencies --packagePath filestudio-X.Y.Z.vsix`.
 
 ## Questions
 

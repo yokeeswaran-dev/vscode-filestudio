@@ -1,0 +1,115 @@
+# Release button: Actions → Release → Run workflow (on the main branch).
+# Bumps the version (patch / minor / major), moves the CHANGELOG [Unreleased] notes into the new version, builds and
+# tests the VSIX, commits + tags + pushes, creates the GitHub release with the VSIX, and publishes to the Marketplace.
+# Secrets (Settings → Secrets and variables → Actions):
+#   VSCE_PAT       Azure DevOps personal access token with the "Marketplace → Manage" scope (needed to publish).
+#   RELEASE_TOKEN  (optional) token of a maintainer allowed to push to the protected main / dev branches.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump: patch = fixes (0.1.0 → 0.1.1), minor = features (0.1.x → 0.2.0), major = 1.0.0'
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      publish:
+        description: Publish to the VS Code Marketplace
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release (${{ inputs.bump }})
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Bump the version
+        id: version
+        run: |
+          npm version "${{ inputs.bump }}" --no-git-tag-version
+          VERSION=$(node -p "require('./package.json').version")
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::The tag v$VERSION already exists."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Update CHANGELOG.md
+        run: node .github/scripts/changelog.js release "${{ steps.version.outputs.version }}" "$(date -u +%Y-%m-%d)"
+
+      - run: npm run typecheck
+      - run: npm test
+
+      # vsce runs the `vscode:prepublish` script (type check + production build) before packaging.
+      - name: Package VSIX
+        run: npx --yes @vscode/vsce package --no-dependencies
+
+      - name: Keep the VSIX as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: filestudio-${{ steps.version.outputs.version }}
+          path: filestudio-${{ steps.version.outputs.version }}.vsix
+          if-no-files-found: error
+
+      - name: Commit, tag and push
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json CHANGELOG.md
+          git commit -m "chore(release): v$VERSION"
+          git tag -a "v$VERSION" -m "FileStudio v$VERSION"
+          git push origin HEAD:main "v$VERSION"
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          node .github/scripts/changelog.js notes "$VERSION" > release-notes.md
+          gh release create "v$VERSION" "filestudio-$VERSION.vsix" \
+            --title "FileStudio v$VERSION" --notes-file release-notes.md --verify-tag
+
+      - name: Publish to the VS Code Marketplace
+        if: inputs.publish
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          if [ -z "$VSCE_PAT" ]; then
+            echo "::error::The VSCE_PAT secret is missing. Add it, or upload the VSIX from the GitHub release by hand."
+            exit 1
+          fi
+          npx --yes @vscode/vsce publish --no-dependencies --packagePath "filestudio-${{ steps.version.outputs.version }}.vsix"
+
+      # Bring the release commit into dev so the next version starts from it. Not fatal: if dev has moved on in a
+      # way that cannot be merged automatically, merge main into dev by hand.
+      - name: Merge main back into dev
+        continue-on-error: true
+        run: |
+          if git ls-remote --exit-code --heads origin dev >/dev/null; then
+            git fetch origin dev
+            git checkout -B dev origin/dev
+            git merge --no-edit main
+            git push origin dev
+          fi

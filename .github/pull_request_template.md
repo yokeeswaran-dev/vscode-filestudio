@@ -1,3 +1,5 @@
+<!-- Pull requests target the `dev` branch (releases are made from `main` by the maintainers). -->
+
 ## Summary
 
 <!-- What does this pull request change, and why? Keep it short. -->
