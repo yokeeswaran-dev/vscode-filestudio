@@ -1,5 +1,5 @@
 // FileStudio extension entry point: registers the six custom editors, the two commands and the fallback for
-// text files too large for a custom editor. All viewer logic lives in viewerProvider.ts.
+// text files VS Code cannot pass to a custom editor (too large, binary). All viewer logic lives in viewerProvider.ts.
 
 import * as vscode from 'vscode';
 import {
@@ -14,7 +14,7 @@ import {
   getLog,
   reopenAsText,
   viewTypeForUri,
-  watchOversizedTextTabs,
+  watchUnreadableTextTabs,
 } from './viewerProvider';
 
 // ===== ACTIVATION =====
@@ -49,8 +49,9 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand('fileStudio.openWith', openWithFileStudio),
     vscode.commands.registerCommand('fileStudio.reopenAsText', reopenActiveAsText),
-    // CSV/Markdown files over VS Code's 50 MB extension limit cannot open in a custom text editor: use the text editor.
-    watchOversizedTextTabs(),
+    // CSV/Markdown files VS Code does not pass to extensions as text (over its 50 MB limit, or binary) cannot open in a
+    // custom text editor: use the text editor.
+    watchUnreadableTextTabs(),
     // Last, so anything logged while the registrations above are disposed still has a channel.
     { dispose: disposeLog },
   );

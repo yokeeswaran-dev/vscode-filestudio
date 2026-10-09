@@ -2,7 +2,8 @@
 # Bumps the version (patch / minor / major), moves the CHANGELOG [Unreleased] notes into the new version, builds and
 # tests the VSIX, commits + tags + pushes, creates the GitHub release with the VSIX, and publishes to the Marketplace.
 # Secrets (Settings → Secrets and variables → Actions):
-#   VSCE_PAT       Azure DevOps personal access token with the "Marketplace → Manage" scope (needed to publish).
+#   VSCE_PAT       (optional) Azure DevOps personal access token with the "Marketplace → Manage" scope. Without it the
+#                  workflow skips publishing; upload the VSIX from the GitHub release on the Marketplace page instead.
 #   RELEASE_TOKEN  (optional) token of a maintainer allowed to push to the protected main / dev branches.
 name: Release
 
@@ -97,8 +98,8 @@ jobs:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: |
           if [ -z "$VSCE_PAT" ]; then
-            echo "::error::The VSCE_PAT secret is missing. Add it, or upload the VSIX from the GitHub release by hand."
-            exit 1
+            echo "::warning::No VSCE_PAT secret: not published. Download filestudio-${{ steps.version.outputs.version }}.vsix from the GitHub release and upload it on https://marketplace.visualstudio.com/manage/publishers/yokeeswaran (… → Update)."
+            exit 0
           fi
           npx --yes @vscode/vsce publish --no-dependencies --packagePath "filestudio-${{ steps.version.outputs.version }}.vsix"
 
