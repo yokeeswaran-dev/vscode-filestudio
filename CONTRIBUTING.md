@@ -198,7 +198,7 @@ with **patch**, then make sure `main` is merged back into `dev`.
 
 | Secret | Needed for |
 | --- | --- |
-| `VSCE_PAT` | Publishing. An Azure DevOps personal access token with the scope **Marketplace → Manage** (organisation: *All accessible organizations*). |
+| `VSCE_PAT` | Optional: automatic publishing. An Azure DevOps personal access token with the scope **Marketplace → Manage** (organisation: *All accessible organizations*). Without it the workflow skips publishing: download the `.vsix` from the GitHub release and upload it on the [Marketplace publisher page](https://marketplace.visualstudio.com/manage/publishers/yokeeswaran) (**… → Update**). |
 | `RELEASE_TOKEN` | Only when branch rules block the workflow from pushing to `main` / `dev`: a fine-grained personal access token of a maintainer who is on the rules' bypass list, with **Contents: Read and write** on this repository. |
 
 **Manual release (fallback):** `npm version patch --no-git-tag-version`, update `CHANGELOG.md`,
