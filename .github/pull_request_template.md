@@ -1,4 +1,5 @@
-<!-- Pull requests target the `dev` branch (releases are made from `main` by the maintainers). -->
+<!-- Pull requests target the `dev` branch. Only maintainers open pull requests into `main` (a release from `dev`
+     or `hotfix`; see CONTRIBUTING.md, "Release steps"). -->
 
 ## Summary
 
@@ -41,7 +42,7 @@ light / dark theme, operating system.
 ## Checklist
 
 - [ ] My change is focused on one topic.
-- [ ] I followed the coding style in [CONTRIBUTING.md](../CONTRIBUTING.md) (`.editorconfig`, section comments, strict TypeScript, `// @ts-check` in `viewer.js`).
+- [ ] I followed the coding style in [CONTRIBUTING.md](https://github.com/yokeeswaran-dev/vscode-filestudio/blob/dev/CONTRIBUTING.md) (`.editorconfig`, section comments, strict TypeScript, `// @ts-check` in `viewer.js`).
 - [ ] I added or updated tests where it makes sense.
 - [ ] I updated `CHANGELOG.md` (`## [Unreleased]`) for changes users will notice.
 - [ ] I updated the documentation (README, settings descriptions) if needed.
