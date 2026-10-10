@@ -86,6 +86,32 @@ const excludeModulesPlugin = {
   },
 };
 
+// ----- KaTeX fonts -----
+
+/**
+ * KaTeX's stylesheet lists each font as woff2, woff and ttf. The webview (Chromium) always takes the first format it
+ * supports, woff2, so the woff and ttf fallbacks are removed from the @font-face rules and are not packaged.
+ */
+const KATEX_FALLBACK_FONT = /,url\(fonts\/[\w-]+\.(?:woff|ttf)\) format\("(?:woff|truetype)"\)/g;
+
+const katexFontsPlugin = {
+  name: 'katex-fonts',
+  setup(build) {
+    build.onLoad({ filter: /[\\/]katex[\\/]dist[\\/]katex\.min\.css$/ }, async (args) => {
+      const source = await fs.promises.readFile(args.path, 'utf8');
+      const fontFaces = source.match(/@font-face\{/g)?.length ?? 0;
+      const found = source.match(KATEX_FALLBACK_FONT)?.length ?? 0;
+      if (!fontFaces || found !== 2 * fontFaces) {
+        throw new Error(
+          `katex.min.css: expected a woff and a ttf fallback in each of the ${fontFaces} @font-face rules, found ${found}. ` +
+            'KaTeX changed: update katexFontsPlugin in esbuild.js.',
+        );
+      }
+      return { contents: source.replace(KATEX_FALLBACK_FONT, ''), loader: 'css', resolveDir: path.dirname(args.path) };
+    });
+  },
+};
+
 const common = {
   bundle: true,
   minify: production,
@@ -153,6 +179,10 @@ function copyPdfjsData() {
 }
 
 async function main() {
+  // Start from an empty dist/: the chunk and font names carry content hashes, so files of an earlier (debug or
+  // older) build would otherwise stay next to the new ones and be packaged into the VSIX.
+  fs.rmSync(path.join(__dirname, 'dist'), { recursive: true, force: true });
+
   const extensionCtx = await esbuild.context({
     ...common,
     entryPoints: ['src/extension.ts'],
@@ -184,6 +214,7 @@ async function main() {
       '.gif': 'file',
     },
     define: { 'process.env.NODE_ENV': production ? '"production"' : '"development"' },
+    plugins: [...common.plugins, katexFontsPlugin],
   });
 
   const pdfWorkerCtx = await esbuild.context({

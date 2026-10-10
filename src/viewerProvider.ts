@@ -15,7 +15,7 @@ import type { PptxDeckMeta, PptxSlide } from './renderers/pptx';
 import { execFile } from 'child_process';
 import { randomBytes } from 'crypto';
 import { constants as fsConstants } from 'fs';
-import { access, open as openFileHandle } from 'fs/promises';
+import { access, open as openFileHandle, stat as statPath } from 'fs/promises';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
@@ -216,6 +216,11 @@ const KIND_BY_EXTENSION: ReadonlyMap<string, ViewKind> = new Map<string, ViewKin
   ['.docx', 'docx'],
   ['.pdf', 'pdf'],
   ['.pptx', 'pptx'],
+  ['.pptm', 'pptx'],
+  ['.ppsx', 'pptx'],
+  ['.ppsm', 'pptx'],
+  ['.potx', 'pptx'],
+  ['.potm', 'pptx'],
 ]);
 
 /** File extension of a resource, lower-case with the dot ('' when it has none). */
@@ -1036,6 +1041,14 @@ function execFileBytes(file: string, args: string[], cwd: string): Promise<Uint8
   });
 }
 
+async function isDirectory(fsPath: string): Promise<boolean> {
+  try {
+    return (await statPath(fsPath)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The committed bytes of a Git version, read with `git cat-file blob` (which never converts content) by the git
  * executable of VS Code's Git extension. Undefined when that extension is not available, and in Restricted Mode (the
@@ -1056,8 +1069,15 @@ async function readGitBlob(version: GitVersion): Promise<Uint8Array | undefined>
   const ref = version.ref;
   const revisions = ref === '~' ? ['', 'HEAD'] : /^~\d$/.test(ref) ? [`:${ref[1]}`] : [ref];
   if (revisions.some((revision) => revision.startsWith('-'))) return undefined; // a ref must never become an option
-  const cwd = path.dirname(version.workingFile.fsPath);
-  const name = path.basename(version.workingFile.fsPath);
+  // git runs in the nearest folder that still exists: the file's folder may be deleted or renamed in the working tree
+  // (Open Changes / Timeline of a deleted file); the path is then relative to that folder, with '/' separators.
+  let cwd = path.dirname(version.workingFile.fsPath);
+  while (!(await isDirectory(cwd))) {
+    const parent = path.dirname(cwd);
+    if (parent === cwd) throw new Error(`no folder of ${version.workingFile.fsPath} exists`);
+    cwd = parent;
+  }
+  const name = path.relative(cwd, version.workingFile.fsPath).split(path.sep).join('/');
   let lastError: unknown;
   for (const revision of revisions) {
     try {
@@ -1716,21 +1736,60 @@ function delimitedFormatOf(uri: vscode.Uri): DelimitedFormat {
 
 /**
  * Parses delimited text: TSV on tabs, PSV on '|', SSV on ';' or on runs of spaces (whichever detectSsvDelimiter finds
- * in the text, so an edit can switch it), CSV on the delimiter the parser detects.
+ * in the text, so an edit can switch it), CSV on the delimiter the parser detects. A `chosen` delimiter (Change
+ * Delimiter) wins over all of these.
  */
-function parseDelimited(text: string, format: DelimitedFormat): CsvModel {
+function parseDelimited(text: string, format: DelimitedFormat, chosen?: string): CsvModel {
+  // forView: the view never writes the text back, so the parser skips what only saving needs
+  if (chosen !== undefined) {
+    return parseCsv(text, chosen === ' ' ? { delimiter: ' ', collapseSpaces: true, forView: true } : { delimiter: chosen, forView: true });
+  }
   switch (format) {
     case 'tsv':
-      return parseCsv(text, { delimiter: '\t' });
+      return parseCsv(text, { delimiter: '\t', forView: true });
     case 'psv':
-      return parseCsv(text, { delimiter: '|' });
+      return parseCsv(text, { delimiter: '|', forView: true });
     case 'ssv':
       return detectSsvDelimiter(text) === ';'
-        ? parseCsv(text, { delimiter: ';' })
-        : parseCsv(text, { delimiter: ' ', collapseSpaces: true });
+        ? parseCsv(text, { delimiter: ';', forView: true })
+        : parseCsv(text, { delimiter: ' ', collapseSpaces: true, forView: true });
     default:
-      return parseCsv(text);
+      return parseCsv(text, { forView: true });
   }
+}
+
+/** Delimiters chosen with `fileStudio.changeDelimiter`, by document URI, for this session (none = detect / by format). */
+const chosenDelimiters = new Map<string, string>();
+/** CsvViews to re-parse when a delimiter is chosen (called with the document URI string). */
+const chosenDelimiterListeners = new Set<(key: string) => void>();
+
+const DELIMITER_CHOICES: readonly { label: string; description: string; delimiter: string | undefined }[] = [
+  { label: 'Detect automatically', description: 'by file type and content', delimiter: undefined },
+  { label: 'Comma', description: ',', delimiter: ',' },
+  { label: 'Semicolon', description: ';', delimiter: ';' },
+  { label: 'Tab', description: '\\t', delimiter: '\t' },
+  { label: 'Pipe', description: '|', delimiter: '|' },
+  { label: 'Spaces', description: 'runs of spaces', delimiter: ' ' },
+];
+
+/**
+ * `fileStudio.changeDelimiter`: a quick pick of delimiters; every FileStudio view of the file re-parses with the
+ * choice. It lasts until VS Code is closed; the file itself is not changed.
+ */
+export async function changeDelimiter(uri: vscode.Uri): Promise<void> {
+  const key = uri.toString();
+  const current = chosenDelimiters.get(key);
+  const pick = await vscode.window.showQuickPick(
+    DELIMITER_CHOICES.map((choice) => ({
+      ...choice,
+      detail: choice.delimiter === current ? 'Current choice' : undefined,
+    })),
+    { placeHolder: `Split the columns of "${fileNameOf(uri)}" on` },
+  );
+  if (!pick || pick.delimiter === current) return;
+  if (pick.delimiter === undefined) chosenDelimiters.delete(key);
+  else chosenDelimiters.set(key, pick.delimiter);
+  for (const listener of chosenDelimiterListeners) listener(key);
 }
 
 /**
@@ -1748,6 +1807,8 @@ class CsvView {
   private initDelimiter: string | undefined;
   private parseError: unknown;
   private parsedVersion = -1;
+  /** The text changed while the panel was hidden: re-parsed when it is shown again. */
+  private stale = false;
 
   constructor(
     private readonly document: vscode.TextDocument,
@@ -1758,6 +1819,20 @@ class CsvView {
     this.reparse = debounce(() => this.refresh(), TEXT_DEBOUNCE_MS);
     this.session.onDispose(this.reparse);
     this.session.onDispose(onTextDocumentChanged(document, () => this.reparse.schedule()));
+    // A big file blocks the extension host for seconds per parse: a hidden panel parses when it is shown again.
+    this.session.onDispose(
+      panel.onDidChangeViewState(() => {
+        if (panel.visible && this.stale) this.refresh();
+      }),
+    );
+    // "Change Delimiter" for this file: parse again with the chosen delimiter.
+    const onChosenDelimiter = (key: string): void => {
+      if (key !== document.uri.toString()) return;
+      this.parsedVersion = -1;
+      this.refresh();
+    };
+    chosenDelimiterListeners.add(onChosenDelimiter);
+    this.session.onDispose({ dispose: () => chosenDelimiterListeners.delete(onChosenDelimiter) });
     // Parse right after the HTML is handed over, so the model is usually ready when the webview asks for it.
     const initialParse = setTimeout(() => this.ensureParsed(), 0);
     this.session.onDispose({ dispose: () => clearTimeout(initialParse) });
@@ -1767,7 +1842,7 @@ class CsvView {
     if (this.session.isDisposed || this.parsedVersion === this.document.version) return;
     this.parsedVersion = this.document.version;
     try {
-      const csv = parseDelimited(this.document.getText(), this.format);
+      const csv = parseDelimited(this.document.getText(), this.format, chosenDelimiters.get(this.document.uri.toString()));
       this.model = new CsvGridModel(csv, this.session.fileName);
       this.delimiter = csv.delimiter;
       this.parseError = undefined;
@@ -1818,6 +1893,8 @@ class CsvView {
 
   /** Debounced: the text changed (typing in a text editor, undo, external reload). */
   private refresh(): void {
+    this.stale = !this.session.panel.visible;
+    if (this.stale) return;
     this.ensureParsed();
     if (!this.session.isReady) return; // 'ready' will send init from the current text
     if (!this.model || this.session.shown !== 'content' || this.delimiter !== this.initDelimiter) {

@@ -17,7 +17,7 @@ For larger changes, please open an issue first, so we can agree on the approach 
 ## Prerequisites
 
 - [Node.js](https://nodejs.org/) **22 or later** and **npm**
-- [VS Code](https://code.visualstudio.com/) **1.90 or later**
+- [VS Code](https://code.visualstudio.com/) **1.123 or later**
 - [Git](https://git-scm.com/)
 
 ## Set up the project

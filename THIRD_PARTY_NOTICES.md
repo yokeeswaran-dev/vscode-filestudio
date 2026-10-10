@@ -1,6 +1,6 @@
 # Third-party notices
 
-FileStudio 0.1.0 is released under the MIT License (see [LICENSE](LICENSE)). Its packaged extension bundles the open-source npm packages listed below into `dist/extension.js` (extension host), `dist/viewer.js` with `dist/chunks/`, `dist/viewer.css` and `dist/fonts/` (webview), and `dist/pdf.worker.min.mjs` (PDF worker).
+FileStudio is released under the MIT License (see [LICENSE](LICENSE)). Its packaged extension bundles the open-source npm packages listed below into `dist/extension.js` (extension host), `dist/viewer.js` with `dist/chunks/`, `dist/viewer.css` and `dist/fonts/` (webview), and `dist/pdf.worker.min.mjs` (PDF worker).
 
 The list was made from the esbuild metafile of the production build (`node esbuild.js --production`): every package that contributes code, styles or fonts to those files. Some packages ship pre-built files that already contain other packages (found through their source maps and bundler comments); those are listed too, marked "inside …". For each package you will find its version, licence, source repository, copyright notice and full licence text. Packages that ship the same licence text are grouped under one copy of it.
 
@@ -1874,6 +1874,16 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 - **echarts** 6.1.0 — Apache-2.0 — https://github.com/apache/echarts  
   Copyright 2017-2026 The Apache Software Foundation (from its NOTICE file)
+
+NOTICE file of echarts (Apache License 2.0, section 4(d)):
+
+````text
+Apache ECharts
+Copyright 2017-2026 The Apache Software Foundation
+
+This product includes software developed at
+The Apache Software Foundation (https://www.apache.org/).
+````
 
 ````text
                                  Apache License

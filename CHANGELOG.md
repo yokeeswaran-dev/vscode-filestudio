@@ -7,6 +7,86 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-11
+
+### Fixed
+
+#### General
+
+- **Open Changes** and other diffs of a `.pdf`, `.docx`, `.xlsx` or `.pptx` file now show FileStudio views,
+  not a text diff.
+- A file that was deleted can now be shown from Git (for example in **Open Changes**).
+- **Open with FileStudio** on a text tab now replaces that tab instead of adding a second one.
+  A tab with unsaved changes stays open.
+- **Split Editor Right** on an `.xlsx` file now shows the workbook in both groups, not an empty group.
+- **Open with FileStudio** no longer shows on folders whose name ends in `.csv` or `.md`.
+- In PDF, Word and Markdown views, the arrow keys and Space scroll again after you come back from another
+  part of VS Code.
+
+#### Spreadsheets (`.xlsx`)
+
+- A damaged threaded-comment part can no longer freeze VS Code.
+- The "not displayed" banner no longer lists threaded comments when they are shown.
+
+#### Delimited text (`.csv`, `.tsv`, `.psv`, `.ssv`)
+
+- A first line with a space, such as `sep= ;`, is also understood.
+- In `;` files, numbers are read with one rule: `,` is the decimal mark and `.` groups thousands.
+- The formula bar shows the number as written in the file (`007`, long numbers, `1e5`, `50%`), the same as
+  the cell and the copy.
+- Long numbers (14 digits or more) fit their column and no longer show as `1.23457E+13`.
+- Status bar statistics now work for columns after `XFD`.
+- Empty lines at the end of the file no longer add empty rows.
+- Large files react faster to edits, and a hidden view is updated only when it is shown again.
+- Ctrl+PageDown and Ctrl+PageUp switch VS Code editors again.
+- The status bar shows the format and delimiter in use (for example `CSV · Semicolon`). The new command
+  **FileStudio: Change Delimiter** lets you pick another delimiter for this session.
+
+#### PDF (`.pdf`)
+
+- On a VS Code version that is too old for the PDF engine, the view says so, instead of staying blank.
+- A PDF with no pages, or whose first page cannot be read, shows an error instead of a blank grey view.
+- A custom zoom (for example 160%) and the position inside a tall page come back after a reload.
+- Find: F3 / Shift+F3 and Ctrl+G / Ctrl+Shift+G go to the next or previous match, Alt+C turns on match case,
+  and reopening Find after Escape highlights the matches again.
+- Page Down / Page Up scroll one screen, and End / Ctrl+End go to the end of the document.
+- In a narrow view, the toolbar and the find bar no longer hide buttons.
+- Better screen-reader and keyboard support: the toolbar, zoom button and outline have clear names, and the
+  outline works with the arrow keys, Home and End.
+- pdf.js warnings no longer fill the developer console.
+
+#### PowerPoint (`.pptx`)
+
+- `.pptm`, `.ppsx`, `.ppsm`, `.potx` and `.potm` files can now be opened.
+- A missing picture or a damaged slide no longer stops the whole deck from opening; a placeholder is shown.
+- Charts: combo charts show every series (with a secondary axis), date axes show dates, and the title,
+  legend, number format, gridlines, text size and data labels follow the chart. Horizontal bars are in
+  PowerPoint's order, and names with `&` or `<` show correctly.
+- Text: line spacing and empty lines for small text, bullets and numbering from the layout or master, soft
+  line breaks, vertical text, highlight, double/dotted/wavy underlines, tabs and percent line spacing now
+  look like PowerPoint.
+- Text inside ellipses, arrows, callouts and other shapes uses the shape's text area.
+- Block arrows, callouts and other shapes have the right form, and outlines without a set width are drawn.
+- Table cell margins are used, and tint/shade colours (for example in table styles) and gradients match
+  PowerPoint.
+- Hyperlink text uses the theme's link colour.
+- Pictures cropped at the top or bottom are no longer squashed, and SVG-only pictures are shown.
+- Embedded objects, linked pictures and SmartArt without a drawing show a box or their preview picture.
+- Next/Previous/First/Last slide links work, and links on shapes and pictures work with the keyboard and
+  screen readers.
+- Screen readers announce each slide thumbnail's real position (for example 220 of 220).
+
+### Changed
+
+- FileStudio now needs VS Code 1.123 or newer (the PDF engine needs it).
+- New Marketplace name and description: **FileStudio – Excel, CSV, Word, PDF & PowerPoint Viewer**. The
+  extension is also listed under the **Visualization** and **Data Science** categories, with more search keywords.
+- Setting descriptions now say that `backupOnSave` and the `split` / `wysiwyg` modes are planned for 0.2.0.
+- New README: every supported file type at a glance, a section per format, a short FAQ, and how to reopen a
+  file as text. It asks you to uninstall the old "File Viewer" extension.
+- The package is smaller: only the `woff2` KaTeX fonts are included.
+- The echarts NOTICE text is now included in the third-party notices.
+
 ## [0.1.1] - 2026-10-11
 
 ### Fixed
@@ -153,6 +233,7 @@ First public release. This version is **view-only**.
 - Links to other slides and to web pages.
 - Banner that lists content the viewer does not show (video, audio, embedded objects and more).
 
-[Unreleased]: https://github.com/yokeeswaran-dev/vscode-filestudio/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/yokeeswaran-dev/vscode-filestudio/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/yokeeswaran-dev/vscode-filestudio/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/yokeeswaran-dev/vscode-filestudio/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/yokeeswaran-dev/vscode-filestudio/releases/tag/v0.1.0

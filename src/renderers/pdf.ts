@@ -88,6 +88,40 @@ export function checkPdf(head: Uint8Array): PdfCheck {
   return version === undefined ? {} : { version };
 }
 
+// ===== ENGINE CHECK =====
+
+/** Error name the webview gives a failure from missingPdfEngineFeatures (describePdfFailure words it for users). */
+export const PDF_ENGINE_UNSUPPORTED = 'PdfEngineUnsupportedError';
+
+/**
+ * JavaScript built-ins pdf.js 6 calls without a fallback (its modern build ships no polyfills): a web view whose
+ * Chromium lacks one (an older VS Code, or a fork) fails while loading or drawing with "x is not a function".
+ */
+const PDF_ENGINE_FEATURES: readonly (readonly [string, (g: any) => unknown])[] = [
+  ['Promise.withResolvers', (g) => g.Promise?.withResolvers],
+  ['Promise.try', (g) => g.Promise?.try],
+  ['URL.parse', (g) => g.URL?.parse],
+  ['RegExp.escape', (g) => g.RegExp?.escape],
+  ['Math.sumPrecise', (g) => g.Math?.sumPrecise],
+  ['Uint8Array.fromBase64', (g) => g.Uint8Array?.fromBase64],
+  ['Uint8Array.prototype.toBase64', (g) => g.Uint8Array?.prototype?.toBase64],
+  ['Uint8Array.prototype.toHex', (g) => g.Uint8Array?.prototype?.toHex],
+  ['Map.prototype.getOrInsert', (g) => g.Map?.prototype?.getOrInsert],
+  ['Map.prototype.getOrInsertComputed', (g) => g.Map?.prototype?.getOrInsertComputed],
+  ['WeakMap.prototype.getOrInsertComputed', (g) => g.WeakMap?.prototype?.getOrInsertComputed],
+];
+
+/** Names of the built-ins pdf.js needs that `scope` (default: this JavaScript engine) does not have. */
+export function missingPdfEngineFeatures(scope: object = globalThis): string[] {
+  return PDF_ENGINE_FEATURES.filter(([, get]) => {
+    try {
+      return typeof get(scope) !== 'function';
+    } catch {
+      return true;
+    }
+  }).map(([name]) => name);
+}
+
 // ===== ERRORS =====
 
 /** pdf.js PasswordException codes (PasswordResponses). */
@@ -159,6 +193,8 @@ export function describePdfFailure(error: unknown): string {
       return 'Loading the PDF was cancelled.';
     case 'RenderingCancelledException':
       return 'Rendering was cancelled.';
+    case PDF_ENGINE_UNSUPPORTED:
+      return 'This version of VS Code is too old for the PDF viewer: its web view lacks JavaScript features the PDF engine needs. Update VS Code to view PDF files here.';
     default:
       break;
   }

@@ -19,3 +19,6 @@ CLAUDE.md
 **/*.map
 **/*.ts
 *.vsix
+# KaTeX woff/ttf fallbacks: the webview uses woff2 only (see esbuild.js); old builds may have left them in dist/fonts.
+dist/fonts/*.woff
+dist/fonts/*.ttf

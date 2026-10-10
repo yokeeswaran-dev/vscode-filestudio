@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { checkPdf, describePdfFailure, PDF_HEADER_SEARCH_BYTES } = require('../.out/pdf.js');
+const { checkPdf, describePdfFailure, missingPdfEngineFeatures, PDF_ENGINE_UNSUPPORTED, PDF_HEADER_SEARCH_BYTES } = require('../.out/pdf.js');
 
 const bytes = (text) => new TextEncoder().encode(text);
 
@@ -41,4 +41,34 @@ test('describePdfFailure: damaged files, worker failures and unknown errors', ()
   assert.match(describePdfFailure(new Error('Setting up fake worker failed: x')), /PDF engine could not start/);
   assert.equal(describePdfFailure('something odd'), 'Could not display the PDF: something odd');
   assert.equal(describePdfFailure(undefined), 'Could not display the PDF: Unknown error.');
+});
+
+test('missingPdfEngineFeatures: names the built-ins an older web view lacks (R3-005)', () => {
+  // A scope with every built-in pdf.js calls (like the web view of a current VS Code).
+  const fn = () => {};
+  const proto = { toBase64: fn, toHex: fn, getOrInsert: fn, getOrInsertComputed: fn };
+  const full = {
+    Promise: { withResolvers: fn, try: fn },
+    URL: { parse: fn },
+    RegExp: { escape: fn },
+    Math: { sumPrecise: fn },
+    Uint8Array: { fromBase64: fn, prototype: proto },
+    Map: { prototype: proto },
+    WeakMap: { prototype: proto },
+  };
+  assert.deepEqual(missingPdfEngineFeatures(full), []);
+  // A scope like Chromium 122 (VS Code 1.90): no URL.parse, Promise.try, base64/hex or getOrInsertComputed.
+  const old = {
+    Promise: { withResolvers() {} },
+    URL: function URL() {},
+    RegExp: {},
+    Math: {},
+    Uint8Array: { prototype: {} },
+    Map: { prototype: {} },
+    WeakMap: { prototype: {} },
+  };
+  const missing = missingPdfEngineFeatures(old);
+  assert.ok(missing.includes('URL.parse') && missing.includes('Map.prototype.getOrInsertComputed') && missing.includes('Uint8Array.prototype.toHex'));
+  assert.ok(!missing.includes('Promise.withResolvers'));
+  assert.match(describePdfFailure({ name: PDF_ENGINE_UNSUPPORTED, message: missing.join(', ') }), /too old for the PDF viewer.*Update VS Code/);
 });
