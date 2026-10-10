@@ -2863,9 +2863,9 @@ function dynamicArrayMetadata(xml: string): Set<number> {
   const types = [...(xmlSection(xml, 'metadataTypes') ?? '').matchAll(/<(?:\w+:)?metadataType\b([^>]*?)\/?>/g)].map(
     (m) => parseXmlAttributes(m[1]).name,
   );
-  const blocks = (section: string): string[] => [...section.matchAll(/<(?:\w+:)?bk\b[^>]*>([\s\S]*?)<\/(?:\w+:)?bk>/g)].map((m) => m[1]);
-  const future = /<(?:\w+:)?futureMetadata\b[^>]*\bname\s*=\s*["']XLDAPR["'][^>]*>([\s\S]*?)<\/(?:\w+:)?futureMetadata>/.exec(xml);
-  const dynamic = future ? blocks(future[1]).map((bk) => /\bfDynamic\s*=\s*["'](?:1|true)["']/.test(bk)) : [];
+  const blocks = (section: string): string[] => [...xmlElements(section, 'bk')].map((m) => m.inner ?? '');
+  const future = [...xmlElements(xml, 'futureMetadata')].find((m) => parseXmlAttributes(m.attrs).name === 'XLDAPR')?.inner;
+  const dynamic = future !== undefined ? blocks(future).map((bk) => /\bfDynamic\s*=\s*["'](?:1|true)["']/.test(bk)) : [];
   blocks(xmlSection(xml, 'cellMetadata') ?? '').forEach((bk, i) => {
     for (const rc of bk.matchAll(/<(?:\w+:)?rc\b([^>]*?)\/?>/g)) {
       const { t, v } = parseXmlAttributes(rc[1]);
@@ -2945,27 +2945,27 @@ async function readThreadedComments(zip: JSZip): Promise<Map<number, Map<number,
   const persons = new Map<string, string>();
   for (const target of (await readRelationships(zip, 'xl/workbook.xml', PERSON_REL_TYPE)).values()) {
     const xml = await zip.file(resolvePartPath('xl/workbook.xml', target))?.async('string');
-    for (const m of xml?.matchAll(/<(?:\w+:)?person\b([^>]*?)\/?>/g) ?? []) {
-      const { id, displayName } = parseXmlAttributes(m[1]);
+    for (const m of xmlElements(xml ?? '', 'person')) {
+      const { id, displayName } = parseXmlAttributes(m.attrs);
       if (id && displayName) persons.set(id, displayName);
     }
   }
   const workbookRels = await readRelationships(zip, 'xl/workbook.xml');
   const out = new Map<number, Map<number, string>>();
-  for (const m of (xmlSection(workbookXml, 'sheets') ?? '').matchAll(/<(?:\w+:)?sheet\b([^>]*?)\/?>/g)) {
-    const sheetId = parseInt(parseXmlAttributes(m[1]).sheetId ?? '', 10);
-    const target = workbookRels.get(relationshipId(m[1]) ?? '');
+  for (const m of xmlElements(xmlSection(workbookXml, 'sheets') ?? '', 'sheet')) {
+    const sheetId = parseInt(parseXmlAttributes(m.attrs).sheetId ?? '', 10);
+    const target = workbookRels.get(relationshipId(m.attrs) ?? '');
     if (!Number.isFinite(sheetId) || !target) continue;
     const sheetPath = resolvePartPath('xl/workbook.xml', target);
     const threads = new Map<number, { root: boolean; line: string }[]>();
     for (const part of (await readRelationships(zip, sheetPath, THREADED_COMMENT_REL_TYPE)).values()) {
       const xml = await zip.file(resolvePartPath(sheetPath, part))?.async('string');
-      for (const c of xml?.matchAll(/<(?:\w+:)?threadedComment\b([^>]*?)(?:\/>|>([\s\S]*?)<\/(?:\w+:)?threadedComment>)/g) ?? []) {
-        const attrs = parseXmlAttributes(c[1]);
+      for (const c of xmlElements(xml ?? '', 'threadedComment')) {
+        const attrs = parseXmlAttributes(c.attrs);
         const at = decodeCell(attrs.ref ?? '');
         if (!at) continue;
         // line breaks normalized as an XML parser does (Excel writes CR LF inside the text)
-        const raw = /<(?:\w+:)?text\b[^>]*>([\s\S]*?)<\/(?:\w+:)?text>/.exec(c[2] ?? '')?.[1] ?? '';
+        const raw = xmlSection(c.inner ?? '', 'text') ?? '';
         const text = decodeXmlEntities(raw.replace(/\r\n?/g, '\n'));
         const author = persons.get(attrs.personId ?? '');
         const key = at.r * MAX_COLS + at.c;
@@ -3117,8 +3117,35 @@ function buildExtras(raw: RawStyles | undefined, stylesXform: unknown): Workbook
 
 /** Inner XML of the first <tag ...>...</tag> (any namespace prefix). */
 function xmlSection(xml: string, tag: string): string | undefined {
-  const m = new RegExp(`<(?:\\w+:)?${tag}\\b[^>]*?(?<!/)>([\\s\\S]*?)</(?:\\w+:)?${tag}>`).exec(xml);
-  return m ? m[1] : undefined;
+  for (const element of xmlElements(xml, tag)) {
+    if (element.inner !== undefined) return element.inner;
+  }
+  return undefined;
+}
+
+/**
+ * The <tag ...>...</tag> and <tag .../> elements (any namespace prefix) in file order: the text between the tag name
+ * and '>' (attributes), and the inner XML (undefined when self-closing). Parts come from the file, so this scans
+ * forward in linear time (a lazy regex to the end tag is quadratic on many start tags without one) and stops at the
+ * first start tag without its '>' or end tag, as an XML parser stops at malformed XML.
+ */
+function* xmlElements(xml: string, tag: string): Generator<{ attrs: string; inner: string | undefined }> {
+  const start = new RegExp(`<(?:\\w+:)?${tag}(?=[\\s/>])`, 'g');
+  const end = new RegExp(`</(?:\\w+:)?${tag}\\s*>`, 'g');
+  for (let m = start.exec(xml); m; m = start.exec(xml)) {
+    const close = xml.indexOf('>', start.lastIndex);
+    if (close < 0) return;
+    if (xml[close - 1] === '/') {
+      yield { attrs: xml.slice(start.lastIndex, close - 1), inner: undefined };
+      start.lastIndex = close + 1;
+      continue;
+    }
+    end.lastIndex = close + 1;
+    const e = end.exec(xml);
+    if (!e) return;
+    yield { attrs: xml.slice(start.lastIndex, close), inner: xml.slice(close + 1, e.index) };
+    start.lastIndex = e.index + e[0].length;
+  }
 }
 
 function parseXmlAttributes(source: string): Record<string, string> {
@@ -4387,13 +4414,21 @@ const CSV_POLICY_SAMPLE_ROWS = 200;
 const QUOTE_POLICIES: readonly QuotePolicy[] = ['minimal', 'all', 'nonNumeric', 'nonEmpty'];
 const NUMERIC_TEXT_RE = /^[ \t]*[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?[ \t]*$/;
 const GROUPED_NUMBER_RE = /^[ \t]*[-+]?\d{1,3}(?:,\d{3})+(?:\.\d+)?[ \t]*$/;
-const DECIMAL_COMMA_RE = /^[ \t]*[-+]?\d+,\d+[ \t]*$/;
+/**
+ * Numbers in ';'-separated text, which comes from decimal-comma locales (Excel's list separator is ';' there): ','
+ * is the decimal point and '.' groups thousands, for the whole file ('1.234,56', '999,00', '1.000' = 1000). A '.'
+ * that is not a thousands group ('1.5') is text, as in those locales.
+ */
+const DECIMAL_COMMA_RE = /^[ \t]*[-+]?(?:\d+(?:,\d*)?|,\d+)(?:[eE][-+]?\d+)?[ \t]*$/;
+const DOT_GROUPED_NUMBER_RE = /^[ \t]*[-+]?\d{1,3}(?:\.\d{3})+(?:,\d+)?[ \t]*$/;
+const DECIMAL_COMMA_PERCENT_RE = /^[ \t]*[-+]?(?:\d+(?:,\d*)?|,\d+)%[ \t]*$/;
 const PERCENT_TEXT_RE = /^[ \t]*[-+]?(?:\d+\.?\d*|\.\d+)%[ \t]*$/;
 /**
  * Excel's delimiter directive: a first line 'sep=' + one character (any case, spaces around it and surrounding quotes
- * allowed, also as the whole file), checked against Excel 16. Group 1 = the delimiter.
+ * allowed, also as the whole file), checked against Excel 16. Group 1 = the delimiter; Excel skips spaces after '='
+ * ('sep= ;' is ';'), and a space ('sep= ') hides the line but is not used as the delimiter.
  */
-const CSV_SEP_LINE_RE = /^[ \t]*"?sep=([^\r\n])"?[ \t]*(?:\r\n|\n|\r|$)/i;
+const CSV_SEP_LINE_RE = /^[ \t]*"?sep= *([^\r\n])"?[ \t]*(?:\r\n|\n|\r|$)/i;
 
 /**
  * Parses CSV/TSV text with papaparse (Excel's rules where papaparse reads
@@ -4411,8 +4446,12 @@ const CSV_SEP_LINE_RE = /^[ \t]*"?sep=([^\r\n])"?[ \t]*(?:\r\n|\n|\r|$)/i;
  * an empty first field (right-aligned columns stay aligned), and a quoted
  * field may span lines like in Excel's CSV reader (so serializeCsv output
  * always reads back).
+ *
+ * `forView` skips what only serializeCsv needs (the quoting policy and the
+ * original text of records it does not reproduce): a read-only view of a big
+ * file parses faster.
  */
-export function parseCsv(text: string, opts?: { delimiter?: string; collapseSpaces?: boolean }): CsvModel {
+export function parseCsv(text: string, opts?: { delimiter?: string; collapseSpaces?: boolean; forView?: boolean }): CsvModel {
   let body = text;
   let hasBom = false;
   if (body.charCodeAt(0) === 0xfeff) {
@@ -4426,7 +4465,7 @@ export function parseCsv(text: string, opts?: { delimiter?: string; collapseSpac
   }
   const collapse = opts?.delimiter === ' ' && !!opts.collapseSpaces;
   const scan = scanCsv(body, collapse);
-  const delimiter = opts?.delimiter || sep?.[1] || scan.delimiter;
+  const delimiter = opts?.delimiter || (sep?.[1] !== ' ' && sep?.[1]) || scan.delimiter;
   const newline = scan.newline;
   // Whether the last record is terminated by a line break (decided after parsing: an
   // unterminated quote can swallow the final line break into the last field).
@@ -4454,7 +4493,7 @@ export function parseCsv(text: string, opts?: { delimiter?: string; collapseSpac
   if (sep) {
     model.sepLine = sep[0];
   }
-  const source = describeCsvSource(model, body, ends);
+  const source = opts?.forView ? undefined : describeCsvSource(model, body, ends);
   if (source) {
     csvSources.set(model, source);
     csvSources.set(rows, source);
@@ -4937,14 +4976,19 @@ function csvNumber(text: string, delimiter: string): number | undefined {
     return undefined;
   }
   let value: number | undefined;
-  if (NUMERIC_TEXT_RE.test(text)) {
+  if (delimiter === ';') {
+    // decimal comma, '.' thousands groups (see DECIMAL_COMMA_RE)
+    if (DECIMAL_COMMA_RE.test(text) || DOT_GROUPED_NUMBER_RE.test(text)) {
+      value = Number(text.trim().replace(/\./g, '').replace(',', '.'));
+    } else if (DECIMAL_COMMA_PERCENT_RE.test(text)) {
+      value = Number(text.trim().slice(0, -1).replace(',', '.')) / 100;
+    }
+  } else if (NUMERIC_TEXT_RE.test(text)) {
     value = Number(text.trim());
   } else if (PERCENT_TEXT_RE.test(text)) {
     value = Number(text.trim().slice(0, -1)) / 100;
-  } else if (delimiter === ';' && DECIMAL_COMMA_RE.test(text)) {
-    value = Number(text.trim().replace(',', '.'));
-  } else if (delimiter !== ',' || GROUPED_NUMBER_RE.test(text)) {
-    value = GROUPED_NUMBER_RE.test(text) && delimiter !== ';' ? Number(text.trim().replace(/,/g, '')) : undefined;
+  } else if (GROUPED_NUMBER_RE.test(text)) {
+    value = Number(text.trim().replace(/,/g, ''));
   }
   return value !== undefined && Number.isFinite(value) ? value : undefined;
 }
@@ -4980,18 +5024,21 @@ export class CsvGridModel implements GridSource {
     for (const row of rows) {
       if (row.length > colCount) colCount = row.length;
     }
+    // Blank lines (records with no text) at the end are not part of the used range, like Excel.
+    let usedRows = rows.length;
+    while (usedRows > 0 && rows[usedRows - 1].every((field) => !field)) usedRows--;
     const sheet: SheetMeta = {
       index: 0,
       name: csvSheetName(fileName),
       state: 'visible',
-      rowCount: Math.max(1, rows.length),
+      rowCount: Math.max(1, usedRows),
       colCount: Math.max(1, colCount),
       defaultColWidth: DEFAULT_COL_WIDTH_PX,
       defaultRowHeight: ptToPx(DEFAULT_ROW_HEIGHT_PT),
       cols: csvColumnWidths(rows, colCount),
       rows: {},
       merges: [],
-      frozen: { rows: hasHeader && rows.length > 1 ? 1 : 0, cols: 0 },
+      frozen: { rows: hasHeader && usedRows > 1 ? 1 : 0, cols: 0 },
       showGridLines: true,
       zoom: 100,
       conditionalFormats: [],
@@ -5035,7 +5082,8 @@ export class CsvGridModel implements GridSource {
       return acc.result();
     }
     const rows = this.csv.rows;
-    forEachRangeRow(ranges, rows.length, MAX_COLS, (r, c0, c1) => {
+    // Every column the grid shows (a CSV file may be wider than Excel's 16,384 columns).
+    forEachRangeRow(ranges, rows.length, this.meta.sheets[0].colCount, (r, c0, c1) => {
       const row = rows[r];
       if (!row) return true;
       const header = this.hasHeader && r === 0;
@@ -5053,7 +5101,10 @@ export class CsvGridModel implements GridSource {
   }
 }
 
-/** Column widths from the first rows' content (px, default width when narrower). */
+/**
+ * Column widths from the first rows' content (px, default width when narrower). Calibri 11 digits are about 7.43 px
+ * (MDW is 7): half a pixel of margin per character keeps long numbers (IDs) from turning into 1.23457E+13.
+ */
 function csvColumnWidths(rows: readonly string[][], colCount: number): Record<number, ColInfo> {
   const longest = new Array<number>(colCount).fill(0);
   const sample = Math.min(rows.length, 1000);
@@ -5068,7 +5119,7 @@ function csvColumnWidths(rows: readonly string[][], colCount: number): Record<nu
   }
   const out: Record<number, ColInfo> = {};
   longest.forEach((len, c) => {
-    const px = Math.min(480, Math.round(len * MDW + 10));
+    const px = Math.min(480, Math.ceil(len * (MDW + 0.5) + 10));
     if (px > DEFAULT_COL_WIDTH_PX) out[c] = { w: px };
   });
   return out;
@@ -5118,7 +5169,10 @@ async function scanLossyFeatures(data: Uint8Array): Promise<string[]> {
   if (has(/^xl\/vbaProject\.bin$/i)) found.add(LOSSY.macros);
   if (has(/^xl\/(slicers|slicerCaches|timelines|timelineCaches)\//i)) found.add(LOSSY.slicers);
   if (has(/^xl\/externalLinks\//i)) found.add(LOSSY.externalLinks);
-  if (has(/^xl\/threadedComments\//i)) found.add(LOSSY.threadedComments);
+  // shown as the cell's note when the threads can be read (readThreadedComments)
+  if (has(/^xl\/threadedComments\//i) && !(await readThreadedComments(zip).catch(() => undefined))) {
+    found.add(LOSSY.threadedComments);
+  }
   if (has(/^xl\/(ctrlProps|activeX)\//i)) found.add(LOSSY.controls);
 
   for (const name of names) {

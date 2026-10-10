@@ -18,7 +18,7 @@
 import 'katex/dist/katex.min.css';
 // @ts-ignore -- side-effect CSS import: esbuild adds the pdf.js viewer styles (page, text and annotation layers) to dist/viewer.css.
 import 'pdfjs-dist/web/pdf_viewer.css';
-import { describePdfFailure } from '../src/renderers/pdf';
+import { describePdfFailure, missingPdfEngineFeatures, PDF_ENGINE_UNSUPPORTED } from '../src/renderers/pdf';
 import DOMPurify from 'dompurify';
 
 /** @typedef {import('../src/renderers/sheet').Range} Range */
@@ -177,6 +177,24 @@ function disposeView() {
 function listen(target, type, fn, options) {
   target.addEventListener(type, fn, options);
   onDispose(() => target.removeEventListener(type, fn, options));
+}
+
+/**
+ * Document views (Markdown, Word, PDF): when the focus falls to <body> (a round trip through the workbench, e.g. the
+ * Explorer and back, or the focused element went away), the view's scroller takes it back as the frame gets the focus
+ * again or a key is pressed, so arrow keys, Space and Page Up / Down go on scrolling (like the grid's restoreLostFocus).
+ * A key pressed on <body> scrolls the scroller natively once it has the focus.
+ * @param {HTMLElement} scroller
+ */
+function keepScrollerFocus(scroller) {
+  const take = () => {
+    const focus = document.activeElement;
+    if (scroller.isConnected && (!focus || focus === document.body)) scroller.focus({ preventScroll: true });
+  };
+  listen(window, 'focus', take);
+  listen(document, 'keydown', (/** @type {KeyboardEvent} */ e) => {
+    if (e.target === document.body) take();
+  }, true);
 }
 
 /** @param {unknown} err */
@@ -3665,6 +3683,8 @@ function rawValue(cell) {
   if (!cell || cell.t === 'z') return '';
   // Legacy (Ctrl+Shift+Enter) array formulas in braces, like Excel's formula bar; dynamic arrays have none.
   if (cell.f) return cell.array ? `{=${cell.f}}` : '=' + cell.f;
+  // A delimited file's number shows its field text (007, 1e5, 50%), the same as the cell and the copy.
+  if (G?.kind === 'csv' && cell.t === 'n' && typeof cell.w === 'string') return cell.w;
   const v = cell.v;
   if (v === null || v === undefined) return cell.w ?? '';
   switch (cell.t) {
@@ -4479,7 +4499,7 @@ function onGridKeyDown(e) {
     case 'PageDown':
     case 'PageUp':
       if (ctrl) {
-        switchSheet(e.key === 'PageDown' ? 1 : -1);
+        if (!switchSheet(e.key === 'PageDown' ? 1 : -1)) return;
         break;
       }
       pageMove(view, e.key === 'PageDown' ? 1 : -1, shift, e.altKey);
@@ -4541,7 +4561,7 @@ function onGridAppKeyDown(e) {
   } else if (ctrl && !e.altKey && !e.shiftKey && (e.key === 'PageDown' || e.key === 'PageUp')) {
     const focus = document.activeElement;
     const inTabs = !!focus && G.dom.tabBar.contains(focus);
-    switchSheet(e.key === 'PageDown' ? 1 : -1);
+    if (!switchSheet(e.key === 'PageDown' ? 1 : -1)) return;
     // The tab strip was rebuilt: keep the focus on the (new) active tab; from the menu, go back to the grid.
     if (inTabs) /** @type {HTMLElement | null} */ (G.dom.tabStrip.querySelector('.fv-tab-active'))?.focus();
     else if (!focus || focus === document.body || !focus.isConnected) G.dom.scroller.focus({ preventScroll: true });
@@ -5056,13 +5076,19 @@ function pageMove(view, dir, extend, horizontal) {
   jumpTo(view, horizontal ? { r: from.r, c: visibleCol(L, at) } : { r: visibleRow(L, at), c: from.c }, extend);
 }
 
-/** Ctrl+PageUp/PageDown: previous/next visible sheet. @param {number} dir */
+/**
+ * Ctrl+PageUp/PageDown: previous/next visible sheet. Returns false when there is none (a one-sheet file, CSV, or the
+ * first / last sheet): the key is then left to VS Code, whose Ctrl+PageUp/PageDown goes to the previous/next editor.
+ * @param {number} dir
+ */
 function switchSheet(dir) {
-  if (!G) return;
+  if (!G) return false;
   const order = G.meta.sheets.filter((s) => s.state === 'visible' || G?.revealed.has(s.index)).map((s) => s.index);
   const pos = order.indexOf(G.sheet);
   const next = order[pos + dir];
-  if (next !== undefined) activateSheet(next);
+  if (next === undefined) return false;
+  activateSheet(next);
+  return true;
 }
 
 /**
@@ -6202,8 +6228,28 @@ function buildStatusBar(msg) {
     zoomLabel,
     h('button', { class: 'fv-icon-btn fv-zoom-btn', type: 'button', title: 'Zoom in (Ctrl+Wheel)', 'aria-label': 'Zoom in', onclick: () => G && setZoom(activeView().zoom + 10) }, '+'),
   );
-  const bar = h('div', { class: 'fv-statusbar' }, mode, info, msgEl, h('span', { class: 'fv-status-spacer' }), stats, zoom);
+  const delimiter = msg.kind === 'csv' && msg.delimited ? buildDelimiterStatus(msg.delimited) : null;
+  const bar = h('div', { class: 'fv-statusbar' }, mode, info, ...(delimiter ? [delimiter] : []), msgEl, h('span', { class: 'fv-status-spacer' }), stats, zoom);
   return { bar, msg: msgEl, stats, info, zoomLabel };
+}
+
+/** Names of the delimiters parseDelimited uses (' ' = runs of spaces). */
+const DELIMITER_NAMES = /** @type {Record<string, string>} */ ({ ',': 'Comma', ';': 'Semicolon', '\t': 'Tab', '|': 'Pipe', ' ': 'Spaces' });
+
+/**
+ * Delimited text: the format and the delimiter the columns were split on ("CSV · Semicolon"), so a wrong guess (a tie,
+ * a .csv that is really tab-separated) can be seen.
+ * @param {{ format: string, delimiter: string }} delimited
+ */
+function buildDelimiterStatus(delimited) {
+  const d = delimited.delimiter;
+  const name = DELIMITER_NAMES[d] ?? `“${d}”`;
+  const shown = d === ' ' ? 'runs of spaces' : d === '\t' ? 'tabs' : `“${d}”`;
+  return h(
+    'span',
+    { class: 'fv-status-item fv-status-delim', title: `${delimited.format.toUpperCase()} file: the columns are split on ${shown} (FileStudio: Change Delimiter to choose another)` },
+    `${delimited.format.toUpperCase()} · ${name}`,
+  );
 }
 
 function updateStatusInfo() {
@@ -6668,6 +6714,7 @@ function showMarkdown(msg) {
     mdWatchDiagrams([article], []);
     mdTasksAfterRender(article);
     if (deferred.length) mdStartDeferredBlocks(raws.slice(eager), deferred);
+    keepScrollerFocus(view);
     view.focus({ preventScroll: true });
   } catch (err) {
     mdFail(err, 'Could not display the Markdown preview.', true);
@@ -8696,6 +8743,7 @@ function showDocx(msg) {
     const saved = docxReadScrollTop();
     // images (data: URIs) decode late: hold the offset until the user scrolls
     if (saved !== undefined) mdKeepScroll(view, docxState.scroll, null, 0, saved);
+    keepScrollerFocus(view);
     view.focus({ preventScroll: true });
   } catch (err) {
     mdFail(err, 'Could not display the Word document.', false);
@@ -8893,6 +8941,9 @@ const PDF_DEFAULT_ZOOM = 'auto';
 const PDF_SAVE_DELAY_MS = 250;
 /** Canvas redraw delay while zooming with Ctrl+Wheel / pinch (pages are scaled by CSS meanwhile). */
 const PDF_WHEEL_ZOOM_DELAY_MS = 400;
+/** Page Up / Page Down scroll by this share of the view's height, or by its height less the overlap if that is more. */
+const PDF_PAGE_KEY_STEP = 0.875;
+const PDF_PAGE_KEY_OVERLAP = 40;
 /** Outline levels shown (deeper entries are left out; real outlines are far shallower). */
 const PDF_MAX_OUTLINE_DEPTH = 32;
 /** pdf.js FindState (web/pdf_find_controller.js). */
@@ -8965,6 +9016,8 @@ const PDF_ICONS = {
  * @property {boolean} outlineOpen
  * @property {boolean} matchCase
  * @property {number} findState PDF_FIND_STATE of the last find
+ * @property {{ pageNumber: number, destArray: any[] } | null} restoreAgain restored position to set once more on
+ *   'pagesloaded' (every page has page 1's size until then); dropped when the user moves first
  * @property {(() => void) & { cancel(): void, flush(): void }} saveSoon
  */
 
@@ -9006,6 +9059,7 @@ function showPdf(msg) {
     outlineOpen: false,
     matchCase: false,
     findState: PDF_FIND_STATE.FOUND,
+    restoreAgain: null,
     saveSoon: debounce(() => pdfSaveView(view), PDF_SAVE_DELAY_MS),
   };
   pdfState.view = view;
@@ -9016,6 +9070,7 @@ function showPdf(msg) {
   root.replaceChildren(...(msg.banner ? [buildBanner(msg.banner, null)] : []), ...pdfBuildFrame(view));
   pdfWireFrame(view);
   pdfShowLoading(view, null);
+  keepScrollerFocus(view.dom.container);
   view.dom.container.focus({ preventScroll: true });
   void pdfOpen(view, msg);
 }
@@ -9095,6 +9150,11 @@ async function pdfOpen(view, msg) {
   try {
     const source = pdfDocumentSource(msg);
     if (!source) throw new Error('The PDF view received no file to display.');
+    // pdf.js would fail later with "x is not a function" (or draw part of a page); say plainly that VS Code is too old.
+    const missing = missingPdfEngineFeatures();
+    if (missing.length > 0) {
+      throw Object.assign(new Error(`This web view lacks: ${missing.join(', ')}`), { name: PDF_ENGINE_UNSUPPORTED });
+    }
     const { lib, viewerLib } = await pdfLoadLibraries();
     if (view.disposed) return;
     view.lib = lib;
@@ -9105,6 +9165,9 @@ async function pdfOpen(view, msg) {
       standardFontDataUrl: new URL(PDF_ASSETS.standardFonts, import.meta.url).href,
       useWorkerFetch: false,
       useWasm: false,
+      // pdf.js warnings (one "Failed to compile PostScript function to wasm" per Type 4 function, as wasm is off on
+      // purpose; font quirks) are noise in the console: real failures go through pdfFail and the 'pagerendered' log.
+      verbosity: lib.VerbosityLevel.ERRORS,
     });
     view.loadingTask = task;
     task.onPassword = (/** @type {(password: string) => void} */ update, /** @type {number} */ reason) => {
@@ -9237,7 +9300,13 @@ function pdfShowDocument(view, viewerLib, pdfDocument) {
   // Until now every page had the size of the first one: a fit zoom is lowered if a page turned out wider. (Not the
   // whole preset again: pdf.js's 'auto' depends on the current page, which may now be a restored landscape page.)
   eventBus.on('pagesloaded', () => {
-    if (!view.disposed && view.zoomPreset && PDF_FIT_PRESETS.includes(view.zoomPreset)) pdfFitWidestPage(view);
+    if (view.disposed) return;
+    if (view.zoomPreset && PDF_FIT_PRESETS.includes(view.zoomPreset)) pdfFitWidestPage(view);
+    // The restored point was placed with page 1's size for every page: on a page of another size it landed on the
+    // wrong spot (even the previous page). Every page has its real size now.
+    const again = view.restoreAgain;
+    view.restoreAgain = null;
+    if (again) viewer.scrollPageIntoView({ ...again, allowNegativeOffset: true });
   });
   eventBus.on('pagechanging', (/** @type {{ pageNumber: number }} */ e) => pdfUpdatePageControls(view, e.pageNumber));
   eventBus.on('scalechanging', (/** @type {{ scale: number, presetValue?: string }} */ e) => {
@@ -9264,8 +9333,17 @@ function pdfShowDocument(view, viewerLib, pdfDocument) {
     log('warn', `Page ${e.pageNumber} of ${view.fileName} could not be rendered completely: ${pdfErrorDetail(e.error)}`);
   });
 
+  // A document without pages, or whose first page cannot be read (broken page tree or cross-reference table), would
+  // leave the frame empty: PDFViewer needs page 1 to lay out every page and only logs to the console when it fails.
+  if (view.pagesCount < 1) {
+    pdfFail(view, new Error('This PDF has no pages.'));
+    return;
+  }
   viewer.setDocument(pdfDocument);
   linkService.setDocument(pdfDocument, null);
+  viewer.pagesPromise?.catch((/** @type {unknown} */ err) => {
+    if (!view.disposed && view.viewer === viewer) pdfFail(view, err);
+  });
 
   dom.overlay.hidden = true;
   dom.overlay.replaceChildren();
@@ -9288,7 +9366,10 @@ function pdfRestoreView(view) {
   if (!saved) return;
   const pageNumber = clamp(saved.page, 1, view.pagesCount);
   if (pageNumber === saved.page && saved.left !== null && saved.top !== null) {
-    viewer.scrollPageIntoView({ pageNumber, destArray: [null, { name: 'XYZ' }, saved.left, saved.top, null], allowNegativeOffset: true });
+    const destArray = [null, { name: 'XYZ' }, saved.left, saved.top, null];
+    viewer.scrollPageIntoView({ pageNumber, destArray, allowNegativeOffset: true });
+    // Set again on 'pagesloaded', when the pages above and this one have their real sizes (unless the user moved).
+    if (pageNumber > 1) view.restoreAgain = { pageNumber, destArray };
   } else if (pageNumber > 1) {
     viewer.currentPageNumber = pageNumber;
   }
@@ -9314,13 +9395,14 @@ function pdfReadState() {
 }
 
 /**
- * PDFViewer.currentScaleValue for a zoom from the state or a pdf.js location: a preset name, or a percentage (125)
- * as a scale factor ('1.25').
+ * PDFViewer.currentScaleValue for a zoom from the state or a pdf.js location: a preset name, a percentage (125)
+ * as a scale factor ('1.25'), or a scale factor saved by pdfSaveView ('1.6').
  * @param {unknown} zoom
  */
 function pdfZoomValue(zoom) {
   if (typeof zoom === 'string' && PDF_ZOOM_PRESETS.includes(zoom)) return zoom;
   if (typeof zoom === 'number' && Number.isFinite(zoom) && zoom > 0) return String(clamp(zoom, 10, 2500) / 100);
+  if (typeof zoom === 'string' && /^\d*\.?\d+$/.test(zoom) && Number(zoom) > 0) return String(clamp(Number(zoom), 0.1, 25));
   return PDF_DEFAULT_ZOOM;
 }
 
@@ -9359,14 +9441,14 @@ function pdfBuildDom(fileName) {
   return {
     app: root,
     outlineBtn: button('Outline', 'Outline', icon(PDF_ICONS.outline), { 'aria-pressed': 'false', 'aria-controls': 'pdf-sidebar' }),
-    prevBtn: button('Previous page (Page Up)', 'Previous page', icon(PDF_ICONS.chevronUp)),
-    nextBtn: button('Next page (Page Down)', 'Next page', icon(PDF_ICONS.chevronDown)),
+    prevBtn: button('Previous page', 'Previous page', icon(PDF_ICONS.chevronUp)),
+    nextBtn: button('Next page', 'Next page', icon(PDF_ICONS.chevronDown)),
     pageInput: /** @type {HTMLInputElement} */ (
       h('input', { class: 'pdf-page-input', type: 'text', inputmode: 'numeric', autocomplete: 'off', spellcheck: 'false', 'aria-label': 'Page number', title: 'Page number', disabled: true })
     ),
     pageCount: h('span', { class: 'pdf-page-count' }),
     zoomOutBtn: button('Zoom out (Ctrl+-)', 'Zoom out', '−', { class: 'fv-icon-btn fv-zoom-btn' }),
-    zoomLabel: /** @type {HTMLButtonElement} */ (h('button', { class: 'fv-zoom-label pdf-zoom-label', type: 'button', title: 'Reset zoom (Ctrl+0)', disabled: true }, '100%')),
+    zoomLabel: /** @type {HTMLButtonElement} */ (h('button', { class: 'fv-zoom-label pdf-zoom-label', type: 'button', title: 'Reset zoom (Ctrl+0)', 'aria-label': 'Reset zoom', disabled: true }, '100%')),
     zoomInBtn: button('Zoom in (Ctrl+=)', 'Zoom in', '+', { class: 'fv-icon-btn fv-zoom-btn' }),
     fitWidthBtn: button('Fit width', 'Fit width', icon(PDF_ICONS.fitWidth), { 'aria-pressed': 'false' }),
     fitPageBtn: button('Fit page', 'Fit page', icon(PDF_ICONS.fitPage), { 'aria-pressed': 'false' }),
@@ -9404,7 +9486,7 @@ function pdfBuildFrame(view) {
 
   const toolbar = h(
     'div',
-    { class: 'pdf-toolbar', 'aria-label': 'PDF toolbar' },
+    { class: 'pdf-toolbar', role: 'toolbar', 'aria-label': 'PDF toolbar' },
     d.outlineBtn,
     h('span', { class: 'pdf-sep' }),
     h('span', { class: 'pdf-group', role: 'group', 'aria-label': 'Pages' }, d.prevBtn, d.nextBtn, d.pageInput, d.pageCount),
@@ -9421,6 +9503,7 @@ function pdfBuildFrame(view) {
 function pdfWireFrame(view) {
   const d = view.dom;
   d.outlineBtn.addEventListener('click', () => pdfToggleOutline(view));
+  d.outline.addEventListener('keydown', pdfOnOutlineKeyDown);
   d.prevBtn.addEventListener('click', () => view.viewer?.previousPage());
   d.nextBtn.addEventListener('click', () => view.viewer?.nextPage());
   d.zoomOutBtn.addEventListener('click', () => pdfZoomBy(view, -1));
@@ -9463,6 +9546,11 @@ function pdfWireFrame(view) {
   listen(d.container, 'click', (e) => pdfOnLinkClick(view, e));
   listen(d.container, 'auxclick', (e) => pdfOnLinkClick(view, e));
   listen(d.container, 'wheel', (e) => pdfOnWheel(view, e), { passive: false });
+  // The user moves before the pages are laid out: the restored position is not set again over theirs.
+  const keepUserPosition = () => (view.restoreAgain = null);
+  for (const type of ['wheel', 'touchstart']) listen(d.container, type, keepUserPosition, { passive: true });
+  listen(d.app, 'pointerdown', keepUserPosition, true);
+  listen(window, 'keydown', keepUserPosition, true);
   // Capture phase: runs before VS Code's keydown listener on the window, which forwards keys to the workbench (where
   // Ctrl+= would zoom the whole window); handled keys stop there.
   listen(window, 'keydown', (e) => pdfOnKeyDown(view, e), true);
@@ -9507,6 +9595,8 @@ function pdfUpdateZoomControls(view, scale) {
   if (view.disposed) return;
   const d = view.dom;
   d.zoomLabel.textContent = `${Math.round(scale * 100)}%`;
+  // The text alone would be read as "125% button": say what the button does.
+  d.zoomLabel.setAttribute('aria-label', `Reset zoom (current ${Math.round(scale * 100)}%)`);
   d.fitWidthBtn.setAttribute('aria-pressed', String(view.zoomPreset === 'page-width'));
   d.fitPageBtn.setAttribute('aria-pressed', String(view.zoomPreset === 'page-fit'));
 }
@@ -9615,8 +9705,9 @@ function pdfIsTextField(target) {
 }
 
 /**
- * View shortcuts: Ctrl+F find, Ctrl+= / Ctrl+- / Ctrl+0 zoom, Page Up / Page Down previous / next page, Home / End
- * first / last page, Escape closes the find bar. Arrow keys and Space scroll the focused pages natively.
+ * View shortcuts: Ctrl+F find, F3 / Shift+F3 and Ctrl+G / Ctrl+Shift+G next / previous match, Alt+C match case,
+ * Ctrl+= / Ctrl+- / Ctrl+0 zoom, Page Up / Page Down one screen up / down (a page at "Fit page"), Home / End top /
+ * bottom of the document, Escape closes the find bar. Arrow keys and Space scroll the focused pages natively.
  * @param {PdfView} view
  * @param {KeyboardEvent} e
  */
@@ -9624,6 +9715,9 @@ function pdfOnKeyDown(view, e) {
   if (e.isComposing || view.disposed) return;
   const ctrl = e.ctrlKey || e.metaKey;
   const key = e.key;
+  const d = view.dom;
+  // Next / previous match work while the find bar is open with a query (else Ctrl+G stays VS Code's).
+  const findQuery = !d.findBar.hidden && d.findInput.value !== '';
   /** @type {(() => void) | null} */
   let action = null;
   if (ctrl && !e.altKey) {
@@ -9631,12 +9725,18 @@ function pdfOnKeyDown(view, e) {
     else if (key === '+' || key === '=' || e.code === 'NumpadAdd') action = () => pdfZoomBy(view, 1);
     else if (key === '-' || key === '_' || e.code === 'NumpadSubtract') action = () => pdfZoomBy(view, -1);
     else if (key === '0' || e.code === 'Numpad0') action = () => pdfSetZoom(view, PDF_DEFAULT_ZOOM);
+    else if ((key === 'g' || key === 'G') && findQuery) action = () => pdfFind(view, 'again', e.shiftKey);
   }
+  // F3 / Shift+F3 like VS Code's find widget (and the browser's PDF viewer); with no query, F3 opens the find bar.
+  if (!action && key === 'F3' && !ctrl && !e.altKey && view.viewer) {
+    action = findQuery ? () => pdfFind(view, 'again', e.shiftKey) : () => pdfOpenFind(view);
+  }
+  if (!action && e.altKey && !ctrl && !e.shiftKey && e.code === 'KeyC' && !d.findBar.hidden) action = () => d.findCaseBtn.click();
+  // Home / End in the outline move in the outline (pdfOnOutlineKeyDown), not in the pages.
+  const inOutline = e.target instanceof Node && d.sidebar.contains(e.target);
   if (!action && !e.altKey && !e.shiftKey && !pdfIsTextField(e.target)) {
-    if (!ctrl && key === 'PageDown') action = () => view.viewer?.nextPage();
-    else if (!ctrl && key === 'PageUp') action = () => view.viewer?.previousPage();
-    else if (key === 'Home') action = () => pdfGoToPage(view, 1);
-    else if (key === 'End') action = () => pdfGoToPage(view, view.pagesCount);
+    if (!ctrl && (key === 'PageDown' || key === 'PageUp')) action = () => pdfPageKey(view, key === 'PageDown' ? 1 : -1);
+    else if ((key === 'Home' || key === 'End') && !inOutline) action = () => pdfScrollToEnd(view, key === 'End');
   }
   if (
     !action &&
@@ -9655,12 +9755,44 @@ function pdfOnKeyDown(view, e) {
   action();
 }
 
+/**
+ * Page Up / Page Down: one screen up / down, less a little overlap (like the browser's own paging), so no part of a
+ * page is skipped; at "Fit page", where a page fills the screen, the previous / next page (like pdf.js's app).
+ * @param {PdfView} view
+ * @param {number} dir 1 = down
+ */
+function pdfPageKey(view, dir) {
+  const { viewer } = view;
+  if (!viewer || !view.pdfDocument) return;
+  if (view.zoomPreset === 'page-fit') {
+    if (dir > 0) viewer.nextPage();
+    else viewer.previousPage();
+    return;
+  }
+  const c = view.dom.container;
+  c.scrollTop += dir * Math.max(c.clientHeight * PDF_PAGE_KEY_STEP, c.clientHeight - PDF_PAGE_KEY_OVERLAP);
+}
+
+/**
+ * Home / End (also with Ctrl): the top / the bottom of the document (not the top of the last page).
+ * @param {PdfView} view
+ * @param {boolean} end
+ */
+function pdfScrollToEnd(view, end) {
+  if (!view.viewer || !view.pdfDocument) return;
+  const c = view.dom.container;
+  c.scrollTop = end ? c.scrollHeight : 0;
+}
+
 // ----- PDF: FIND -----
 
 /** @param {PdfView} view */
 function pdfOpenFind(view) {
   if (!view.viewer) return;
   const d = view.dom;
+  // Reopened with the last query: its matches are highlighted again (closing removed them), so the "n of m" shown
+  // still matches the page, like VS Code's find widget.
+  if (d.findBar.hidden && d.findInput.value) pdfFind(view, 'highlightallchange', false);
   d.findBar.hidden = false;
   d.findBtn.setAttribute('aria-expanded', 'true');
   d.findInput.focus();
@@ -9678,9 +9810,10 @@ function pdfCloseFind(view) {
 }
 
 /**
- * Runs a search in the PDFFindController ('' = the query changed, 'again' = next / previous match).
+ * Runs a search in the PDFFindController ('' = the query changed, 'again' = next / previous match,
+ * 'highlightallchange' = highlight the current matches again without moving).
  * @param {PdfView} view
- * @param {'' | 'again' | 'casesensitivitychange'} type
+ * @param {'' | 'again' | 'casesensitivitychange' | 'highlightallchange'} type
  * @param {boolean} findPrevious
  */
 function pdfFind(view, type, findPrevious) {
@@ -9768,11 +9901,13 @@ function pdfBuildOutlineList(view, items, depth) {
         {
           class: 'fv-icon-btn pdf-outline-toggle',
           type: 'button',
-          'aria-label': title,
+          // Its own name: the entry's button next to it (which goes to the entry) is named after the title.
+          'aria-label': `${expanded ? 'Collapse' : 'Expand'} ${title}`,
           'aria-expanded': String(expanded),
           onclick: () => {
             sub.hidden = !sub.hidden;
             toggle.setAttribute('aria-expanded', String(!sub.hidden));
+            toggle.setAttribute('aria-label', `${sub.hidden ? 'Expand' : 'Collapse'} ${title}`);
           },
         },
         icon(ICONS.chevronRight),
@@ -9784,6 +9919,54 @@ function pdfBuildOutlineList(view, items, depth) {
     list.append(li);
   }
   return list;
+}
+
+/**
+ * Tree keys in the outline, like a VS Code tree: Up / Down previous / next entry shown, Right expands (or goes to the
+ * first child), Left collapses (or goes to the parent), Home / End first / last entry shown.
+ * @param {KeyboardEvent} e
+ */
+function pdfOnOutlineKeyDown(e) {
+  if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || e.isComposing) return;
+  const outline = e.currentTarget instanceof HTMLElement ? e.currentTarget : null;
+  const li = e.target instanceof HTMLElement ? e.target.closest('.pdf-outline-item') : null;
+  if (!outline || !li) return;
+  /** @param {Element | null | undefined} item */
+  const linkOf = (item) => /** @type {HTMLElement | null} */ (item?.querySelector(':scope > .pdf-outline-row > .pdf-outline-link') ?? null);
+  // Entries inside a collapsed (hidden) list have no layout box.
+  const links = [.../** @type {NodeListOf<HTMLElement>} */ (outline.querySelectorAll('.pdf-outline-link'))].filter((el) => el.getClientRects().length > 0);
+  const i = links.indexOf(/** @type {HTMLElement} */ (linkOf(li)));
+  const toggle = /** @type {HTMLElement | null} */ (li.querySelector(':scope > .pdf-outline-row > .pdf-outline-toggle'));
+  const sub = /** @type {HTMLElement | null} */ (li.querySelector(':scope > ul'));
+  /** @type {HTMLElement | null | undefined} */
+  let next = null;
+  switch (e.key) {
+    case 'ArrowDown':
+      next = links[i + 1];
+      break;
+    case 'ArrowUp':
+      next = i > 0 ? links[i - 1] : null;
+      break;
+    case 'Home':
+      next = links[0];
+      break;
+    case 'End':
+      next = links[links.length - 1];
+      break;
+    case 'ArrowRight':
+      if (sub && toggle && sub.hidden) toggle.click();
+      else if (sub) next = linkOf(sub.querySelector(':scope > .pdf-outline-item'));
+      break;
+    case 'ArrowLeft':
+      if (sub && toggle && !sub.hidden) toggle.click();
+      else next = linkOf(li.parentElement?.closest('.pdf-outline-item'));
+      break;
+    default:
+      return;
+  }
+  e.preventDefault();
+  e.stopPropagation();
+  next?.focus();
 }
 
 /**
@@ -9957,6 +10140,33 @@ const PPTX_MONO_FALLBACK = 'Consolas, "Courier New", monospace';
 
 /** Presets whose holes are sub-paths drawn in the same direction as the outline (filled even-odd). */
 const PPTX_EVENODD_TYPES = new Set(['donut', 'noSmoking', 'frame']);
+
+/** Presets drawn with the viewer's own geometry (pptxPresetPath) rather than pptxtojson's path. */
+const PPTX_OWN_PRESETS = new Set([
+  'rect',
+  'roundRect',
+  'ellipse',
+  'triangle',
+  'rtTriangle',
+  'diamond',
+  'parallelogram',
+  'trapezoid',
+  'pentagon',
+  'hexagon',
+  'octagon',
+  'chevron',
+  'homePlate',
+  'rightArrow',
+  'leftArrow',
+  'upArrow',
+  'downArrow',
+  'wedgeRectCallout',
+  'wedgeRoundRectCallout',
+  'wedgeEllipseCallout',
+]);
+
+/** In-between stops per gradient segment, so the browser's sRGB blend follows PowerPoint's linear-light blend. */
+const PPTX_GRADIENT_STEPS = 8;
 
 /** Line-like presets: drawn as open paths with their own geometry (head / tail ends, never filled). */
 const PPTX_LINE_TYPES = new Set([
@@ -10760,6 +10970,8 @@ function pptxOnStageClick(event) {
  */
 function pptxFollowLink(href) {
   const s = pptxState;
+  // A slide jump action of a text run comes as '#ppaction://hlinkshowjump?jump=…' (the sanitizer keeps '#' links).
+  if (/^#ppaction:/i.test(href)) href = href.slice(1);
   if (!href || href.startsWith('#') || !s.deck) return;
   const slideRef = /(?:^|[\\/])(slide(\d+)\.xml)$/i.exec(href);
   if (slideRef && !/^[a-z][a-z0-9+.-]*:/i.test(href)) {
@@ -10875,6 +11087,9 @@ function pptxBuildThumbItem(index) {
       id: `pptx-thumb-${index}`,
       role: 'option',
       'aria-selected': String(index === s.current),
+      // Only the visible part of the list is in the DOM: give each option its real position in the deck.
+      'aria-posinset': String(index + 1),
+      'aria-setsize': String(s.deck?.slideCount ?? 0),
       'aria-label': label,
       title: label,
       dataset: { index: String(index) },
@@ -11088,9 +11303,26 @@ function pptxBuildShape(el, ctx, mirror, isText) {
  */
 function pptxSetLink(box, link) {
   if (typeof link !== 'string' || !link.trim()) return;
-  box.setAttribute('data-pptx-link', link.trim());
+  const href = link.trim();
+  box.setAttribute('data-pptx-link', href);
   box.classList.add('pptx-has-link');
-  box.setAttribute('title', link.trim());
+  box.setAttribute('title', href);
+  // A link for the keyboard and screen readers too (like the text links): focusable, named, opened with Enter.
+  box.setAttribute('role', 'link');
+  box.setAttribute('tabindex', '0');
+  const jump = /^ppaction:\/\/hlinkshowjump\?jump=(\w+)/i.exec(href)?.[1].toLowerCase();
+  const target =
+    { nextslide: 'Next slide', previousslide: 'Previous slide', firstslide: 'First slide', lastslide: 'Last slide' }[jump ?? ''] ??
+    (/(?:^|[\\/])slide(\d+)\.xml$/i.test(href) ? 'Another slide' : href);
+  const text = (box.textContent ?? '').replace(/\s+/g, ' ').trim();
+  box.setAttribute('aria-label', text && text !== target ? `${text} (${target})` : target);
+  box.addEventListener('keydown', (event) => {
+    if (!(event instanceof KeyboardEvent) || event.target !== box || (event.key !== 'Enter' && event.key !== ' ')) return;
+    if (event.altKey || event.ctrlKey || event.metaKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    pptxFollowLink(href);
+  });
 }
 
 /**
@@ -11226,6 +11458,11 @@ function pptxDashArray(value, width) {
  * @param {number} h
  */
 function pptxShapePathData(el, shapType, w, h) {
+  // pptxtojson's geometry of these presets is wrong (arrow heads from the width, callout arcs): own geometry first.
+  if (PPTX_OWN_PRESETS.has(shapType)) {
+    const own = pptxPresetPath(shapType, w, h, el.keypoints);
+    if (own) return own;
+  }
   const path = typeof el.path === 'string' ? el.path.trim() : '';
   if (path && /^[MmZzLlHhVvCcSsQqTtAa0-9eE.,+\-\s]+$/.test(path) && /\d/.test(path)) {
     const vb = el.pathViewBox && typeof el.pathViewBox === 'object' ? el.pathViewBox : {};
@@ -11394,12 +11631,134 @@ function pptxPresetPath(type, w, h, kp) {
       }
       return poly(points);
     }
+    case 'wedgeEllipseCallout': {
+      // The bubble is the ellipse from 11° before to 11° after the direction of the pointer tip.
+      const [rx, ry] = [w / 2, h / 2];
+      const dx = w * pptxAdj(kp, 'adj1', -20833);
+      const dy = h * pptxAdj(kp, 'adj2', 62500);
+      const angle = Math.atan2(dy * w, dx * h);
+      const at = (/** @type {number} */ a) => [rx + rx * Math.cos(a), ry + ry * Math.sin(a)];
+      const [x1, y1] = at(angle + (11 * Math.PI) / 180);
+      const [x2, y2] = at(angle - (11 * Math.PI) / 180);
+      return `M ${pptxR(rx + dx)} ${pptxR(ry + dy)} L ${pptxR(x1)} ${pptxR(y1)} A ${pptxR(rx)} ${pptxR(ry)} 0 1 1 ${pptxR(x2)} ${pptxR(y2)} Z`;
+    }
+    case 'wedgeRectCallout':
+    case 'wedgeRoundRectCallout':
+      return pptxWedgeRectPath(type === 'wedgeRoundRectCallout', w, h, kp);
     default:
-      // Callouts are drawn as their rectangle (or ellipse) without the pointer.
-      if (/^wedgeEllipseCallout$/.test(type)) return pptxPresetPath('ellipse', w, h, kp);
-      if (/^wedgeRoundRectCallout$/.test(type)) return pptxPresetPath('roundRect', w, h, kp);
+      // Other callouts are drawn as their rectangle without the pointer.
       if (/Callout|^callout\d$/.test(type)) return pptxRectPath(w, h);
       return '';
+  }
+}
+
+/**
+ * DrawingML wedgeRectCallout / wedgeRoundRectCallout: the pointer leaves the side the tip is beyond (between 2/12 and
+ * 5/12, or 7/12 and 10/12, of that side).
+ * @param {boolean} round
+ * @param {number} w
+ * @param {number} h
+ * @param {unknown} kp
+ */
+function pptxWedgeRectPath(round, w, h, kp) {
+  const dx = w * pptxAdj(kp, 'adj1', -20833);
+  const dy = h * pptxAdj(kp, 'adj2', 62500);
+  const [xp, yp] = [w / 2 + dx, h / 2 + dy];
+  const vertical = Math.abs(dy) - Math.abs((dx * h) / w) > 0;
+  const [x1, x2] = dx > 0 ? [(w * 7) / 12, (w * 10) / 12] : [(w * 2) / 12, (w * 5) / 12];
+  const [y1, y2] = dy > 0 ? [(h * 7) / 12, (h * 10) / 12] : [(h * 2) / 12, (h * 5) / 12];
+  const r = round ? Math.min(Math.min(w, h) * pptxAdj(kp, 'adj3', 16667), w / 2, h / 2) : 0;
+  /** @type {(string | number)[]} */
+  const d = ['M', 0, r];
+  const corner = (/** @type {number} */ x, /** @type {number} */ y) => {
+    if (r > 0) d.push('A', r, r, 0, 0, 1, x, y);
+  };
+  const line = (/** @type {number} */ x, /** @type {number} */ y) => d.push('L', x, y);
+  corner(r, 0);
+  if (vertical && dy < 0) [[x1, 0], [xp, yp], [x2, 0]].forEach(([x, y]) => line(x, y));
+  line(w - r, 0);
+  corner(w, r);
+  if (!vertical && dx > 0) [[w, y1], [xp, yp], [w, y2]].forEach(([x, y]) => line(x, y));
+  line(w, h - r);
+  corner(w - r, h);
+  if (vertical && dy > 0) [[x2, h], [xp, yp], [x1, h]].forEach(([x, y]) => line(x, y));
+  line(r, h);
+  corner(0, h - r);
+  if (!vertical && dx <= 0) [[0, y2], [xp, yp], [0, y1]].forEach(([x, y]) => line(x, y));
+  d.push('Z');
+  return d.map((v) => (typeof v === 'number' ? pptxR(v) : v)).join(' ');
+}
+
+/**
+ * The text rectangle of a preset (DrawingML presetShapeDefinitions <a:rect>) in points, null for the whole box.
+ * @param {string} type
+ * @param {number} w
+ * @param {number} h
+ * @param {unknown} kp pptxtojson keypoints
+ * @returns {{ l: number, t: number, r: number, b: number } | null}
+ */
+function pptxTextRect(type, w, h, kp) {
+  const ss = Math.min(w, h);
+  if (!(ss > 0)) return null;
+  switch (type) {
+    case 'ellipse':
+    case 'wedgeEllipseCallout': {
+      const [dx, dy] = [(w / 2) * (1 - Math.SQRT1_2), (h / 2) * (1 - Math.SQRT1_2)];
+      return { l: dx, t: dy, r: w - dx, b: h - dy };
+    }
+    case 'roundRect':
+    case 'wedgeRoundRectCallout': {
+      const i = Math.min(ss * pptxAdj(kp, type === 'roundRect' ? 'adj' : 'adj3', 16667), w / 2, h / 2) * 0.29289;
+      return { l: i, t: i, r: w - i, b: h - i };
+    }
+    case 'triangle': {
+      const x1 = (w * pptxAdj(kp, 'adj', 50000)) / 2;
+      return { l: x1, t: h / 2, r: x1 + w / 2, b: h };
+    }
+    case 'rtTriangle':
+      return { l: w / 12, t: (h * 7) / 12, r: (w * 7) / 12, b: (h * 11) / 12 };
+    case 'diamond':
+      return { l: w / 4, t: h / 4, r: (w * 3) / 4, b: (h * 3) / 4 };
+    case 'parallelogram': {
+      const max = w / ss;
+      const q = (1 + (5 * Math.min(pptxAdj(kp, 'adj', 25000), max)) / max) / 12;
+      return { l: q * w, t: q * h, r: w - q * w, b: h - q * h };
+    }
+    case 'trapezoid': {
+      const max = (0.5 * w) / ss;
+      const f = Math.min(pptxAdj(kp, 'adj', 25000), max) / max / 3;
+      return { l: f * w, t: f * h, r: w - f * w, b: h };
+    }
+    case 'pentagon':
+      return { l: w * 0.191, t: h * 0.236, r: w * 0.809, b: h };
+    case 'octagon': {
+      const i = Math.min(ss * pptxAdj(kp, 'adj', 29289), w / 2, h / 2) / 2;
+      return { l: i, t: i, r: w - i, b: h - i };
+    }
+    case 'chevron': {
+      const x1 = Math.min(ss * pptxAdj(kp, 'adj', 50000), w);
+      return w - x1 > x1 ? { l: x1, t: 0, r: w - x1, b: h } : null;
+    }
+    case 'homePlate': {
+      const x1 = Math.min(ss * pptxAdj(kp, 'adj', 50000), w);
+      return { l: 0, t: 0, r: (w - x1 + w) / 2, b: h };
+    }
+    case 'rightArrow':
+    case 'leftArrow': {
+      const y1 = h / 2 - (h * pptxAdj(kp, 'adj1', 50000)) / 2;
+      const head = Math.min(ss * pptxAdj(kp, 'adj2', 50000), w);
+      const back = (y1 * head) / (h / 2);
+      return type === 'rightArrow' ? { l: 0, t: y1, r: w - head + back, b: h - y1 } : { l: head - back, t: y1, r: w, b: h - y1 };
+    }
+    case 'upArrow':
+    case 'downArrow': {
+      const x1 = w / 2 - (w * pptxAdj(kp, 'adj1', 50000)) / 2;
+      const head = Math.min(ss * pptxAdj(kp, 'adj2', 50000), h);
+      const back = (x1 * head) / (w / 2);
+      return type === 'upArrow' ? { l: x1, t: head - back, r: w - x1, b: h } : { l: x1, t: 0, r: w - x1, b: h - head + back };
+    }
+    default:
+      return null;
   }
 }
 
@@ -11637,6 +11996,43 @@ function pptxGradientStops(value) {
 }
 
 /**
+ * Gradient stops with in-between stops blended in linear light, as PowerPoint blends (the browser blends in sRGB,
+ * which makes the middle tones too dark). Colours it cannot read are kept as they are.
+ * @param {{ offset: number, color: string }[]} stops
+ * @returns {{ offset: number, color: string }[]}
+ */
+function pptxLinearStops(stops) {
+  /** @param {string} color */
+  const read = (color) => {
+    const hex = pptxRgba(color);
+    if (hex) return hex;
+    const m = /^rgba?\(\s*([\d.]+)[\s,]+([\d.]+)[\s,]+([\d.]+)(?:[\s,/]+([\d.]+)(%?))?\s*\)$/i.exec(color);
+    if (!m) return null;
+    const alpha = m[4] === undefined ? 1 : Number(m[4]) / (m[5] ? 100 : 1);
+    return [Number(m[1]), Number(m[2]), Number(m[3]), alpha];
+  };
+  const toLinear = (/** @type {number} */ c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+  const fromLinear = (/** @type {number} */ c) => (c <= 0.0031308 ? c * 12.92 : 1.055 * c ** (1 / 2.4) - 0.055);
+  /** @type {{ offset: number, color: string }[]} */
+  const out = [];
+  stops.forEach((stop, i) => {
+    const prev = stops[i - 1];
+    const a = prev ? read(prev.color) : null;
+    const b = read(stop.color);
+    if (prev && a && b && stop.offset > prev.offset) {
+      for (let k = 1; k < PPTX_GRADIENT_STEPS; k++) {
+        const t = k / PPTX_GRADIENT_STEPS;
+        const rgb = [0, 1, 2].map((j) => Math.round(fromLinear(toLinear(a[j] / 255) * (1 - t) + toLinear(b[j] / 255) * t) * 255));
+        const alpha = pptxR(a[3] * (1 - t) + b[3] * t, 1000);
+        out.push({ offset: prev.offset + (stop.offset - prev.offset) * t, color: `rgba(${rgb.join(', ')}, ${alpha})` });
+      }
+    }
+    out.push(stop);
+  });
+  return out;
+}
+
+/**
  * Adds a <linearGradient> / <radialGradient> to `defs`; returns its id ('' without stops).
  * DrawingML angles: 0° = left to right, 90° = top to bottom; path gradients start at the centre.
  * @param {unknown} value
@@ -11656,7 +12052,7 @@ function pptxGradientDef(value, defs) {
     const dy = Math.sin(rad) / 2;
     grad = pptxSvg('linearGradient', { id, x1: pptxR(0.5 - dx, 1000), y1: pptxR(0.5 - dy, 1000), x2: pptxR(0.5 + dx, 1000), y2: pptxR(0.5 + dy, 1000) });
   }
-  for (const stop of stops) grad.appendChild(pptxSvg('stop', { offset: `${stop.offset}%`, 'stop-color': stop.color }));
+  for (const stop of pptxLinearStops(stops)) grad.appendChild(pptxSvg('stop', { offset: `${pptxR(stop.offset)}%`, 'stop-color': stop.color }));
   defs.appendChild(grad);
   return id;
 }
@@ -11668,7 +12064,9 @@ function pptxGradientDef(value, defs) {
 function pptxCssGradient(value) {
   const stops = pptxGradientStops(value);
   if (!stops.length) return '';
-  const list = stops.map((s) => `${s.color} ${s.offset}%`).join(', ');
+  const list = pptxLinearStops(stops)
+    .map((s) => `${s.color} ${pptxR(s.offset)}%`)
+    .join(', ');
   const v = /** @type {Record<string, any>} */ (value);
   if (v.path === 'circle' || v.path === 'rect' || v.path === 'shape') return `radial-gradient(closest-side, ${list})`;
   return `linear-gradient(${pptxR(pptxNum(v.rot) + 90)}deg, ${list})`;
@@ -11756,11 +12154,19 @@ function pptxTextLayer(el, place) {
   const anchor = el.vAlign === 'mid' ? 'mid' : el.vAlign === 'down' ? 'down' : 'up';
   const layer = h('div', { class: `pptx-text pptx-anchor-${anchor}` });
   const inset = el.textInset && typeof el.textInset === 'object' ? el.textInset : PPTX_DEFAULT_INSET;
-  layer.style.padding = ['t', 'r', 'b', 'l'].map((k) => `${pptxR(Math.max(0, pptxNum(inset[k], /** @type {any} */ (PPTX_DEFAULT_INSET)[k])))}pt`).join(' ');
+  // The text sits in the preset's text rectangle (a triangle's lower middle, an arrow's shaft…), mirrored with a flip.
+  const rect = el.type === 'shape' ? pptxTextRect(String(el.shapType || ''), place.width, place.height, el.keypoints) : null;
+  /** @type {Record<string, number>} */
+  const off = rect ? { l: rect.l, t: rect.t, r: place.width - rect.r, b: place.height - rect.b } : { l: 0, t: 0, r: 0, b: 0 };
+  if (place.flipH !== place.flipV) [off.l, off.r] = [off.r, off.l];
+  layer.style.padding = ['t', 'r', 'b', 'l']
+    .map((k) => `${pptxR(Math.max(0, pptxNum(inset[k], /** @type {any} */ (PPTX_DEFAULT_INSET)[k])) + Math.max(0, off[k]))}pt`)
+    .join(' ');
   if (el.wrap === false) layer.classList.add('pptx-nowrap');
   if (el.isVertical === true) layer.classList.add('pptx-vertical');
-  // PowerPoint turns the text of a vertically flipped shape upside down; a horizontal flip leaves it readable.
-  if (place.flipV) layer.style.transform = 'rotate(180deg)';
+  // PowerPoint turns the text of a vertically flipped shape upside down (a horizontal flip leaves it readable);
+  // 270° vertical text (bodyPr vert270) is vertical text turned upside down.
+  if (place.flipV !== (el.vert270 === true)) layer.style.transform = 'rotate(180deg)';
   const body = h('div', { class: 'pptx-text-body' });
   body.innerHTML = sanitize(html, DOCX_SANITIZE_OPTIONS);
   pptxFixText(body);
@@ -11776,7 +12182,8 @@ function pptxTextLayer(el, place) {
  * @param {string} html
  */
 function pptxHasText(html) {
-  return /\S/.test(html.replace(/<[^>]*>/g, '').replace(/&nbsp;|&#160;|&#xa0;| /gi, ' '));
+  // A zero-width space is the text of an empty paragraph (pptx.ts sizes it like PowerPoint).
+  return /\S/.test(html.replace(/<[^>]*>/g, '').split(String.fromCharCode(0x200b)).join('').replace(/&nbsp;|&#160;|&#xa0;| /gi, ' '));
 }
 
 /**
@@ -11794,6 +12201,34 @@ function pptxFixText(scope) {
     const style = /** @type {HTMLElement} */ (el).style;
     if (style && style.fontFamily) style.fontFamily = pptxFontStack(style.fontFamily);
   });
+  scope.querySelectorAll('p').forEach((p) => {
+    // The line box of a paragraph is as tall as its largest run (pptxtojson sizes the runs only; the slide's 18pt
+    // would otherwise be the smallest line height).
+    let size = 0;
+    p.querySelectorAll('span').forEach((span) => {
+      size = Math.max(size, pptxPt(/** @type {HTMLElement} */ (span).style.fontSize));
+    });
+    if (size > 0) p.style.fontSize = `${pptxR(size)}pt`;
+    // The bullet hangs at marL + indent (never left of the text box) and the text starts at marL.
+    const bullet = p.querySelector('.pptx-bullet');
+    if (bullet instanceof HTMLElement) {
+      const indent = pptxPt(p.style.textIndent);
+      if (indent < 0 && pptxPt(p.style.marginLeft) + indent < 0) p.style.marginLeft = `${pptxR(-indent)}pt`;
+      if (indent < 0) bullet.style.minWidth = `${pptxR(-indent)}pt`;
+      else bullet.style.paddingRight = '0.3em';
+    }
+  });
+}
+
+/**
+ * A CSS length of pptxtojson's HTML in points (pt or px; 0 for anything else).
+ * @param {string} value
+ */
+function pptxPt(value) {
+  const m = /^(-?[\d.]+)(pt|px)$/.exec(String(value || '').trim());
+  if (!m) return 0;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? (m[2] === 'px' ? n * 0.75 : n) : 0;
 }
 
 /**
@@ -11949,6 +12384,8 @@ function pptxBuildTable(el, mirror) {
         const css = pptxCssBorder(border);
         if (css) /** @type {any} */ (td.style)[prop] = css;
       }
+      const margin = cell.margin && typeof cell.margin === 'object' ? cell.margin : null;
+      if (margin) td.style.padding = ['t', 'r', 'b', 'l'].map((k) => `${pptxR(Math.max(0, pptxNum(margin[k])))}pt`).join(' ');
       const text = h('div', { class: 'pptx-cell-text' });
       text.innerHTML = sanitize(typeof cell.text === 'string' ? cell.text : '', DOCX_SANITIZE_OPTIONS);
       pptxFixText(text);
@@ -12067,7 +12504,8 @@ function pptxBuildChart(el, ctx, mirror) {
     box.appendChild(pptxChartPlaceholder(el, !ctx.thumb, ctx.thumb));
     return box;
   }
-  const host = h('div', { class: 'pptx-chart-host', role: 'img', 'aria-label': pptxChartName(el) }, h('span', { class: 'pptx-chart-loading' }, 'Loading chart…'));
+  const chartTitle = typeof el.title === 'string' ? el.title.replace(/\s+/g, ' ').trim() : '';
+  const host = h('div', { class: 'pptx-chart-host', role: 'img', 'aria-label': chartTitle ? `${pptxChartName(el)}: ${chartTitle}` : pptxChartName(el) }, h('span', { class: 'pptx-chart-loading' }, 'Loading chart…'));
   box.appendChild(host);
   ctx.charts.push({ el, host, kind, width: place.width * PPTX_PX_PER_PT, height: place.height * PPTX_PX_PER_PT, dark: ctx.dark });
   return box;
@@ -12203,35 +12641,110 @@ function pptxChartOption(job) {
   /** @param {number} i */
   const colorAt = (i) => pptxColor(chartColors[i]) || basePalette[i % basePalette.length];
   const data = Array.isArray(el.data) ? el.data : [];
-  const textStyle = { color: fg, fontSize: 13, fontFamily: PPTX_SANS_FALLBACK };
+  // Chart settings read from the chart part (PptxChartExtras); a chart without them keeps the defaults.
+  const fontPt = pptxNum(el.fontSize);
+  const fontPx = fontPt > 0 ? pptxR(clamp(fontPt, 4, 72) * PPTX_PX_PER_PT) : 0;
+  const textStyle = { color: fg, fontSize: fontPx || 13, fontFamily: PPTX_SANS_FALLBACK };
   const option = /** @type {Record<string, any>} */ ({
     animation: false,
     textStyle,
     tooltip: { trigger: 'item', confine: true },
   });
-  const legend = { bottom: 4, textStyle: { color: fg, fontSize: 12 }, icon: 'rect', itemWidth: 10, itemHeight: 10 };
-  const grid = (/** @type {boolean} */ withLegend) => ({ left: 12, right: 16, top: 16, bottom: withLegend ? 36 : 12, containLabel: true });
-  const valueAxis = (/** @type {boolean} */ percent) => ({
+  const title = typeof el.title === 'string' ? el.title.trim() : '';
+  const titlePt = pptxNum(el.titleSize);
+  const titlePx = titlePt > 0 ? pptxR(clamp(titlePt, 4, 96) * PPTX_PX_PER_PT) : pptxR((fontPx || 13) * 1.2);
+  const titleH = title ? Math.ceil(titlePx * 1.3 * title.split('\n').length) + 10 : 0;
+  if (title) option.title = { text: title, left: 'center', top: 6, textStyle: { color: fg, fontSize: titlePx, fontWeight: 'normal' } };
+  const legendPos = typeof el.legend === 'string' ? el.legend : '';
+  const legendFont = fontPx || 12;
+  const legend = { textStyle: { color: fg, fontSize: legendFont }, icon: 'rect', itemWidth: 10, itemHeight: 10 };
+  /**
+   * Legend of the chart (null: none) and the room it takes: PowerPoint's position when the chart part gives one,
+   * else at the bottom when there is more than one series.
+   * @param {string[]} names
+   * @param {boolean} many
+   */
+  const legendFor = (names, many) => {
+    if (legendPos === 'none' || (!legendPos && !many)) return null;
+    const pos = legendPos || 'b';
+    const vertical = pos === 'l' || pos === 'r' || pos === 'tr';
+    const longest = Math.max(0, ...names.map((n) => String(n).length));
+    const width = Math.ceil(26 + longest * legendFont * 0.55);
+    /** @type {Record<string, any>} */
+    const box = { ...legend, data: names };
+    if (pos === 't') Object.assign(box, { top: titleH + 4 });
+    else if (pos === 'b') Object.assign(box, { bottom: 4 });
+    else Object.assign(box, { orient: 'vertical', top: pos === 'tr' ? titleH + 4 : 'middle', [pos === 'l' ? 'left' : 'right']: 8 });
+    const room = vertical ? { side: pos === 'l' ? 'left' : 'right', size: width + 8 } : { side: pos === 't' ? 'top' : 'bottom', size: Math.ceil(legendFont * 1.4) + 14 };
+    return { box, room };
+  };
+  /** @param {{ box: any, room: { side: string, size: number } } | null} withLegend */
+  const gridFor = (withLegend) => {
+    /** @type {Record<string, any>} */
+    const g = { left: 12, right: 16, top: 16 + titleH, bottom: 12, containLabel: true };
+    if (withLegend) g[withLegend.room.side] += withLegend.room.size;
+    return g;
+  };
+  const gridlines = el.gridlines !== false;
+  /**
+   * @param {boolean} percent
+   * @param {unknown} [format] Excel number format code of the axis
+   */
+  const valueAxis = (percent, format) => ({
     type: 'value',
     max: percent ? 100 : undefined,
-    axisLabel: { color: fg, formatter: percent ? '{value}%' : undefined },
+    axisLabel: { color: fg, fontSize: fontPx || undefined, formatter: percent ? '{value}%' : pptxNumberFormatter(format) },
     axisLine: { show: false },
-    splitLine: { lineStyle: { color: gridColor } },
+    splitLine: { show: gridlines, lineStyle: { color: gridColor } },
   });
+  const dataLabels = Array.isArray(el.dataLabels) ? el.dataLabels : [];
+  /**
+   * Data labels of series `i` (PptxDataLabels), as an echarts label; undefined when the series shows none.
+   * @param {number} i
+   * @param {string} position
+   * @param {(p: any) => number} valueOf the point's own value (before percent stacking)
+   * @param {string} seriesName
+   */
+  const labelFor = (i, position, valueOf, seriesName) => {
+    const spec = dataLabels[i];
+    if (!spec || typeof spec !== 'object') return undefined;
+    const format = pptxNumberFormatter(spec.format) ?? ((/** @type {number} */ v) => String(pptxR(v, 1e6)));
+    return {
+      show: true,
+      position,
+      color: fg,
+      fontSize: fontPx || 12,
+      formatter: (/** @type {any} */ p) => {
+        const parts = [];
+        if (spec.series) parts.push(seriesName);
+        if (spec.category) parts.push(String(p.name ?? ''));
+        if (spec.value) {
+          const v = valueOf(p);
+          if (Number.isFinite(v)) parts.push(format(v));
+        }
+        if (spec.percent && Number.isFinite(p.percent)) parts.push(`${Math.round(p.percent)}%`);
+        return parts.join(', ');
+      },
+    };
+  };
 
   if (job.kind === 'pie' || job.kind === 'doughnut') {
     const series = data[0];
     const categories = pptxChartCategories(data);
     const values = Array.isArray(series?.values) ? series.values : [];
     const hole = clamp(parseFloat(String(el.holeSize)) || 50, 10, 90);
-    option.legend = { ...legend, data: categories };
+    const pieLegend = legendFor(categories, true);
+    if (pieLegend) option.legend = pieLegend.box;
+    const side = pieLegend?.room.side;
+    const radius = title || side === 'top' ? 62 : 70;
+    const name = pptxSeriesName(series, 0);
     option.series = [
       {
         type: 'pie',
-        name: pptxSeriesName(series, 0),
-        radius: job.kind === 'doughnut' ? [`${pptxR((70 * hole) / 100)}%`, '70%'] : '70%',
-        center: ['50%', '46%'],
-        label: { show: false },
+        name,
+        radius: job.kind === 'doughnut' ? [`${pptxR((radius * hole) / 100)}%`, `${radius}%`] : `${radius}%`,
+        center: [side === 'right' ? '42%' : side === 'left' ? '58%' : '50%', side === 'top' || title ? '54%' : '46%'],
+        label: labelFor(0, 'inside', (p) => Number(p.value), name) ?? { show: false },
         itemStyle: { borderColor: job.dark ? '#262626' : '#FFFFFF', borderWidth: 1 },
         data: values.map((/** @type {any} */ v, /** @type {number} */ i) => ({
           name: categories[i] ?? String(i + 1),
@@ -12245,17 +12758,26 @@ function pptxChartOption(job) {
 
   if (job.kind === 'scatter') {
     const xs = Array.isArray(data[0]) ? data[0] : [];
-    const series = data.slice(1).map((ys, i) => ({
-      type: 'scatter',
-      name: data.length > 2 ? `Series ${i + 1}` : 'Series 1',
-      symbolSize: 8,
-      itemStyle: { color: colorAt(i) },
-      data: xs.map((/** @type {number} */ x, /** @type {number} */ j) => [x, Array.isArray(ys) ? ys[j] : null]),
-    }));
-    if (series.length > 1) option.legend = legend;
-    option.grid = grid(series.length > 1);
+    const names = Array.isArray(el.seriesNames) ? el.seriesNames : [];
+    const series = data.slice(1).map((ys, i) => {
+      const name = typeof names[i] === 'string' && names[i].trim() ? names[i] : data.length > 2 ? `Series ${i + 1}` : 'Series 1';
+      return {
+        type: 'scatter',
+        name,
+        symbolSize: 8,
+        itemStyle: { color: colorAt(i) },
+        label: labelFor(i, 'right', (p) => Number(Array.isArray(p.value) ? p.value[1] : p.value), name),
+        data: xs.map((/** @type {number} */ x, /** @type {number} */ j) => [x, Array.isArray(ys) ? ys[j] : null]),
+      };
+    });
+    const scatterLegend = legendFor(
+      series.map((s) => s.name),
+      series.length > 1,
+    );
+    if (scatterLegend) option.legend = scatterLegend.box;
+    option.grid = gridFor(scatterLegend);
     option.xAxis = { ...valueAxis(false), axisLine: { show: true, lineStyle: { color: axisColor } } };
-    option.yAxis = valueAxis(false);
+    option.yAxis = valueAxis(false, el.valueFormat);
     option.series = series;
     return option;
   }
@@ -12269,35 +12791,160 @@ function pptxChartOption(job) {
   const rows = data.map((series) =>
     (Array.isArray(series?.values) ? series.values : []).map((/** @type {any} */ v) => (Number.isFinite(v?.y) ? v.y : null)),
   );
+  const raw = rows.map((row) => row.slice());
   if (percent) {
     const totals = categories.map((_, c) => rows.reduce((sum, row) => sum + Math.abs(row[c] ?? 0), 0));
     rows.forEach((row) => row.forEach((v, c) => (row[c] = v === null || !totals[c] ? v : pptxR((v / totals[c]) * 100, 100))));
   }
   const horizontal = job.kind === 'bar' && el.barDir === 'bar';
+  // A combo chart (PptxChartExtras.seriesTypes): each series keeps its own plot type and value axis.
+  const seriesTypes = Array.isArray(el.seriesTypes) ? el.seriesTypes : [];
+  const secondaryOf = Array.isArray(el.secondary) ? el.secondary : [];
+  const kindOf = (/** @type {number} */ i) => (typeof seriesTypes[i] === 'string' ? pptxChartKind({ chartType: seriesTypes[i] }) : '') || job.kind;
+  const kinds = data.map((_, i) => kindOf(i));
+  const hasSecondary = data.some((_, i) => secondaryOf[i] === true);
   // Like PowerPoint: bar and line points sit between the tick marks, area charts reach the plot edges.
-  const edgeToEdge = job.kind === 'area';
+  const edgeToEdge = kinds.length > 0 && kinds.every((k) => k === 'area');
   const categoryAxis = {
     type: 'category',
     data: categories,
     boundaryGap: !edgeToEdge,
     axisLine: { lineStyle: { color: axisColor } },
     axisTick: { show: false },
-    axisLabel: { color: fg },
+    axisLabel: { color: fg, fontSize: fontPx || undefined },
   };
-  option.legend = data.length > 1 ? legend : undefined;
+  const names = data.map((series, i) => pptxSeriesName(series, i));
+  // Horizontal bars: PowerPoint lists the legend in reverse too (Series 3, 2, 1), like the bars from the top.
+  const barLegend = legendFor(horizontal ? [...names].reverse() : names, data.length > 1);
+  if (barLegend) option.legend = barLegend.box;
   // The last category label of an edge-to-edge axis is centred on the plot's right edge: leave room for it.
-  option.grid = { ...grid(data.length > 1), right: edgeToEdge ? 40 : 16 };
-  option.xAxis = horizontal ? valueAxis(percent) : categoryAxis;
-  option.yAxis = horizontal ? categoryAxis : valueAxis(percent);
-  option.series = data.map((series, i) => {
-    const base = { name: pptxSeriesName(series, i), data: rows[i], stack: stacked ? 'total' : undefined, itemStyle: { color: colorAt(i) } };
-    if (job.kind === 'bar') return { ...base, type: 'bar', barMaxWidth: 64 };
-    if (job.kind === 'area') {
+  const plotGrid = gridFor(barLegend);
+  if (edgeToEdge && !(barLegend && barLegend.room.side === 'right')) plotGrid.right = 40;
+  option.grid = plotGrid;
+  const valueAxes = [valueAxis(percent, el.valueFormat)];
+  if (hasSecondary) valueAxes.push({ ...valueAxis(false, el.valueFormat2), splitLine: { show: false, lineStyle: { color: gridColor } } });
+  option.xAxis = horizontal ? valueAxes : categoryAxis;
+  option.yAxis = horizontal ? categoryAxis : valueAxes;
+  const series = data.map((_, i) => {
+    const kind = kinds[i];
+    const secondary = secondaryOf[i] === true;
+    const label = labelFor(
+      i,
+      kind === 'bar' ? (stacked ? 'inside' : horizontal ? 'right' : 'top') : 'top',
+      (p) => Number(raw[i]?.[p.dataIndex]),
+      names[i],
+    );
+    const base = {
+      name: names[i],
+      data: rows[i],
+      stack: stacked ? `total-${kind}-${secondary ? 2 : 1}` : undefined,
+      itemStyle: { color: colorAt(i) },
+      label,
+      [horizontal ? 'xAxisIndex' : 'yAxisIndex']: secondary ? 1 : 0,
+    };
+    if (kind === 'bar') return { ...base, type: 'bar', barMaxWidth: 64 };
+    if (kind === 'area') {
       return { ...base, type: 'line', showSymbol: false, lineStyle: { width: 1, color: colorAt(i) }, areaStyle: { color: colorAt(i), opacity: stacked ? 1 : 0.85 } };
     }
-    return { ...base, type: 'line', showSymbol: el.marker === true, symbolSize: 7, lineStyle: { width: 3, color: colorAt(i) } };
+    return { ...base, type: 'line', showSymbol: el.marker === true || !!label, symbolSize: 7, lineStyle: { width: 3, color: colorAt(i) } };
   });
+  // Horizontal bars: PowerPoint puts series 1 nearest the category axis (lowest in each group); echarts draws the
+  // series of a vertical category axis top-down, so they are given in reverse.
+  option.series = horizontal ? series.reverse() : series;
   return option;
+}
+
+/**
+ * Formatter for an Excel number format code ('"₹"#,##0.00', '0%', '0.0,"K"', …) as chart axes and data labels use
+ * them: literal text, currency, percent, decimals, thousands separators and scaling. Dates and other codes fall back
+ * to the plain number. Undefined for General / no format.
+ * @param {unknown} code
+ * @returns {((value: number) => string) | undefined}
+ */
+function pptxNumberFormatter(code) {
+  if (typeof code !== 'string' || !code.trim() || /^general$/i.test(code.trim())) return undefined;
+  /** @type {string[]} */
+  const sections = [''];
+  for (const m of code.matchAll(/"[^"]*"|\\.|\[[^\]]*\]|;|[^"\\[;]+/g)) {
+    if (m[0] === ';') sections.push('');
+    else sections[sections.length - 1] += m[0];
+  }
+  /**
+   * @param {string} section
+   * @returns {((abs: number) => string) | null}
+   */
+  const compile = (section) => {
+    let prefix = '';
+    let suffix = '';
+    let integer = '';
+    let fraction = '';
+    let inFraction = false;
+    let seenDigit = false;
+    let percent = 0;
+    let scale = 0;
+    let date = false;
+    for (const m of section.matchAll(/"([^"]*)"|\\(.)|\[\$([^\]-]*)[^\]]*\]|\[[^\]]*\]|_.|\*.|([0#?])|(\.)|(,)|(%)|([eE][+-])|(.)/gu)) {
+      const [, quoted, escaped, currency, digit, dot, comma, pct, exp, other] = m;
+      /** @type {string | undefined} */
+      let literal = quoted ?? escaped ?? currency;
+      if (digit) {
+        if (inFraction) fraction += digit;
+        else integer += digit;
+        seenDigit = true;
+        suffix = '';
+        scale = 0;
+        continue;
+      }
+      if (dot && !inFraction) {
+        inFraction = true;
+        seenDigit = true;
+        continue;
+      }
+      if (comma) {
+        // Between digits: thousands separator; after the last digit: divides by 1000 (counted in `scale`).
+        if (seenDigit && !inFraction) integer += ',';
+        if (seenDigit) scale++;
+        continue;
+      }
+      if (pct) {
+        percent++;
+        literal = '%';
+      }
+      if (exp) return null;
+      if (other !== undefined) {
+        if (/[ymdhsAa]/.test(other)) date = true;
+        literal = other;
+      }
+      if (m[0].startsWith('_')) literal = ' ';
+      if (literal === undefined) continue;
+      if (seenDigit) suffix += literal;
+      else prefix += literal;
+    }
+    if (date || (!integer && !fraction && !seenDigit)) return date ? null : () => `${prefix}${suffix}`;
+    const grouped = /[0#?],[0#?]/.test(integer);
+    const minInt = (integer.replace(/,/g, '').match(/0/g) ?? []).length;
+    const maxDec = fraction.length;
+    const minDec = (fraction.match(/0/g) ?? []).length;
+    return (abs) => {
+      const value = (abs * 100 ** percent) / 1000 ** scale;
+      let [int, dec = ''] = value.toFixed(maxDec).split('.');
+      while (dec.length > minDec && dec.endsWith('0')) dec = dec.slice(0, -1);
+      if (int === '0' && minInt === 0) int = '';
+      else if (int.length < minInt) int = int.padStart(minInt, '0');
+      if (grouped) int = int.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+      return `${prefix}${int}${dec ? `.${dec}` : ''}${suffix}`;
+    };
+  };
+  const positive = compile(sections[0]);
+  const negative = sections.length > 1 && sections[1] !== '' ? compile(sections[1]) : null;
+  const zero = sections.length > 2 && sections[2] !== '' ? compile(sections[2]) : null;
+  if (!positive) return undefined;
+  return (value) => {
+    if (!Number.isFinite(value)) return '';
+    if (value === 0 && zero) return zero(0);
+    if (value < 0) return negative ? negative(-value) : `-${positive(-value)}`;
+    return positive(value);
+  };
 }
 
 // ----- PPTX: VALUES -----

@@ -1,8 +1,8 @@
 {
   "name": "filestudio",
-  "displayName": "FileStudio - Universal File Viewer & Editor",
-  "description": "View and edit common document, spreadsheet, and presentation files directly in VS Code.",
-  "version": "0.1.1",
+  "displayName": "FileStudio – Excel, CSV, Word, PDF & PowerPoint Viewer",
+  "description": "Open and preview Excel (.xlsx), CSV, Word (.docx), PDF, PowerPoint (.pptx) and Markdown files in VS Code. Fast, offline and private: no Office needed.",
+  "version": "0.1.2",
   "publisher": "Yokeeswaran",
   "repository": {
     "type": "git",
@@ -14,27 +14,44 @@
   "homepage": "https://github.com/yokeeswaran-dev/vscode-filestudio",
   "license": "MIT",
   "icon": "assets/icon.png",
+  "galleryBanner": {
+    "color": "#1E2533",
+    "theme": "dark"
+  },
   "engines": {
-    "vscode": "^1.90.0"
+    "vscode": "^1.123.0"
   },
   "categories": [
+    "Visualization",
+    "Data Science",
     "Other"
   ],
   "keywords": [
-    "xlsx",
     "excel",
+    "xlsx",
+    "spreadsheet",
+    "sheet",
     "csv",
     "tsv",
     "psv",
     "ssv",
-    "spreadsheet",
-    "docx",
     "word",
+    "docx",
+    "doc",
     "pdf",
-    "pptx",
     "powerpoint",
+    "pptx",
+    "ppt",
+    "slides",
+    "presentation",
     "markdown",
-    "viewer"
+    "preview",
+    "viewer",
+    "reader",
+    "office",
+    "document",
+    "table",
+    "data"
   ],
   "main": "./dist/extension.js",
   "activationEvents": [],
@@ -49,18 +66,31 @@
         "viewType": "fileStudio.sheet",
         "displayName": "FileStudio: Spreadsheet",
         "selector": [
-          { "filenamePattern": "*.xlsx" }
+          {
+            "filenamePattern": "*.xlsx"
+          }
         ],
-        "priority": "default"
+        "priority": {
+          "textEditor": "default",
+          "diffEditor": "default"
+        }
       },
       {
         "viewType": "fileStudio.csv",
         "displayName": "FileStudio: CSV",
         "selector": [
-          { "filenamePattern": "*.csv" },
-          { "filenamePattern": "*.tsv" },
-          { "filenamePattern": "*.psv" },
-          { "filenamePattern": "*.ssv" }
+          {
+            "filenamePattern": "*.csv"
+          },
+          {
+            "filenamePattern": "*.tsv"
+          },
+          {
+            "filenamePattern": "*.psv"
+          },
+          {
+            "filenamePattern": "*.ssv"
+          }
         ],
         "priority": "default"
       },
@@ -68,8 +98,12 @@
         "viewType": "fileStudio.markdown",
         "displayName": "FileStudio: Markdown",
         "selector": [
-          { "filenamePattern": "*.md" },
-          { "filenamePattern": "*.markdown" }
+          {
+            "filenamePattern": "*.md"
+          },
+          {
+            "filenamePattern": "*.markdown"
+          }
         ],
         "priority": "option"
       },
@@ -77,25 +111,55 @@
         "viewType": "fileStudio.docx",
         "displayName": "FileStudio: Word Document",
         "selector": [
-          { "filenamePattern": "*.docx" }
+          {
+            "filenamePattern": "*.docx"
+          }
         ],
-        "priority": "default"
+        "priority": {
+          "textEditor": "default",
+          "diffEditor": "default"
+        }
       },
       {
         "viewType": "fileStudio.pdf",
         "displayName": "FileStudio: PDF",
         "selector": [
-          { "filenamePattern": "*.pdf" }
+          {
+            "filenamePattern": "*.pdf"
+          }
         ],
-        "priority": "default"
+        "priority": {
+          "textEditor": "default",
+          "diffEditor": "default"
+        }
       },
       {
         "viewType": "fileStudio.pptx",
         "displayName": "FileStudio: Presentation",
         "selector": [
-          { "filenamePattern": "*.pptx" }
+          {
+            "filenamePattern": "*.pptx"
+          },
+          {
+            "filenamePattern": "*.pptm"
+          },
+          {
+            "filenamePattern": "*.ppsx"
+          },
+          {
+            "filenamePattern": "*.ppsm"
+          },
+          {
+            "filenamePattern": "*.potx"
+          },
+          {
+            "filenamePattern": "*.potm"
+          }
         ],
-        "priority": "default"
+        "priority": {
+          "textEditor": "default",
+          "diffEditor": "default"
+        }
       }
     ],
     "commands": [
@@ -110,36 +174,50 @@
         "title": "Reopen as Text",
         "category": "FileStudio",
         "icon": "$(go-to-file)"
+      },
+      {
+        "command": "fileStudio.changeDelimiter",
+        "title": "Change Delimiter",
+        "category": "FileStudio"
       }
     ],
     "menus": {
       "explorer/context": [
         {
           "command": "fileStudio.openWith",
-          "when": "resourceExtname =~ /^\\.(xlsx|csv|tsv|psv|ssv|md|markdown|docx|pdf|pptx)$/i",
+          "when": "resourceExtname =~ /^\\.(xlsx|csv|tsv|psv|ssv|md|markdown|docx|pdf|pptx|pptm|ppsx|ppsm|potx|potm)$/i && !explorerResourceIsFolder",
           "group": "navigation@20"
         }
       ],
       "editor/title": [
         {
           "command": "fileStudio.openWith",
-          "when": "resourceExtname =~ /^\\.(xlsx|csv|tsv|psv|ssv|md|markdown|docx|pdf|pptx)$/i && activeCustomEditorId != fileStudio.sheet && activeCustomEditorId != fileStudio.csv && activeCustomEditorId != fileStudio.markdown && activeCustomEditorId != fileStudio.docx && activeCustomEditorId != fileStudio.pdf && activeCustomEditorId != fileStudio.pptx",
+          "when": "resourceExtname =~ /^\\.(xlsx|csv|tsv|psv|ssv|md|markdown|docx|pdf|pptx|pptm|ppsx|ppsm|potx|potm)$/i && activeCustomEditorId != fileStudio.sheet && activeCustomEditorId != fileStudio.csv && activeCustomEditorId != fileStudio.markdown && activeCustomEditorId != fileStudio.docx && activeCustomEditorId != fileStudio.pdf && activeCustomEditorId != fileStudio.pptx",
           "group": "navigation@20"
         },
         {
           "command": "fileStudio.reopenAsText",
           "when": "activeCustomEditorId == fileStudio.csv || activeCustomEditorId == fileStudio.markdown",
           "group": "navigation@21"
+        },
+        {
+          "command": "fileStudio.changeDelimiter",
+          "when": "activeCustomEditorId == fileStudio.csv",
+          "group": "1_fileStudio@1"
         }
       ],
       "commandPalette": [
         {
           "command": "fileStudio.openWith",
-          "when": "resourceExtname =~ /^\\.(xlsx|csv|tsv|psv|ssv|md|markdown|docx|pdf|pptx)$/i"
+          "when": "resourceExtname =~ /^\\.(xlsx|csv|tsv|psv|ssv|md|markdown|docx|pdf|pptx|pptm|ppsx|ppsm|potx|potm)$/i"
         },
         {
           "command": "fileStudio.reopenAsText",
           "when": "activeCustomEditorId == fileStudio.csv || activeCustomEditorId == fileStudio.markdown"
+        },
+        {
+          "command": "fileStudio.changeDelimiter",
+          "when": "activeCustomEditorId == fileStudio.csv"
         }
       ]
     },
@@ -153,15 +231,20 @@
             "split",
             "wysiwyg"
           ],
+          "enumDescriptions": [
+            "Rendered preview.",
+            "Planned for 0.2.0. For now the same as preview.",
+            "Planned for 0.2.0 (editing). For now the same as preview."
+          ],
           "default": "preview",
           "scope": "resource",
-          "description": "Mode used when a Markdown file is opened with FileStudio."
+          "description": "Mode used when a Markdown file is opened with FileStudio. Only preview is available in this release; split and wysiwyg arrive in 0.2.0."
         },
         "fileStudio.xlsx.backupOnSave": {
           "type": "boolean",
           "default": true,
           "scope": "resource",
-          "description": "Write <name>.xlsx.bak (once) before the first save of a workbook."
+          "description": "Used from 0.2.0 (editing): write <name>.xlsx.bak (once) before the first save of a workbook. This release is view-only and never saves a workbook."
         }
       }
     }
