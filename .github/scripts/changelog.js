@@ -1,10 +1,10 @@
-// CHANGELOG.md helper for the Release workflow (.github/workflows/release.yml). The file follows Keep a Changelog.
+// CHANGELOG.md helper, used by `node .github/scripts/release.js prepare`. The file follows Keep a Changelog.
 //
 //   node .github/scripts/changelog.js release <version> <yyyy-mm-dd>
 //       Moves the entries under "## [Unreleased]" into a new "## [<version>] - <date>" section and updates the
 //       compare links at the bottom of the file.
 //   node .github/scripts/changelog.js notes <version>
-//       Prints the "## [<version>]" section (used as the GitHub release notes).
+//       Prints the "## [<version>]" section (for example as GitHub release notes).
 'use strict';
 
 const fs = require('fs');
@@ -25,10 +25,32 @@ function fail(message) {
 
 const escapeRe = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-/** Start of the next "## [" heading or of the link definitions after `from` (the end of a section). */
+/**
+ * Start of the next "## [" heading or of the version compare links ("[Unreleased]: ...", "[1.2.3]: ...") after
+ * `from` (the end of a section). Other link definitions (for example "[#12]: ...") belong to the section.
+ */
 function sectionEnd(text, from) {
-  const next = text.slice(from).search(/^## \[|^\[[^\]]+\]: /m);
+  const next = text.slice(from).search(/^## \[|^\[(?:Unreleased|\d+\.\d+\.\d+)\]: /m);
   return next < 0 ? text.length : from + next;
+}
+
+/** Removes headings ("### Added", "#### General", ...) with no entries before the next heading of their level. */
+function dropEmptyHeadings(notes) {
+  const level = (line) => /^(#{3,6}) /.exec(line)?.[1].length ?? 0;
+  let lines = notes.split('\n');
+  for (let changed = true; changed; ) {
+    changed = false;
+    lines = lines.filter((line, i) => {
+      const own = level(line);
+      if (!own) return true;
+      let next = i + 1;
+      while (next < lines.length && !lines[next].trim()) next++;
+      const empty = next === lines.length || (level(lines[next]) > 0 && level(lines[next]) <= own);
+      if (empty) changed = true;
+      return !empty;
+    });
+  }
+  return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function release(version, date) {
@@ -41,9 +63,9 @@ function release(version, date) {
   if (start < 0) fail(`CHANGELOG.md has no "${UNRELEASED_HEADER}" section.`);
   const bodyStart = start + UNRELEASED_HEADER.length;
   const end = sectionEnd(text, bodyStart);
-  let notes = text.slice(bodyStart, end).trim();
+  let notes = dropEmptyHeadings(text.slice(bodyStart, end).trim());
   if (!notes) {
-    console.log('::warning::The [Unreleased] section of CHANGELOG.md is empty; the release notes say "Maintenance release".');
+    console.log('::warning::The [Unreleased] section of CHANGELOG.md has no entries; the release notes say "Maintenance release".');
     notes = EMPTY_NOTES;
   }
   text = `${text.slice(0, start)}${UNRELEASED_HEADER}\n\n## [${version}] - ${date}\n\n${notes}\n\n${text.slice(end).replace(/^\n+/, '')}`;
