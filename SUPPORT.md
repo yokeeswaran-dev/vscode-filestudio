@@ -7,7 +7,7 @@ Thank you for using FileStudio! Here is where to get help.
 - Read the **[README](README.md)**, especially [Getting started](README.md#getting-started) and
   [Known limitations](README.md#known-limitations). Some things are not supported yet, for example editing
   (planned for 0.2.0) or charts in `.xlsx` files.
-- Make sure you use the **latest version** of FileStudio and VS Code 1.90 or later.
+- Make sure you use the **latest version** of FileStudio and VS Code 1.123 or later.
 - **Search the [existing issues](https://github.com/yokeeswaran-dev/vscode-filestudio/issues?q=is%3Aissue)**
   (open and closed). Someone may already have reported the same thing.
 

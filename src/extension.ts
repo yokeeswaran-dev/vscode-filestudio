@@ -1,4 +1,4 @@
-// FileStudio extension entry point: registers the six custom editors, the two commands and the fallback for
+// FileStudio extension entry point: registers the six custom editors, the three commands and the fallback for
 // text files VS Code cannot pass to a custom editor (too large, binary). All viewer logic lives in viewerProvider.ts.
 
 import * as vscode from 'vscode';
@@ -9,6 +9,7 @@ import {
   SheetEditorProvider,
   TextViewerProvider,
   VIEW_TYPES,
+  changeDelimiter,
   disposeLog,
   fileNameOf,
   getLog,
@@ -24,7 +25,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.window.registerCustomEditorProvider(VIEW_TYPES.sheet, new SheetEditorProvider(context.extensionUri), {
       webviewOptions,
-      supportsMultipleEditorsPerDocument: false,
+      supportsMultipleEditorsPerDocument: true,
     }),
     vscode.window.registerCustomEditorProvider(VIEW_TYPES.csv, new TextViewerProvider(context.extensionUri, 'csv'), {
       webviewOptions,
@@ -49,6 +50,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand('fileStudio.openWith', openWithFileStudio),
     vscode.commands.registerCommand('fileStudio.reopenAsText', reopenActiveAsText),
+    vscode.commands.registerCommand('fileStudio.changeDelimiter', changeActiveDelimiter),
     // CSV/Markdown files VS Code does not pass to extensions as text (over its 50 MB limit, or binary) cannot open in a
     // custom text editor: use the text editor.
     watchUnreadableTextTabs(),
@@ -63,7 +65,7 @@ export function deactivate(): void {
 
 // ===== COMMANDS =====
 
-const SUPPORTED_FILES = '.xlsx, .csv, .tsv, .psv, .ssv, .md, .markdown, .docx, .pdf and .pptx';
+const SUPPORTED_FILES = '.xlsx, .csv, .tsv, .psv, .ssv, .md, .markdown, .docx, .pdf, .pptx, .pptm, .ppsx, .ppsm, .potx and .potm';
 
 /** URI of the resource in the active editor tab (text, custom, notebook or the modified side of a diff). */
 function activeResourceUri(): vscode.Uri | undefined {
@@ -98,6 +100,15 @@ async function openWithFileStudio(arg?: unknown, selection?: unknown): Promise<v
     return;
   }
 
+  // From the palette or the editor title on a text tab of the file: replace that tab, like "Reopen Editor With".
+  const group = vscode.window.tabGroups.activeTabGroup;
+  const activeInput = group.activeTab?.input;
+  const replaceText =
+    !Array.isArray(selection) &&
+    uris.length === 1 &&
+    activeInput instanceof vscode.TabInputText &&
+    activeInput.uri.toString() === uris[0].toString();
+
   for (const uri of uris) {
     const viewType = viewTypeForUri(uri);
     if (!viewType) {
@@ -107,11 +118,26 @@ async function openWithFileStudio(arg?: unknown, selection?: unknown): Promise<v
     try {
       // Several files: open them as regular (non-preview) tabs so they do not replace each other.
       await vscode.commands.executeCommand('vscode.openWith', uri, viewType, uris.length > 1 ? { preview: false } : undefined);
+      if (replaceText) await closeTextTabs(group, uri);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       getLog().error(`Could not open ${uri.toString(true)} with ${viewType}: ${message}`);
       void vscode.window.showErrorMessage(`FileStudio could not open "${fileNameOf(uri)}": ${message}`);
     }
+  }
+}
+
+/** Closes the text tabs of `uri` in `group`, except unsaved ones (their changes must not be lost). */
+async function closeTextTabs(group: vscode.TabGroup, uri: vscode.Uri): Promise<void> {
+  const stale = group.tabs.filter(
+    (tab) => tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString() && !tab.isDirty,
+  );
+  if (stale.length === 0) return;
+  try {
+    await vscode.window.tabGroups.close(stale, true);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    getLog().error(`Could not close the text tab of ${uri.toString(true)}: ${message}`);
   }
 }
 
@@ -130,4 +156,20 @@ async function reopenActiveAsText(arg?: unknown): Promise<void> {
     getLog().error(`Could not reopen ${uri.toString(true)} as text: ${message}`);
     void vscode.window.showErrorMessage(`FileStudio could not reopen "${fileNameOf(uri)}" as text: ${message}`);
   }
+}
+
+/** `fileStudio.changeDelimiter`: the uri comes from the editor title menu, else from the active CSV view tab. */
+async function changeActiveDelimiter(arg?: unknown): Promise<void> {
+  const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+  const uri =
+    arg instanceof vscode.Uri
+      ? arg
+      : input instanceof vscode.TabInputCustom && input.viewType === VIEW_TYPES.csv
+        ? input.uri
+        : undefined;
+  if (!uri) {
+    void vscode.window.showInformationMessage('Open a CSV, TSV, PSV or SSV file in FileStudio first.');
+    return;
+  }
+  await changeDelimiter(uri);
 }

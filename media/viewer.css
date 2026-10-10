@@ -1146,6 +1146,7 @@ body[data-kind='csv'] {
  */
 .fv-status-mode,
 .fv-status-dims,
+.fv-status-delim,
 .fv-status-msg {
   display: block;
   padding: 0;
@@ -1162,6 +1163,11 @@ body[data-kind='csv'] {
 .fv-status-dims {
   flex: 0 1 auto;
   font-variant-numeric: tabular-nums;
+}
+
+/* Delimited text: the format and delimiter used ("CSV · Semicolon"); gives way before the size. */
+.fv-status-delim {
+  flex: 0 10 auto;
 }
 
 .fv-status-msg {
@@ -2652,6 +2658,9 @@ body.vscode-high-contrast-light #app.pdf-app {
   font-family: var(--fv-ui-font);
   font-size: var(--fv-ui-size);
   white-space: nowrap;
+  /* A narrow editor (a three-column split): the controls that do not fit go on a second row, so Find and the fit
+     buttons stay reachable. */
+  flex-wrap: wrap;
   overflow: hidden;
   user-select: none;
 }
@@ -2878,6 +2887,22 @@ body.vscode-high-contrast-light #app.pdf-app {
   color: var(--vscode-descriptionForeground);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+/* A narrow editor: the find bar takes the whole width and the field gives way, so the count and the buttons
+   (next, previous, close) stay visible. */
+@media (max-width: 420px) {
+  .pdf-findbar {
+    right: 0;
+    max-width: 100%;
+  }
+  .pdf-find-input {
+    width: auto;
+    min-width: 40px;
+    flex: 1 1 auto;
+  }
+  .pdf-find-status {
+    min-width: 0;
+  }
 }
 
 /* ----- PDF: OUTLINE SIDEBAR ----- */
@@ -3299,6 +3324,11 @@ body[data-kind='pptx'] {
   cursor: pointer;
 }
 
+.pptx-has-link:focus-visible {
+  outline: 2px solid var(--vscode-focusBorder, #0078d4);
+  outline-offset: 1px;
+}
+
 /* ----- PPTX: TEXT ----- */
 .pptx-text {
   position: absolute;
@@ -3309,7 +3339,8 @@ body[data-kind='pptx'] {
   justify-content: flex-start;
   white-space: pre-wrap;
   overflow-wrap: break-word;
-  tab-size: 36pt;
+  /* PowerPoint's default tab stops: every inch. */
+  tab-size: 72pt;
 }
 
 .pptx-text.pptx-anchor-mid {
@@ -3348,6 +3379,14 @@ body[data-kind='pptx'] {
   display: block;
 }
 
+/* Bullet / number of a paragraph (pptx.ts): hangs in the paragraph's indent (min-width set by pptxFixText). */
+.pptx-bullet {
+  display: inline-block;
+  text-indent: 0;
+  text-decoration: none;
+  white-space: pre;
+}
+
 .pptx-slide a {
   color: inherit;
   text-decoration: underline;
@@ -3363,7 +3402,9 @@ body[data-kind='pptx'] {
 
 .pptx-img {
   position: absolute;
+  /* VS Code's webview style caps every img at 100% of its box, which squashes a cropped picture. */
   max-width: none;
+  max-height: none;
   user-select: none;
   -webkit-user-drag: none;
 }

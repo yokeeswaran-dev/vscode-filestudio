@@ -202,6 +202,31 @@ test('threaded comments show the thread instead of Excel\'s fallback note', asyn
   const { cells } = await loadCells(bytes);
   assert.equal(cells.A2.note, 'Ada Lovelace: first post & more\nAlan Turing: a reply');
   assert.equal(cells.C1.note, 'legacy note');
+  // the threads are shown, so the banner does not list them as not displayed
+  assert.deepEqual(await S.detectLossyFeatures(bytes), []);
+});
+
+test('a threaded-comment part with many unclosed tags loads in linear time', async () => {
+  const bytes = await makeXlsx(
+    (ws) => {
+      ws.getCell('A1').value = 1;
+    },
+    async (zip) => {
+      const tag = '<threadedComment ref="A1" personId="{P1}" id="{T1}">';
+      zip.file('xl/threadedComments/threadedComment1.xml', `<ThreadedComments>${tag.repeat(40000)}</ThreadedComments>`);
+      zip.file(
+        'xl/worksheets/_rels/sheet1.xml.rels',
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdT" ' +
+          'Type="http://schemas.microsoft.com/office/2017/10/relationships/threadedComment" Target="../threadedComments/threadedComment1.xml"/></Relationships>',
+      );
+    },
+  );
+  const t0 = Date.now();
+  const { cells } = await loadCells(bytes);
+  assert.equal(cells.A1.v, 1);
+  // the old lazy regex took about a minute here
+  assert.ok(Date.now() - t0 < 5000, `took ${Date.now() - t0} ms`);
+  assert.deepEqual(await S.detectLossyFeatures(bytes), ['Threaded comments'], 'unread threads are still reported');
 });
 
 test('dialog sheets and Excel 4.0 macro sheets are reported as not displayed', async () => {
@@ -330,6 +355,14 @@ for (const [file, delimiter, hasBom, rowCount, [r, c, field]] of DELIMITED) {
   });
 }
 
+test('parseCsv forView (the read-only view) reads the same rows', () => {
+  for (const [file, delimiter] of DELIMITED) {
+    const text = sample(file).toString('utf8');
+    const opts = delimiter === ' ' ? { delimiter, collapseSpaces: true } : { delimiter };
+    assert.deepEqual(S.parseCsv(text, { ...opts, forView: true }), S.parseCsv(text, opts), file);
+  }
+});
+
 test('sample-space.ssv is read in space mode (runs of spaces, quoted fields)', () => {
   const model = parseDelimited(sample('sample-space.ssv').toString('utf8'), '.ssv');
   assert.equal(model.collapseSpaces, true);
@@ -358,6 +391,11 @@ test("Excel's 'sep=' first line sets the delimiter and is not a row", () => {
   assert.deepEqual(S.parseCsv('sep=\t\na\tb\n', { delimiter: '\t' }).rows, [['a', 'b']]);
   // only the first line is a directive
   assert.deepEqual(S.parseCsv('a;b\nsep=;\n1;2\n').rows, [['a', 'b'], ['sep=', ''], ['1', '2']]);
+  // like Excel 16: spaces after '=' are skipped; a space is not a delimiter, but the line is still hidden
+  const spaced = S.parseCsv('sep= ;\na;b\n');
+  assert.deepEqual([spaced.delimiter, spaced.rows], [';', [['a', 'b']]]);
+  const space = S.parseCsv('sep= \na b\n');
+  assert.deepEqual([space.delimiter, space.rows], [',', [['a b']]]);
 });
 
 test('a CSV sheet name is cut to 31 characters and has ( ) for [ ], like Excel', () => {
@@ -373,4 +411,29 @@ test('detectSsvDelimiter picks ";" or runs of spaces', () => {
   assert.equal(S.detectSsvDelimiter('id name note\n1 x a;b\n2 y c\n3 z d\n4 w e\n'), ' ');
   assert.equal(S.detectSsvDelimiter('id note\n1 "a;b"\n2 "c;d"\n3 "e;f"\n'), ' ', 'quoted ";" does not count');
   assert.equal(S.detectSsvDelimiter(''), ' ');
+});
+
+test("';' files read numbers with one decimal-comma convention: ',' decimal, '.' thousands", () => {
+  const values = ['1.000', '1,000', '1,5', '12.500', '1.234,56', '999,00', '1.5', '1.000.000', '2,5%', '-1,25', '2.5%', '1e3', '42'];
+  const model = new S.CsvGridModel(S.parseCsv(`sep=;\n${values.join(';')}\n`), 'semi.csv');
+  const cells = model.getRows(0, 0, 1).rows[0].cells;
+  assert.deepEqual(
+    cells.map((cell) => (cell.t === 'n' ? cell.v : `text ${cell.v}`)),
+    [1000, 1, 1.5, 12500, 1234.56, 999, 'text 1.5', 1000000, 0.025, -1.25, 'text 2.5%', 1000, 42],
+  );
+  assert.equal(model.getStats(0, [{ r0: 0, c0: 0, r1: 0, c1: 2 }]).sum, 1002.5);
+  // ',' files keep '.' decimals and ',' thousands
+  const comma = new S.CsvGridModel(S.parseCsv('"1,000",1.5,2.5%\n'), 'comma.csv').getRows(0, 0, 1).rows[0].cells;
+  assert.deepEqual(comma.map((cell) => cell.v), [1000, 1.5, 0.025]);
+});
+
+test('a CSV grid: blank lines at the end add no rows, stats cover columns after XFD, long numbers fit their column', () => {
+  const rowCount = (text) => new S.CsvGridModel(S.parseCsv(text), 'x.csv').getMeta().sheets[0].rowCount;
+  assert.deepEqual([rowCount('a,b\n\n1,2\n\n'), rowCount('a,b\n1,2\n\n\n'), rowCount('a,b\n1,2\n,\n'), rowCount('\n\n')], [3, 2, 2, 1]);
+  const line = Array.from({ length: 17_002 }, (_, i) => String(i + 1)).join(',');
+  const wide = new S.CsvGridModel(S.parseCsv(`${line}\n${line}\n`), 'wide.csv');
+  assert.deepEqual(wide.getStats(0, [{ r0: 0, r1: 1, c0: 17_000, c1: 17_001 }]), { count: 4, numCount: 4, sum: 68_006, avg: 17_001.5, min: 17_001, max: 17_002 });
+  // 14 Calibri 11 digits (about 7.43 px each) plus the 4 px cell padding
+  const cols = new S.CsvGridModel(S.parseCsv('12345678901234\n'), 'n.csv').getMeta().sheets[0].cols;
+  assert.ok(cols[0].w >= Math.ceil(14 * 7.43 + 4), `width ${cols[0].w}`);
 });
