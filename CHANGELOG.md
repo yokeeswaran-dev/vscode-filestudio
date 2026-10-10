@@ -7,6 +7,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-11
+
 ### Fixed
 
 #### General
@@ -151,5 +153,6 @@ First public release. This version is **view-only**.
 - Links to other slides and to web pages.
 - Banner that lists content the viewer does not show (video, audio, embedded objects and more).
 
-[Unreleased]: https://github.com/yokeeswaran-dev/vscode-filestudio/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/yokeeswaran-dev/vscode-filestudio/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/yokeeswaran-dev/vscode-filestudio/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/yokeeswaran-dev/vscode-filestudio/releases/tag/v0.1.0
