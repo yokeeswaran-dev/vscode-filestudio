@@ -2,7 +2,7 @@
   "name": "filestudio",
   "displayName": "FileStudio - Universal File Viewer & Editor",
   "description": "View and edit common document, spreadsheet, and presentation files directly in VS Code.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "Yokeeswaran",
   "repository": {
     "type": "git",
@@ -38,6 +38,11 @@
   ],
   "main": "./dist/extension.js",
   "activationEvents": [],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
   "contributes": {
     "customEditors": [
       {

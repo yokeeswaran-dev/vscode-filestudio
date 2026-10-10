@@ -16,7 +16,7 @@ For larger changes, please open an issue first, so we can agree on the approach 
 
 ## Prerequisites
 
-- [Node.js](https://nodejs.org/) **20 or later** and **npm**
+- [Node.js](https://nodejs.org/) **22 or later** and **npm**
 - [VS Code](https://code.visualstudio.com/) **1.90 or later**
 - [Git](https://git-scm.com/)
 
@@ -119,9 +119,13 @@ The message types shared by the extension and the webview are defined in `src/vi
 
 | Branch | Purpose |
 | --- | --- |
-| `main` | Released code only. Every release is a tag on `main` (`v0.1.0`, `v0.1.1`, …). |
+| `main` | Released code only. It changes only through a pull request from `dev` or `hotfix`, and every merge is a release, tagged `vX.Y.Z` automatically. |
 | `dev` | Day-to-day development. **All pull requests target `dev`** (it is the default branch). |
-| `fix/…`, `feat/…`, `docs/…` | Short-lived branches for one change each. |
+| `hotfix` | Urgent fixes for the released version, made by maintainers and released straight into `main`. |
+| `fix/…`, `feat/…`, `docs/…` | Short-lived branches for one change each, made from `dev`. |
+
+After every release, `main` goes back into `hotfix` automatically and into `dev` by the maintainer (step 5 of the
+release steps), so all three branches start from the released code. Always `git pull` before you start new work.
 
 1. **Fork** the repository and create a branch from `dev` with a short, clear name, for example
    `fix/pdf-find-count` or `feat/xlsx-conditional-formatting`.
@@ -177,34 +181,61 @@ docs: explain the Markdown default editor setting
 Versions follow [Semantic Versioning](https://semver.org/): **patch** for fixes (0.1.0 → 0.1.1), **minor** for new
 features (0.1.x → 0.2.0), **major** for 1.0.0 and breaking changes.
 
-1. Make sure the `[Unreleased]` section of `CHANGELOG.md` on `dev` lists the changes.
-2. Open a pull request from `dev` into `main` (for example "Release 0.1.1"), wait for CI, and merge it
-   (use a merge commit, not squash, so `dev` and `main` keep the same history).
-3. Go to **Actions → Release → Run workflow**, keep the branch `main`, choose **patch / minor / major**, and run it.
-   The workflow:
-   - bumps the version in `package.json` / `package-lock.json`,
-   - moves the `[Unreleased]` notes into a new `## [X.Y.Z] - date` section of `CHANGELOG.md`,
-   - type-checks, tests and packages `filestudio-X.Y.Z.vsix`,
-   - commits `chore(release): vX.Y.Z`, tags `vX.Y.Z` and pushes to `main`,
-   - creates the GitHub release with the `.vsix` and the CHANGELOG notes,
-   - publishes to the VS Code Marketplace (needs the `VSCE_PAT` secret),
-   - merges `main` back into `dev`.
-4. Install the published version from the Marketplace and do a quick check of every format.
+A release is a pull request from `dev` (or `hotfix`) into `main`:
 
-**Urgent fix (hotfix):** branch from `main` (`hotfix/…`), open a pull request into `main`, run the Release workflow
-with **patch**, then make sure `main` is merged back into `dev`.
+1. **Bring the branch up to date and set the version** (on `dev`, or on `hotfix` for an urgent fix):
 
-**Repository secrets** (Settings → Secrets and variables → Actions):
+   ```bash
+   git checkout dev
+   git pull
+   git merge origin/main        # only needed when main has commits that dev does not have
+   node .github/scripts/release.js prepare patch    # or minor / major
+   git commit -am "chore(release): vX.Y.Z"
+   git push
+   ```
 
-| Secret | Needed for |
-| --- | --- |
-| `VSCE_PAT` | Publishing. An Azure DevOps personal access token with the scope **Marketplace → Manage** (organisation: *All accessible organizations*). |
-| `RELEASE_TOKEN` | Only when branch rules block the workflow from pushing to `main` / `dev`: a fine-grained personal access token of a maintainer who is on the rules' bypass list, with **Contents: Read and write** on this repository. |
+   `prepare` bumps the version in `package.json` / `package-lock.json` and moves the `[Unreleased]` notes of
+   `CHANGELOG.md` into a new `## [X.Y.Z] - date` section. Bump the version **only now**, at the end, so a hotfix
+   released in the meantime does not take the same number.
+2. **Open a pull request from `dev` into `main`** (for example "Release 0.1.1"). It can only be merged when:
+   - CI passes on Windows and Linux,
+   - the **Release check** passes: the pull request comes from `dev` or `hotfix`, its version is higher than
+     `main`'s, that version is not tagged yet, `package-lock.json` matches, and `CHANGELOG.md` has a section for it
+     (run `node .github/scripts/release.js check` locally to see the same result),
+   - the branch is **up to date with `main`** (otherwise GitHub shows "Update branch"; or merge `origin/main` into it).
+3. **Merge with "Create a merge commit"** (squash is turned off for `main`, so `dev` and `main` keep the same history).
+4. The **Release** workflow then runs by itself: it tags the merge commit `vX.Y.Z` and merges `main` back into
+   `hotfix`.
+5. **Bring `main` into `dev`** (the `dev` rules require pull requests, so the workflow cannot push there; as a
+   repository admin you can):
 
-**Manual release (fallback):** `npm version patch --no-git-tag-version`, update `CHANGELOG.md`,
-`npx @vscode/vsce package --no-dependencies`, commit, `git tag vX.Y.Z`, `git push origin main --tags`, then upload
-the `.vsix` on the [Marketplace publisher page](https://marketplace.visualstudio.com/manage/publishers/yokeeswaran)
-or run `npx @vscode/vsce publish --no-dependencies --packagePath filestudio-X.Y.Z.vsix`.
+   ```bash
+   git checkout dev
+   git pull
+   git merge origin/main
+   git push
+   ```
+
+6. **Build the VSIX from `main` and publish it by hand:**
+
+   ```bash
+   git checkout main
+   git pull
+   npm ci
+   npx @vscode/vsce@4.0.0 package --no-dependencies
+   ```
+
+   Upload `filestudio-X.Y.Z.vsix` on the
+   [Marketplace publisher page](https://marketplace.visualstudio.com/manage/publishers/yokeeswaran) (**… → Update**).
+7. Install the published version from the Marketplace and do a quick check of every format.
+
+**Urgent fix (hotfix):** `git checkout hotfix`, `git pull`, make the fix and commit it, then follow the same steps
+from step 1 with `hotfix` in place of `dev` (usually `prepare patch`). Step 5 then brings the fix into `dev` too.
+
+**Branch rules** (Settings → Rules → Rulesets): `main` accepts only pull requests with merge commits, requires the
+checks "Build and test (ubuntu-latest)", "Build and test (windows-latest)" and "Release check", and requires the
+branch to be up to date. `dev` requires pull requests and CI; repository admins may bypass the rules. `hotfix` only
+blocks deleting and force-pushing. No repository secrets are needed.
 
 ## Questions
 

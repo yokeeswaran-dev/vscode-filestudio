@@ -291,6 +291,8 @@ body[data-kind='csv'] {
 
 /* ----- app layout: [banner] / formula bar / grid / sheet tabs / status bar ----- */
 
+/* Only the formula text (and the name box / cell text box fields) can be selected, as in Excel: a drag out of the
+   formula text, a triple-click or the page's select-all no longer highlight the tabs, bars and labels. */
 #app.fv-grid-app {
   display: flex;
   flex-direction: column;
@@ -298,6 +300,8 @@ body[data-kind='csv'] {
   min-height: 0;
   overflow: hidden;
   background: var(--fv-cell-bg);
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .fv-grid-host {
@@ -1005,6 +1009,12 @@ body[data-kind='csv'] {
   display: flex;
 }
 
+/* A press on a disabled arrow goes to the bar behind it: a disabled button gets no mousedown, so the bar's handler that
+   keeps the keyboard focus on the grid would not run and the focus would drop to <body>. */
+.fv-tab-scroll:disabled {
+  pointer-events: none;
+}
+
 /* Mirrored tab bar (right-to-left sheet): the scroll arrows sit at the far right and still read ‹ ›, like Excel. */
 .fv-tabbar[dir='rtl'] .fv-tab-nav {
   flex-direction: row-reverse;
@@ -1127,18 +1137,35 @@ body[data-kind='csv'] {
   min-width: 0;
 }
 
+/*
+ * In a narrow bar (VS Code's smallest editor group is 220px wide) the zoom controls (flex: none) always stay: the
+ * selection stats give way first, then the message, then the sheet size and the mode, which end in an ellipsis
+ * (block boxes: text-overflow has no effect on a flex container's text). The shrink factors are far apart, so each item
+ * gives way (almost) completely before the next one starts to. Margins, not padding: overflow is clipped at the
+ * padding edge, so an item shrunk to nothing would still show a letter in its padding.
+ */
+.fv-status-mode,
+.fv-status-dims,
+.fv-status-msg {
+  display: block;
+  padding: 0;
+  margin: 0 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .fv-status-mode {
+  flex: 0 1 auto;
   color: var(--vscode-foreground);
 }
 
 .fv-status-dims {
+  flex: 0 1 auto;
   font-variant-numeric: tabular-nums;
 }
 
 .fv-status-msg {
-  flex: 0 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  flex: 0 1000 auto;
 }
 
 .fv-status-msg:empty,
@@ -1163,8 +1190,11 @@ body[data-kind='csv'] {
  * onto a second line, which is clipped (whole stats drop off from the end).
  */
 .fv-status-stats {
-  flex: 0 1 auto;
+  flex: 0 100000 auto;
   flex-wrap: wrap;
+  /* Margins, not padding (see .fv-status-mode). */
+  padding: 0;
+  margin: 0 8px;
   align-self: stretch;
   align-content: flex-start;
   gap: 0 14px;
@@ -1406,6 +1436,21 @@ body.vscode-high-contrast-light .fv-menu {
   .fv-boot-message::before {
     animation: none;
   }
+
+  .fv-status-stats {
+    transition: none;
+  }
+}
+
+/* VS Code's "Reduce Motion" setting (workbench.reduceMotion: on) reaches the webview as a body class, not as the media
+   query (which follows the OS setting only). */
+body.vscode-reduce-motion .fv-loading-rows,
+body.vscode-reduce-motion .fv-boot-message::before {
+  animation: none;
+}
+
+body.vscode-reduce-motion .fv-status-stats {
+  transition: none;
 }
 
 /* ===== MARKDOWN ===== */
@@ -1634,6 +1679,10 @@ body.vscode-high-contrast-light .md-view {
 .md-view .md-article .task-list-item-checkbox:focus-visible {
   outline: 1px solid var(--vscode-focusBorder);
   outline-offset: 1px;
+}
+/* A read-only document's tasks (and raw-HTML checkboxes) cannot be clicked. */
+.md-view .md-article .task-list-item-checkbox:disabled {
+  cursor: default;
 }
 
 /* Blockquote */
@@ -1865,6 +1914,15 @@ body.vscode-high-contrast-light .md-view {
   .md-view .md-copy-button {
     opacity: 1;
   }
+}
+/* Animations off (the OS setting, or VS Code's "Reduce Motion", which reaches the webview as a body class): no fade. */
+@media (prefers-reduced-motion: reduce) {
+  .md-view .md-copy-button {
+    transition: none;
+  }
+}
+body.vscode-reduce-motion .md-view .md-copy-button {
+  transition: none;
 }
 
 /* highlight.js tokens */
@@ -2272,14 +2330,12 @@ body.vscode-high-contrast-light .docx-view {
 }
 /*
  * Text blocks as Word lays them out: tabs and runs of spaces are kept (mammoth passes them through as text; tab stops
- * every 0.5in, Word's default), and each paragraph takes its direction from its own text: mammoth drops the
- * paragraph's right-to-left flag (w:bidi), so an Arabic or Hebrew paragraph is right-aligned with its punctuation
- * in place only through unicode-bidi: plaintext. mammoth's HTML has no formatting whitespace between tags.
+ * every 0.5in, Word's default). mammoth's HTML has no formatting whitespace between tags. A right-to-left paragraph
+ * gets dir="rtl" from viewer.js (docxSetDirections: mammoth drops the paragraph's own w:bidi flag).
  */
 .docx-view .docx-page :is(p, li, td, th, h1, h2, h3, h4, h5, h6, dt, dd, caption) {
   white-space: pre-wrap;
   tab-size: 36pt;
-  unicode-bidi: plaintext;
 }
 .docx-view .docx-page h1,
 .docx-view .docx-page h2,
@@ -2395,7 +2451,11 @@ body.vscode-high-contrast-light .docx-view {
   padding: 4px 8px;
   vertical-align: top;
   border: 1px solid var(--docx-border);
-  /* Like Word, a long unbreakable word (URL, path) wraps inside its cell instead of widening the table past the page. */
+}
+/* Like Word, a long unbreakable word (URL, path) wraps inside its cell instead of widening the table past the page:
+   viewer.js (docxFitTables) marks the cells of a too-wide table that need it. Not every cell: the table layout would
+   then squeeze the other columns below the width of their own words. */
+.docx-view .docx-page .docx-cell-wrap {
   overflow-wrap: anywhere;
 }
 .docx-view .docx-page th {
@@ -2490,6 +2550,15 @@ body.vscode-high-contrast-light .docx-view {
 }
 .docx-view .docx-warnings[open] summary::after {
   transform: rotate(45deg);
+}
+/* Animations off (the OS setting, or VS Code's "Reduce Motion", which reaches the webview as a body class). */
+@media (prefers-reduced-motion: reduce) {
+  .docx-view .docx-warnings summary::after {
+    transition: none;
+  }
+}
+body.vscode-reduce-motion .docx-view .docx-warnings summary::after {
+  transition: none;
 }
 .docx-view .docx-warnings summary:focus-visible {
   outline: 1px solid var(--vscode-focusBorder);
@@ -2894,6 +2963,28 @@ body.vscode-high-contrast-light .pdf-outline-row:hover {
   outline: 1px dashed var(--vscode-contrastActiveBorder, var(--vscode-focusBorder));
   outline-offset: -1px;
   background: transparent;
+}
+
+/* ----- PDF: MOTION ----- */
+/* The OS setting (media query) and VS Code's "Reduce Motion" (workbench.reduceMotion: on), which reaches the webview
+   as a body class only. pdf.js marks a page that is still being drawn with an animated GIF, which cannot be stopped:
+   it is left out, and the page stays blank until it is drawn. */
+@media (prefers-reduced-motion: reduce) {
+  .pdf-outline-toggle .fv-icon {
+    transition: none;
+  }
+
+  .pdf-container .pdfViewer .page.loadingIcon::after {
+    background-image: none;
+  }
+}
+
+body.vscode-reduce-motion .pdf-outline-toggle .fv-icon {
+  transition: none;
+}
+
+body.vscode-reduce-motion .pdf-container .pdfViewer .page.loadingIcon::after {
+  background-image: none;
 }
 
 /* ===== PPTX ===== */
@@ -3490,4 +3581,9 @@ body.vscode-high-contrast-light .pptx-thumb-current .pptx-thumb-pic {
   .pptx-slide.pptx-loading::after {
     animation: none;
   }
+}
+
+/* VS Code's "Reduce Motion" (workbench.reduceMotion: on) reaches the webview as a body class, not as the media query. */
+body.vscode-reduce-motion .pptx-slide.pptx-loading::after {
+  animation: none;
 }

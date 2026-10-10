@@ -1,0 +1,35 @@
+# Required check for pull requests into main (make "Release check" a required status check in the main ruleset).
+# Only dev and hotfix may be merged into main, and only as a new version: see .github/scripts/release.js check.
+name: Release check
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  release-check:
+    name: Release check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Fetch main and the release tags
+        run: git fetch --force --tags origin main
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check the release rules
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+        run: node .github/scripts/release.js check

@@ -39,8 +39,11 @@ test('sample.docx: a table and an embedded image as a data: URI', async () => {
   assert.match(html, /<img alt="Bar chart generated as a PNG" src="data:image\/png;base64,iVBORw0KGgo/);
 });
 
+test('a 0-byte .docx is an empty document, as in Word (not an error)', async () => {
+  assert.deepEqual(await renderDocx(new Uint8Array(0)), { html: '<p class="doc-empty"><em>This document is empty.</em></p>', warnings: [] });
+});
+
 test('files that are not .docx are rejected with a friendly Error', async () => {
-  await assert.rejects(renderDocx(new Uint8Array(0)), { name: 'Error', message: /file is empty/ });
   await assert.rejects(renderDocx(new TextEncoder().encode('hello world')), /not a valid \.docx document \(it is not a ZIP package\)/);
   await assert.rejects(
     renderDocx(new Uint8Array([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0, 0])),

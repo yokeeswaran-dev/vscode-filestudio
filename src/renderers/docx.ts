@@ -3,7 +3,8 @@
 // Pure module (no `vscode` import). Images are embedded as data: URIs so the webview
 // needs no extra resource roots; formats browsers cannot show (EMF/WMF/TIFF) and linked
 // pictures (not stored in the package) become a labelled placeholder image plus a warning.
-// Failures throw a descriptive Error that the provider shows in the webview's error view.
+// Failures throw a descriptive Error that the provider shows in the webview's error view. A 0-byte file is not a
+// failure: Word opens it as an empty document, so it converts to an empty page.
 
 // ===== IMPORTS =====
 
@@ -188,7 +189,6 @@ function startsWith(data: Uint8Array, sig: number[]): boolean {
 
 /** Up-front check that gives users a clear reason instead of a zip parser error. */
 function assertLooksLikeDocx(data: Uint8Array): void {
-  if (data.length === 0) throw new Error('The file is empty (0 bytes), so there is nothing to display.');
   if (startsWith(data, OLE_SIGNATURE)) {
     throw new Error(
       'This file is not an Office Open XML (.docx) package. It is either password-protected/encrypted ' +
@@ -236,6 +236,11 @@ function describeFailure(err: unknown): string {
  * user-facing message when the file cannot be read.
  */
 export async function renderDocx(data: Uint8Array): Promise<DocxResult> {
+  // Word opens a 0-byte .docx as an empty document (e.g. one made with "New > Microsoft Word Document"): an empty
+  // page, not an error.
+  if (data.length === 0) {
+    return { html: '<p class="doc-empty"><em>This document is empty.</em></p>', warnings: [] };
+  }
   assertLooksLikeDocx(data);
 
   const extraWarnings: string[] = [];

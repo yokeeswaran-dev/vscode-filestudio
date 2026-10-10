@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, hotfix]
   pull_request:
 
 permissions:
@@ -21,7 +21,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       - run: npm ci
@@ -33,7 +33,7 @@ jobs:
       # dependencies are bundled into dist/, so the package does not need node_modules.
       - name: Package VSIX
         if: matrix.os == 'ubuntu-latest'
-        run: npx --yes @vscode/vsce package --no-dependencies
+        run: npx --yes @vscode/vsce@4.0.0 package --no-dependencies
 
       - name: Upload VSIX
         if: matrix.os == 'ubuntu-latest'
