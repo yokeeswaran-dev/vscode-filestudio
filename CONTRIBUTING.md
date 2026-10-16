@@ -38,7 +38,7 @@ npm run build
 | `npm run build` | Bundles the extension and the webview into `dist/` with esbuild (development build with source maps). |
 | `npm run watch` | Same as `build`, and rebuilds on every change. |
 | `npm run typecheck` | Type-checks the TypeScript code (`tsc --noEmit`). |
-| `npm test` | Bundles the renderers into `test/.out/` and runs the unit tests in `test/unit/` with Node's built-in test runner. |
+| `npm test` | Bundles the renderers, the webview script and the extension host code into `test/.out/`, then runs the unit tests in `test/unit/` and the host tests in `test/host/` (host code against a fake `vscode` module, `test/host/fake-vscode.js`) with Node's built-in test runner. |
 | `npm run test:integration` | Runs the integration tests in `test/integration/` inside a real VS Code (run `npm run build` first). See below. |
 | `npm run samples` | Regenerates the sample files in `test/samples/` (`node test/generate-samples.js`). |
 | `npm run package` | Production build (minified, no source maps). Used when packaging. |
