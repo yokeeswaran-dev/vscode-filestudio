@@ -24,7 +24,9 @@ Read this first. Every session and every subagent follows it. If a rule here con
   `media/viewer.css` — UI colours come from `--vscode-*` variables (hex only as `var()` fallbacks or for document
   content such as slides); has a HIGH CONTRAST section.
 - `esbuild.js` — builds `dist/` (extension, viewer ESM + lazy chunks, css, fonts, pdf.js). Keep the stubs for `unzipper` and `elkjs`.
-- `test/unit/*.test.js` (node --test), `test/build-tests.js`, `test/generate-samples.js`, `test/samples/` (byte-exact fixtures).
+- `test/unit/*.test.js` (node --test), `test/host/*.test.js` (host code against the fake `vscode` in `test/host/fake-vscode.js`),
+  `test/build-tests.js` (bundles renderers, `viewer.js` with test-only exports, and host code to `test/.out/`),
+  `test/generate-samples.js`, `test/samples/` (byte-exact fixtures).
 - **No new files in `src/` or `media/`.** Put new code in the matching section of the existing file, using
   `// ===== NAME =====` and `// ----- sub -----`. If a split is truly needed for safety, log the reason in `DECISIONS.md` first.
 - Outside `src/` and `media/` you may add: test files, an `@vscode/test-electron` setup, CI changes for it, this file.
@@ -35,7 +37,7 @@ Read this first. Every session and every subagent follows it. If a rule here con
 | --- | --- |
 | `npm ci` | install exactly from `package-lock.json` (only when your task says so) |
 | `npm run typecheck` | `tsc --noEmit` on `src/**/*.ts` |
-| `npm test` | bundles the renderers to `test/.out/` and runs `test/unit` with `node --test` |
+| `npm test` | bundles renderers, `media/viewer.js` and host code to `test/.out/`; runs `test/unit` and `test/host` (fake `vscode`) with `node --test` (Node 22+: glob args) |
 | `npm run build` | `node esbuild.js` (deletes and rebuilds `dist/`) |
 | `npm run package` | production build (minified), as used for the VSIX |
 | `npm run samples` | rebuilds `test/samples/*` (writes only files whose bytes changed); `large.xlsx` (not in Git) only if missing |

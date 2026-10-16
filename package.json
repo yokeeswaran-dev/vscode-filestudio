@@ -256,7 +256,7 @@
     "typecheck": "tsc --noEmit",
     "vscode:prepublish": "npm run typecheck && npm run package",
     "samples": "node test/generate-samples.js",
-    "test": "node test/build-tests.js && cd test/unit && node --test --test-reporter=spec",
+    "test": "node test/build-tests.js && node --test --test-reporter=spec \"test/unit/*.test.js\" \"test/host/*.test.js\"",
     "test:integration": "node test/integration/runTest.js"
   },
   "dependencies": {
