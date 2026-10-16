@@ -16,6 +16,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -28,6 +29,40 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm test
+
+      # Integration tests in a real VS Code (@vscode/test-electron, latest stable). The download is cached in
+      # .vscode-test, one cache per VS Code version, so a new stable release replaces the cache instead of adding to it.
+      - name: Find the current stable VS Code version
+        id: vscode
+        shell: bash
+        run: node -e "fetch('https://update.code.visualstudio.com/api/releases/stable').then((r) => r.json()).then((v) => console.log('version=' + v[0])).catch(() => console.log('version=unknown'))" >> "$GITHUB_OUTPUT"
+
+      - name: Cache VS Code for integration tests
+        uses: actions/cache@v4
+        with:
+          path: .vscode-test
+          key: vscode-test-${{ runner.os }}-${{ steps.vscode.outputs.version }}
+
+      # A failing run keeps its run folder (profile, logs, workspace copy) in FS_IT_TMPDIR; the next step uploads the logs.
+      - name: Integration tests (Linux, virtual display)
+        if: runner.os == 'Linux'
+        env:
+          FS_IT_TMPDIR: ${{ runner.temp }}/filestudio-it
+        run: xvfb-run -a npm run test:integration
+
+      - name: Integration tests (Windows)
+        if: runner.os == 'Windows'
+        env:
+          FS_IT_TMPDIR: ${{ runner.temp }}/filestudio-it
+        run: npm run test:integration
+
+      - name: Upload integration test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/filestudio-it/*/user-data/logs/
+          if-no-files-found: ignore
 
       # vsce runs the `vscode:prepublish` script (type check + production build) before packaging. The npm
       # dependencies are bundled into dist/, so the package does not need node_modules.
