@@ -256,7 +256,8 @@
     "typecheck": "tsc --noEmit",
     "vscode:prepublish": "npm run typecheck && npm run package",
     "samples": "node test/generate-samples.js",
-    "test": "node test/build-tests.js && cd test/unit && node --test --test-reporter=spec"
+    "test": "node test/build-tests.js && cd test/unit && node --test --test-reporter=spec",
+    "test:integration": "node test/integration/runTest.js"
   },
   "dependencies": {
     "dompurify": "^3.4.16",
@@ -279,6 +280,7 @@
     "@types/node": "^20.19.43",
     "@types/papaparse": "^5.5.2",
     "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "3.1.0",
     "esbuild": "^0.28.2",
     "typescript": "^7.0.2"
   }
