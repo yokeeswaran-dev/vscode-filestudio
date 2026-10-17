@@ -44,7 +44,7 @@ Read this first. Every session and every subagent follows it. If a rule here con
 | `npx @vscode/vsce@4.0.0 package --no-dependencies` | builds the VSIX (CI does this on Linux) |
 | F5 | Extension Development Host on `test/samples` (`.vscode/launch.json`) |
 
-- All four checks (`npm ci`, typecheck, test, build) must pass before a merge.
+- All four checks (`npm ci`, typecheck, test, build) must pass before a commit on `feat/0.2.0`.
 - `media/viewer.js` strict check (not in a script yet):
   `node node_modules/typescript/bin/tsc --ignoreConfig --noEmit --allowJs --checkJs --strict --target ES2022 --module preserve --moduleResolution bundler --lib ES2022,DOM,DOM.Iterable --types node --skipLibCheck media/viewer.js`
 - Integration tests (`@vscode/test-electron`, planned for 0.2.0, **not there yet**; planned script name
@@ -90,16 +90,17 @@ Losing or corrupting a user file is worse than a missing feature.
 - Every runtime dependency goes into `THIRD_PARTY_NOTICES.md` with its full licence text. Commit `package-lock.json`.
 
 ## Git, commits, CHANGELOG
-- `main` = released code only. `dev` = default. Work on **`feat/0.2.0-<area>`** branches made from `dev`; merge them back into
-  local `dev` when all checks are green.
-- **Never push, merge into `main`, tag, create a GitHub release, or publish to the Marketplace.**
+- `main` = released code only. `dev` = default, but **we cannot push to `dev`: never commit or merge into `dev`**.
+- **All 0.2.0 work goes on ONE branch: `feat/0.2.0`.** Commit only there (no other 0.2.0 branches, no merge into `dev`),
+  and **push it after every commit**: `git push origin feat/0.2.0`. A pull request `feat/0.2.0` → `dev` is opened by the user.
+- **Never** push any other branch, merge into `main`, tag, create a GitHub release, or publish to the Marketplace.
 - Only the agent whose task says "you own git for this step" changes git state. Others use read-only git (status, diff, log, show).
 - Before a commit: run `git status`; add **explicit paths** only (never `git add -A` / `git add .`); nothing from `.scratch` is committed.
 - Commit format `<type>(<scope>): <summary>` — types `feat|fix|docs|test|refactor|perf|build|chore`, scopes
   `sheet|csv|markdown|docx|pdf|pptx|host|build`; imperative, at most ~72 characters, no full stop.
 - Every user-visible change gets a line under `## [Unreleased]` in `CHANGELOG.md`: simple English, grouped by format, same
   style as the existing entries.
-- Release prep: `node .github/scripts/release.js prepare minor` on a release branch, then commit with explicit paths
+- Release prep: `node .github/scripts/release.js prepare minor` on `feat/0.2.0`, then commit with explicit paths
   (`package.json package-lock.json CHANGELOG.md`), not the `git commit -am` it prints.
 
 ## Tests
