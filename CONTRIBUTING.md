@@ -113,10 +113,11 @@ media/
 esbuild.js              Build script (extension, webview, pdf.js worker and data files)
 test/
   unit/                 Unit tests (Node's test runner)
+  host/                 Host tests: extension code against a fake `vscode` module (fake-vscode.js)
   integration/          Integration tests in a real VS Code (@vscode/test-electron and a small runner)
   samples/              Sample files used for manual and automated tests
   generate-samples.js   Creates the sample files
-  build-tests.js        Bundles the renderers for the unit tests
+  build-tests.js        Bundles the renderers, the webview script and the host code for the unit and host tests
 assets/
   icon.png              Extension icon
   screenshots/          Screenshots used in the README
