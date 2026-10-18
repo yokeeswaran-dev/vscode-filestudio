@@ -30,6 +30,14 @@ jobs:
       - run: npm run build
       - run: npm test
 
+      # Webview regression tests: the built dist/viewer.js in headless Chrome (puppeteer-core, no browser download).
+      # GitHub's Linux and Windows runners have Google Chrome installed (CHROME_BIN). Here a missing browser FAILS the
+      # step (FS_WEBVIEW_REQUIRE_BROWSER=1), so the regression net is never turned off silently; on a PC the suites skip.
+      - name: Webview regression tests
+        run: npm run test:webview
+        env:
+          FS_WEBVIEW_REQUIRE_BROWSER: '1'
+
       # Integration tests in a real VS Code (@vscode/test-electron, latest stable). The download is cached in
       # .vscode-test, one cache per VS Code version, so a new stable release replaces the cache instead of adding to it.
       - name: Find the current stable VS Code version
