@@ -110,6 +110,29 @@ export interface RenderResult {
   tasks?: TaskMarker[];
 }
 
+/**
+ * (v0.2.0, P6) One top-level block of the source, as the WYSIWYG editor may replace it: `start`/`end` are UTF-16
+ * offsets of TextDocument.getText(), `line`/`endLine` 0-based lines. `fixed` blocks (raw HTML, front matter, math,
+ * mermaid, ...) are never rewritten; `reason` says why.
+ */
+export interface MdBlock {
+  start: number;
+  end: number;
+  line: number;
+  endLine: number;
+  kind: string;
+  fixed: boolean;
+  reason?: string;
+}
+
+/** (v0.2.0, P6) One text replacement: UTF-16 offsets of getText(); `oldText` must match the document exactly. */
+export interface MdTextEdit {
+  start: number;
+  end: number;
+  oldText: string;
+  text: string;
+}
+
 // ===== IMPLEMENTATION =====
 
 // ===== RENDER ENVIRONMENT (per-render state) =====

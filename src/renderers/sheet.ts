@@ -116,6 +116,10 @@ export interface CellData {
    * validation repeated its list in every cell). Lists are in SheetMeta.validations.
    */
   list?: string[];
+  /** (v0.2.0, P5) Recalc state of a formula cell; absent = value is current (computed or cached and not dirty). */
+  calc?: 'stale' | 'unsupported' | 'circular';
+  /** (v0.2.0, P5) Conditional-format paint computed by the host for this cell (absent = no rule applies). */
+  cf?: CfPaint;
 }
 
 /**
@@ -228,6 +232,8 @@ export interface SheetMeta {
   autoFilter?: Range;
   /** List data validations, one entry per distinct list (absent when the sheet has none). */
   validations?: ListValidation[];
+  /** (v0.2.0, P2) Stable id; survives rename, reorder, undo. Optional only for type compatibility; the host always sets it. */
+  id?: SheetId;
 }
 
 export interface WorkbookMeta {
@@ -300,6 +306,81 @@ export interface CsvModel {
   sepLine?: string;
 }
 
+/** (v0.2.0) Stable sheet id: xlsx = 's' + the <sheet sheetId="n"> attribute of workbook.xml (= ExcelJS ws.id); csv = 'csv'. */
+export type SheetId = string;
+
+/** (v0.2.0, P5) Result of the conditional formats of one cell. `s` replaces CellData.s for painting (cell style + dxf merged). */
+export interface CfPaint {
+  s?: number;
+  /** Colour-scale fill, '#rrggbb'. */
+  fill?: string;
+  bar?: { pct: number; color: string; negative?: boolean; gradient: boolean; showValue: boolean };
+  icon?: { set: string; index: number; showValue: boolean };
+}
+
+// ----- edit intents -----
+// (v0.2.0) What the webview asks the host to change. Declared once here (protocol frozen after track F, D-062) and
+// shared with media/viewer.js as JSDoc typedefs. Shapes and limits are validated in parseWebviewMessage
+// (src/viewerProvider.ts); the meaning is checked again by the phase's planner (planEdit / planCsvEdit / md checks).
+
+/** What the webview asks for. Validated in parseWebviewMessage (shape + limits) and again by planEdit (meaning). */
+export type EditIntent =
+  // ---- values (xlsx P2, csv P3) ----
+  | { kind: 'setCells'; sheetId: SheetId; cells: [r: number, c: number, text: string][] } // typing, paste, fill, replace one
+  | { kind: 'clear'; sheetId: SheetId; ranges: Range[]; what: 'contents' | 'formats' | 'all' } // csv: 'contents' only
+  // ---- structure (csv P3, xlsx P4) ----
+  | { kind: 'insertRows' | 'deleteRows' | 'insertCols' | 'deleteCols'; sheetId: SheetId; at: number; count: number }
+  | { kind: 'sort'; sheetId: SheetId; range: Range; key: number; desc: boolean; header: boolean } // key = absolute column
+  | { kind: 'replaceAll'; query: FindQuery; replace: string } // scope inside the query
+  // ---- xlsx only (P4) ----
+  | { kind: 'style'; sheetId: SheetId; ranges: Range[]; delta: StyleDelta }
+  | { kind: 'merge' | 'unmerge'; sheetId: SheetId; range: Range }
+  | { kind: 'resize'; sheetId: SheetId; axis: 'row' | 'col'; index: number[]; size: number | null } // px; null = default/auto height
+  | { kind: 'sheetAdd'; index: number; name?: string }
+  | { kind: 'sheetRename'; sheetId: SheetId; name: string }
+  | { kind: 'sheetDelete' | 'sheetDuplicate'; sheetId: SheetId }
+  | { kind: 'sheetMove'; sheetId: SheetId; index: number }
+  | { kind: 'sheetHide'; sheetId: SheetId; hidden: boolean }
+  | { kind: 'tabColor'; sheetId: SheetId; argb: string | null }
+  // ---- markdown (P6) ----
+  | { kind: 'mdText'; edits: MdTextEdit[] };
+
+export type EditKind = EditIntent['kind'];
+
+export interface FindQuery {
+  /** csv: always 'csv'. */
+  scope: SheetId | 'workbook';
+  /** At most 1,000 characters. */
+  text: string;
+  matchCase: boolean;
+  regex: boolean;
+  wholeCell: boolean;
+  /** csv: 'values'. */
+  lookIn: 'values' | 'formulas';
+}
+
+/** Applied in order on the cell's ORIGINAL xf (never on an ExcelJS style object). null = remove that property. */
+export interface StyleDelta {
+  bold?: boolean;
+  italic?: boolean;
+  underline?: 'single' | 'double' | null;
+  strike?: boolean;
+  /** 'FFRRGGBB'. */
+  fontColor?: string | null;
+  /** 'FFRRGGBB'. */
+  fill?: string | null;
+  border?: { top?: BorderSide; bottom?: BorderSide; left?: BorderSide; right?: BorderSide };
+  hAlign?: 'left' | 'center' | 'right' | 'justify' | null;
+  vAlign?: 'top' | 'center' | 'bottom' | null;
+  wrap?: boolean;
+  /** OOXML number format code, already escaped. */
+  numFmt?: string;
+  /** Set by typing a leading apostrophe. */
+  quotePrefix?: boolean;
+}
+
+export type BorderSide = { style: 'thin' | 'medium' | 'thick' | 'dashed' | 'dotted' | 'double' | 'hair'; color?: string } | null;
+
 // ===== IMPLEMENTATION =====
 //
 // Public API (phase-1 contract): loadWorkbook, GridSource, WorkbookModel /
@@ -310,10 +391,11 @@ export interface CsvModel {
 //
 // Sections:
 //   LIBRARIES          third-party imports, local typing for untyped ssf
+//   EDIT TYPES         (v0.2.0) file-side edit types: FileValue, CellPatch, PackageOp, BlockReason (host only)
 //   EXCELJS INTERNALS  the (undocumented) slice of ExcelJS' object model we read
 //   CONSTANTS          units, limits and builtin tables
 //   COLORS             theme palette, tint maths, indexed palette, resolveColor
-//   ADDRESSES          A1 helpers, range parsing, shared-formula translation
+//   ADDRESSES          A1 helpers, range parsing, shared-formula translation; (v0.2.0) fx formula tokenizer adapter
 //   NUMBER FORMATS     ssf wrapper with fast paths and caches
 //   STYLES             ExcelJS style -> CellStyle conversion + dedupe table
 //   LOADING            loadWorkbook (raw styles.xml side channel, internal links)
@@ -328,6 +410,10 @@ export interface CsvModel {
 import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import Papa from 'papaparse';
+// Excel formula tokenizer, xlsx flavour (file syntax: [n] external workbook indexes, _xlfn. prefixes). See ADDRESSES
+// `fx adapter`.
+import { parseA1Ref as fxParseA1Ref, tokenize as fxTokenizeRaw, tokenTypes as FX_TOKEN } from '@borgar/fx/xlsx';
+import type { MdTextEdit } from './markdown';
 
 /** The part of ssf (SheetJS number formatter, untyped CommonJS) used here. */
 interface SsfLib {
@@ -376,6 +462,49 @@ interface XCellParser {
   parseClose(name: string): boolean;
 }
 const CellXform = require('exceljs/lib/xlsx/xform/sheet/cell-xform') as { prototype: XCellParser } | undefined;
+
+// ===== EDIT TYPES =====
+// (v0.2.0) What an edit writes into the file. Host only (never sent to the webview). The save path (XLSX SAVE, P1)
+// patches the loaded package with these operations; every phase that changes a workbook produces them.
+
+/** A cell value as the file stores it. */
+export type FileValue = { t: 'n'; v: number } | { t: 's'; v: string } | { t: 'b'; v: boolean } | { t: 'e'; v: string };
+
+export interface CellPatch {
+  /** null = clear contents (keep s). */
+  value?: FileValue | null;
+  /** FILE syntax (_xlfn. prefixes, English names, ','), without '='. */
+  formula?: string;
+  /** <v> of a formula cell; null = write no <v> (unsupported function, D-021). */
+  cached?: FileValue | null;
+  /** Derived xf appended to styles.xml (existing xfs never change). */
+  style?: StyleDelta[];
+}
+
+/** `sheet` = the numeric <sheet sheetId> attribute (SheetId = 's' + sheet). Positions are those at edit time. */
+export type PackageOp =
+  | { kind: 'cells'; sheet: number; cells: [r: number, c: number, patch: CellPatch][] }
+  | { kind: 'merge' | 'unmerge'; sheet: number; range: Range }
+  | { kind: 'insertRows' | 'deleteRows' | 'insertCols' | 'deleteCols'; sheet: number; at: number; count: number }
+  | { kind: 'sort'; sheet: number; range: Range; byRow: Int32Array } // new row range.r0+i <- old row byRow[i]
+  | { kind: 'rowProps'; sheet: number; rows: number[]; height?: number | null; style?: StyleDelta[] } // points
+  | { kind: 'colProps'; sheet: number; cols: number[]; width?: number | null; style?: StyleDelta[] } // Excel char units
+  | { kind: 'sheetAdd'; sheet: number; name: string; index: number }
+  | { kind: 'sheetRename'; sheet: number; name: string }
+  | { kind: 'sheetDelete'; sheet: number }
+  | { kind: 'sheetDuplicate'; sheet: number; newSheet: number; name: string; index: number }
+  | { kind: 'sheetMove'; sheet: number; index: number }
+  | { kind: 'sheetState'; sheet: number; state: 'visible' | 'hidden' }
+  | { kind: 'tabColor'; sheet: number; argb: string | null };
+
+/** Why an edit is refused (editResult code 'blocked'); used by every phase's block rules. */
+export interface BlockReason {
+  code: 'ref' | 'array' | 'merge' | 'table' | 'rule' | 'name' | 'lossy' | 'protected' | 'unsupported' | 'sheet3d' | 'limit';
+  /** Full user text (contract §3.4 style). */
+  message: string;
+  /** E.g. ['Data!H1', 'F!A2'] (first 12, then "+N more"). */
+  where: string[];
+}
 
 // ===== EXCELJS INTERNALS =====
 // ExcelJS 4.4 keeps its document in plain objects that are mostly absent from
@@ -920,6 +1049,387 @@ function isAutomaticColor(color: XColor | undefined): boolean {
 }
 
 // ===== ADDRESSES =====
+
+// ----- fx adapter -----
+// (v0.2.0) Formula text <-> tokens through @borgar/fx (xlsx flavour = file syntax: A1 references only, R1C1 off,
+// [n] external workbook indexes, _xlfn. prefixes). Used by formula input (P2), reference shifting (P4, display and
+// save, one grammar) and recalc (P5). Rules:
+//   - the tokens cover the formula without gaps or overlaps: joining their text always gives the formula back
+//     (fxJoin); text fx cannot read becomes an 'UNKNOWN' token (callers that rewrite a formula must block on it);
+//   - a reference is re-spelled only where it changes (fxEmitRef): an unchanged prefix keeps its text (quotes,
+//     case), an unchanged range end keeps its text ('a1', '$b$2'), an unchanged reference keeps all of it (B5:A1).
+// Ported from ROUND\s2-editmodel\proto\lex-fx.js (E6 fuzz 90,000/90,000, E7 corpus 532/532).
+
+/** A sheet / workbook prefix of a reference ('My Data'!, [1]Sheet1!, Sheet1:Sheet3!, [1]!), unescaped. */
+export interface FxPrefix {
+  /** The prefix was written in quotes ('Sheet1'!A1). */
+  quoted: boolean;
+  /** External workbook as written: '[1]' (file syntax: index into <externalReferences>), else null. */
+  book: string | null;
+  /** First (or only) sheet; null for a workbook-level name ([1]!Name). */
+  sheet1: string | null;
+  /** Last sheet of a 3D reference (Sheet1:Sheet3!A1), else null. */
+  sheet2: string | null;
+}
+
+/**
+ * The rectangle a reference names: 0-based, inclusive. Whole columns ('cols', A:C) run over every row and whole rows
+ * ('rows', 2:4) over every column; their unused `$` flags are false.
+ */
+export interface FxArea {
+  kind: 'cell' | 'area' | 'rows' | 'cols';
+  r0: number;
+  c0: number;
+  r1: number;
+  c1: number;
+  $r0: boolean;
+  $c0: boolean;
+  $r1: boolean;
+  $c1: boolean;
+}
+
+export interface FxRef extends FxArea {
+  prefix: FxPrefix | null;
+  /** Followed by the spill operator (A1#); the '#' is part of the token. */
+  spill: boolean;
+  /** Offset in the formula where the A1 part starts (after the prefix and its '!'). */
+  bodyStart: number;
+}
+
+/**
+ * One formula token: `formula.slice(start, end)` is its text. `type`: 'REF' (cell, range, whole rows / columns, with
+ * `ref`), 'NAME' (defined name, `prefix` when qualified), 'STRUCT' (table reference, `prefix` when qualified), 'ERR'
+ * (a qualified #REF!: Sheet1!#REF!, with `prefix`), 'UNKNOWN' (unreadable text), or fx's own token type for the rest
+ * ('func', 'operator', 'number', 'string', 'bool', 'error', 'whitespace', 'newline', 'fx_prefix').
+ */
+export interface FxToken {
+  type: string;
+  start: number;
+  end: number;
+  ref?: FxRef;
+  prefix?: FxPrefix | null;
+  refError?: boolean;
+}
+
+const FX_TOKENIZE_OPTIONS = { withLocation: true, mergeRefs: true, negativeNumbers: false, allowTernary: false, r1c1: false };
+
+/** "'[1]My ''x'''" -> {quoted, book '[1]', sheet1 "My 'x'"}; 'Sheet1:Sheet3' -> 3D. Text before the '!'. */
+function fxParsePrefix(text: string): FxPrefix {
+  const quoted = text.length >= 2 && text.startsWith("'") && text.endsWith("'");
+  let inner = quoted ? text.slice(1, -1).replace(/''/g, "'") : text;
+  let book: string | null = null;
+  if (inner.startsWith('[')) {
+    const close = inner.indexOf(']');
+    if (close > 0) {
+      book = inner.slice(0, close + 1);
+      inner = inner.slice(close + 1);
+    }
+  }
+  // Excel forbids ':' in sheet names, so a ':' separates the two ends of a 3D reference.
+  const colon = inner.indexOf(':');
+  const sheet1 = (colon >= 0 ? inner.slice(0, colon) : inner) || null;
+  const sheet2 = colon >= 0 ? inner.slice(colon + 1) || null : null;
+  return { quoted, book, sheet1, sheet2 };
+}
+
+/** fx range of a reference -> FxArea of `kind`. */
+function fxToArea(
+  range: { top: number | null; left: number | null; bottom?: number | null; right?: number | null; $top?: boolean | null; $left?: boolean | null; $bottom?: boolean | null; $right?: boolean | null },
+  kind: FxArea['kind'],
+): FxArea | undefined {
+  const r0 = range.top ?? 0;
+  const c0 = range.left ?? 0;
+  const r1 = range.bottom ?? range.top ?? 0;
+  const c1 = range.right ?? range.left ?? 0;
+  if (kind === 'cols') {
+    if (range.left == null) return undefined;
+    return { kind, r0: 0, r1: MAX_ROWS - 1, c0, c1, $r0: false, $r1: false, $c0: !!range.$left, $c1: !!range.$right };
+  }
+  if (kind === 'rows') {
+    if (range.top == null) return undefined;
+    return { kind, r0, r1, c0: 0, c1: MAX_COLS - 1, $r0: !!range.$top, $r1: !!range.$bottom, $c0: false, $c1: false };
+  }
+  if (range.top == null || range.left == null) return undefined;
+  return {
+    kind,
+    r0,
+    c0,
+    r1,
+    c1,
+    $r0: !!range.$top,
+    $c0: !!range.$left,
+    $r1: !!(range.$bottom ?? range.$top),
+    $c1: !!(range.$right ?? range.$left),
+  };
+}
+
+/**
+ * Tokenizes a formula (with or without the leading '='). Never throws: if fx fails, or its tokens do not cover the
+ * text exactly, the result is one 'UNKNOWN' token for the whole formula.
+ */
+/** Longest formula fxTokenize reads (Excel's limit). @borgar/fx is quadratic on some input (apostrophe runs), and a file's formula text is not limited. */
+export const FX_MAX_FORMULA_CHARS = 8192;
+
+/** Runs no real formula has (a sheet name is at most 31 characters): they make @borgar/fx quadratic. */
+const FX_HOSTILE_RUN = /['[]{64,}|\.{64,}|(?:\d\.){64,}/;
+/** Time budget shared by all calls: slow quote-heavy formulas add their time as debt; the debt shrinks with the clock. */
+const FX_DEBT_LIMIT_MS = 1000;
+const FX_SLOW_CALL_MS = 15;
+let fxDebtMs = 0;
+let fxDebtAt = 0;
+function fxNow(): number {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+/** The formula with the body of every "text" literal blanked (same length): a dotted leader in a string is harmless. */
+function fxMaskStrings(formula: string): string {
+  if (formula.indexOf('"') < 0) return formula;
+  return formula.replace(/"(?:[^"]|"")*"?/g, (m) => '"' + ' '.repeat(Math.max(0, m.length - 2)) + (m.length > 1 ? '"' : ''));
+}
+
+export function fxTokenize(formula: string): FxToken[] {
+  if (!formula) return [];
+  const whole: FxToken[] = [{ type: 'UNKNOWN', start: 0, end: formula.length }];
+  if (formula.length > FX_MAX_FORMULA_CHARS || FX_HOSTILE_RUN.test(fxMaskStrings(formula))) return whole;
+  // Shared budget: the adapter itself stops a workbook of crafted formulas from freezing the host. Only quote-heavy
+  // text can be slow; once the debt is over the limit such a formula is opaque (one UNKNOWN token).
+  const t0 = fxNow();
+  fxDebtMs = Math.max(0, fxDebtMs - (t0 - fxDebtAt));
+  fxDebtAt = t0;
+  const quoteHeavy = formula.length > 256 && (formula.match(/'/g)?.length ?? 0) > 8;
+  if (quoteHeavy && fxDebtMs > FX_DEBT_LIMIT_MS) return whole;
+  let raw: { type: string; value: string; loc?: number[] }[];
+  try {
+    raw = fxTokenizeRaw(formula, FX_TOKENIZE_OPTIONS);
+  } catch {
+    return whole;
+  } finally {
+    const spent = fxNow() - t0;
+    if (quoteHeavy && spent > FX_SLOW_CALL_MS) fxDebtMs += spent;
+    fxDebtAt = fxNow();
+  }
+  const out: FxToken[] = [];
+  let pos = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const t = raw[i];
+    const start = t.loc?.[0];
+    const end = t.loc?.[1];
+    if (start !== pos || end === undefined || end <= start || formula.slice(start, end) !== t.value) return whole;
+    pos = end;
+    const value = t.value;
+    if (t.type === FX_TOKEN.REF_RANGE || t.type === FX_TOKEN.REF_BEAM) {
+      const ref = fxParseA1Ref(value, { allowNamed: false, allowTernary: false });
+      const range = ref && 'range' in ref ? ref.range : undefined;
+      const bang = value.lastIndexOf('!'); // the A1 part never contains '!'; a quoted sheet name may
+      const body = value.slice(bang + 1);
+      const kind: FxArea['kind'] =
+        t.type === FX_TOKEN.REF_BEAM ? (range?.top == null ? 'cols' : 'rows') : body.includes(':') ? 'area' : 'cell';
+      const area = range ? fxToArea(range, kind) : undefined;
+      if (!area) {
+        out.push({ type: 'UNKNOWN', start, end });
+        continue;
+      }
+      let tokenEnd = end;
+      let spill = false;
+      const next = raw[i + 1];
+      if (next && next.type === FX_TOKEN.OPERATOR && next.value === '#' && next.loc?.[0] === end && next.loc[1] === end + 1) {
+        spill = true;
+        tokenEnd = end + 1;
+        pos = tokenEnd;
+        i++;
+      }
+      const prefix = bang >= 0 ? fxParsePrefix(value.slice(0, bang)) : null;
+      out.push({ type: 'REF', start, end: tokenEnd, ref: { ...area, prefix, spill, bodyStart: start + bang + 1 } });
+    } else if (t.type === FX_TOKEN.REF_NAMED || t.type === FX_TOKEN.REF_STRUCT) {
+      // A table reference's own brackets come after the prefix: split at the last '!' before the first '[' of the
+      // table part ('[1]Sh'!Table1[Col], [@x]); a leading '[n]' is an external book.
+      const bang = fxPrefixEnd(value);
+      out.push({
+        type: t.type === FX_TOKEN.REF_NAMED ? 'NAME' : 'STRUCT',
+        start,
+        end,
+        prefix: bang > 0 ? fxParsePrefix(value.slice(0, bang)) : null,
+      });
+    } else if (
+      (t.type === FX_TOKEN.CONTEXT || t.type === FX_TOKEN.CONTEXT_QUOTE) &&
+      raw[i + 1]?.type === FX_TOKEN.OPERATOR &&
+      raw[i + 1].value === '!' &&
+      raw[i + 2]?.type === FX_TOKEN.ERROR &&
+      raw[i + 2].value.toUpperCase() === '#REF!' &&
+      raw[i + 1].loc?.[0] === end &&
+      raw[i + 2].loc?.[0] === end + 1
+    ) {
+      // Sheet1!#REF! (a reference Excel already broke): one token, so a sheet rename can still rewrite its prefix.
+      const errEnd = end + 1 + raw[i + 2].value.length;
+      if (formula.slice(end + 1, errEnd) !== raw[i + 2].value) return whole;
+      out.push({ type: 'ERR', start, end: errEnd, prefix: fxParsePrefix(value), refError: true });
+      pos = errEnd;
+      i += 2;
+    } else if (t.type === FX_TOKEN.UNKNOWN) {
+      out.push({ type: 'UNKNOWN', start, end });
+    } else {
+      out.push({ type: t.type, start, end });
+    }
+  }
+  if (pos !== formula.length) return whole;
+  return out;
+}
+
+/** Unquoted prefix of a name / table token: optional '[n]' book, sheet text, '!' ('[1]!Name', 'Sheet1!Name'). */
+const FX_PLAIN_PREFIX_RE = /^(?:\[[^\]]*\])?[^[\]'!]*!/;
+
+/**
+ * Offset of the '!' that ends the prefix of a name / table token, or -1 when it has none. A table reference's own
+ * brackets ('Table1[Col]', '[@x]', '[[#This Row],[a]]') never count as a prefix, nor does a '!' inside them.
+ */
+function fxPrefixEnd(value: string): number {
+  if (value.startsWith("'")) {
+    for (let i = 1; i < value.length; i++) {
+      if (value[i] !== "'") continue;
+      if (value[i + 1] === "'") {
+        i++;
+        continue;
+      }
+      return value[i + 1] === '!' ? i + 1 : -1;
+    }
+    return -1;
+  }
+  const m = FX_PLAIN_PREFIX_RE.exec(value);
+  return m ? m[0].length - 1 : -1;
+}
+
+/** Joins the tokens' text: always equals the formula they came from. */
+export function fxJoin(formula: string, tokens: readonly FxToken[]): string {
+  let out = '';
+  for (const t of tokens) out += formula.slice(t.start, t.end);
+  return out;
+}
+
+/** Excel's rule for sheet names in references (checked against Excel's own output: 33 names, s2-editmodel E1). */
+export function sheetNeedsQuotes(name: string): boolean {
+  if (!/^[\p{L}_\\][\p{L}0-9_.\\]*$/u.test(name)) return true; // spaces, punctuation, leading digit or dot, digits of other scripts (Excel quotes x٤)
+  if (/^(TRUE|FALSE)$/i.test(name)) return true;
+  const a1 = /^([A-Za-z]{1,3})([0-9]+)$/.exec(name); // looks like a cell (column <= XFD)
+  if (a1 && colToIndex(a1[1]) < MAX_COLS && +a1[2] >= 1 && +a1[2] <= MAX_ROWS) return true;
+  if (/^(R|C|RC|R[0-9]+|C[0-9]+|R[0-9]*C[0-9]*)$/i.test(name)) return true; // looks like R1C1
+  return false;
+}
+
+/** A sheet name as a reference prefix writes it (without the '!'): quoted only when Excel would. */
+export function quoteSheetForRef(name: string): string {
+  return sheetNeedsQuotes(name) ? `'${name.replace(/'/g, "''")}'` : name;
+}
+
+/** Prefix text including the '!'. `quoted` keeps quotes that were written; otherwise they follow sheetNeedsQuotes. */
+export function fxPrefixText(p: FxPrefix): string {
+  if (p.sheet1 === '' || p.sheet2 === '' || p.book === '') throw new RangeError('fx: empty sheet name in a reference prefix');
+  const inner = (p.book ?? '') + (p.sheet1 ?? '') + (p.sheet2 ? ':' + p.sheet2 : '');
+  const needs =
+    p.quoted ||
+    (p.book !== null && /[\\/ ']/.test(p.book)) ||
+    (p.sheet1 !== null && sheetNeedsQuotes(p.sheet1)) ||
+    (p.sheet2 !== null && sheetNeedsQuotes(p.sheet2));
+  return (needs ? `'${inner.replace(/'/g, "''")}'` : inner) + '!';
+}
+
+/** Throws a RangeError for a coordinate that is not an integer inside the grid (the caller must write #REF! itself); swapped corners are put in order. */
+function fxCheckedArea(a: FxArea): FxArea {
+  const ok = (n: number, max: number) => Number.isInteger(n) && n >= 0 && n < max;
+  const usesRow = a.kind !== 'cols';
+  const usesCol = a.kind !== 'rows';
+  const two = a.kind !== 'cell';
+  if (
+    (usesRow && !(ok(a.r0, MAX_ROWS) && (!two || ok(a.r1, MAX_ROWS)))) ||
+    (usesCol && !(ok(a.c0, MAX_COLS) && (!two || ok(a.c1, MAX_COLS))))
+  ) {
+    throw new RangeError('fx: reference outside the grid');
+  }
+  const swapR = two && usesRow && a.r0 > a.r1;
+  const swapC = two && usesCol && a.c0 > a.c1;
+  if (!swapR && !swapC) return a;
+  return {
+    ...a,
+    r0: swapR ? a.r1 : a.r0, r1: swapR ? a.r0 : a.r1, $r0: swapR ? a.$r1 : a.$r0, $r1: swapR ? a.$r0 : a.$r1,
+    c0: swapC ? a.c1 : a.c0, c1: swapC ? a.c0 : a.c1, $c0: swapC ? a.$c1 : a.$c0, $c1: swapC ? a.$c0 : a.$c1,
+  };
+}
+
+/** One end of a reference: 'B3', '$B$3', 'B' (cols), '3' (rows). */
+function fxEndText(kind: FxArea['kind'], r: number, c: number, $r: boolean, $c: boolean): string {
+  const col = (abs: boolean) => (abs ? '$' : '') + indexToCol(c);
+  const row = (abs: boolean) => (abs ? '$' : '') + (r + 1);
+  if (kind === 'cols') return col($c);
+  if (kind === 'rows') return row($r);
+  return col($c) + row($r);
+}
+
+/** Reference text of an area without prefix: 'A1', 'A1:B2', 'A:C', '2:4' (normalized, upper-case). */
+export function fxAreaText(a: FxArea): string {
+  const first = fxEndText(a.kind, a.r0, a.c0, a.$r0, a.$c0);
+  return a.kind === 'cell' ? first : `${first}:${fxEndText(a.kind, a.r1, a.c1, a.$r1, a.$c1)}`;
+}
+
+const FX_END_RE = /^(\$?)([A-Za-z]{1,3})?(\$?)(\d{1,7})?$/;
+
+function samePrefix(a: FxPrefix | null, b: FxPrefix | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.book === b.book && a.sheet1 === b.sheet1 && a.sheet2 === b.sheet2;
+}
+
+function sameArea(a: FxArea, b: FxArea): boolean {
+  return (
+    a.kind === b.kind && a.r0 === b.r0 && a.c0 === b.c0 && a.r1 === b.r1 && a.c1 === b.c1 &&
+    a.$r0 === b.$r0 && a.$c0 === b.$c0 && a.$r1 === b.$r1 && a.$c1 === b.$c1
+  );
+}
+
+/**
+ * New text of a 'REF' token. `next.prefix` (null = no prefix) and `next.area` replace the token's prefix and range;
+ * undefined keeps them. Unchanged parts keep their original spelling: the whole prefix text when the new prefix names
+ * the same book and sheets, the whole range text when the area is unchanged, and otherwise each end whose row, column
+ * and `$` flags are unchanged. The spill '#' is kept.
+ */
+export function fxEmitRef(formula: string, token: FxToken, next: { prefix?: FxPrefix | null; area?: FxArea }): string {
+  const ref = token.ref;
+  if (!ref) return formula.slice(token.start, token.end);
+  const bodyEnd = token.end - (ref.spill ? 1 : 0);
+  const oldPrefixText = formula.slice(token.start, ref.bodyStart);
+  const oldBody = formula.slice(ref.bodyStart, bodyEnd);
+  let prefixText = oldPrefixText;
+  if (next.prefix !== undefined && !samePrefix(next.prefix, ref.prefix)) {
+    prefixText = next.prefix === null ? '' : fxPrefixText(next.prefix);
+  }
+  let body = oldBody;
+  const area = next.area && fxCheckedArea(next.area);
+  if (area && !sameArea(area, ref)) {
+    const ends = oldBody.split(':');
+    const sameShape = area.kind === ref.kind && ends.length === (area.kind === 'cell' ? 1 : 2);
+    /** The old text of end `k` when it already says (r, c, $r, $c), else the new text. */
+    const keep = (k: 0 | 1, r: number, c: number, $r: boolean, $c: boolean): string => {
+      const m = sameShape ? FX_END_RE.exec(ends[k]) : null;
+      if (m) {
+        const hasCol = m[2] !== undefined;
+        const hasRow = m[4] !== undefined;
+        const colAbs = hasCol && m[1] === '$';
+        const rowAbs = hasCol ? m[3] === '$' : m[1] === '$' || m[3] === '$';
+        const colOk = area.kind === 'rows' ? !hasCol : hasCol && colToIndex(m[2]) === c && colAbs === $c;
+        const rowOk = area.kind === 'cols' ? !hasRow : hasRow && parseInt(m[4], 10) - 1 === r && rowAbs === $r;
+        if (colOk && rowOk) return ends[k];
+      }
+      return fxEndText(area.kind, r, c, $r, $c);
+    };
+    const first = keep(0, area.r0, area.c0, area.$r0, area.$c0);
+    body = area.kind === 'cell' ? first : `${first}:${keep(1, area.r1, area.c1, area.$r1, area.$c1)}`;
+  }
+  return prefixText + body + (ref.spill ? '#' : '');
+}
+
+/** Rebuilds a formula from its tokens: `replace` returns new text for a token, or null to keep its text. */
+export function fxEmit(formula: string, tokens: readonly FxToken[], replace: (token: FxToken) => string | null): string {
+  let out = '';
+  for (const t of tokens) out += replace(t) ?? formula.slice(t.start, t.end);
+  return out;
+}
 
 /** 'A' -> 0, 'XFD' -> 16383; -1 when not letters. */
 function colToIndex(letters: string): number {

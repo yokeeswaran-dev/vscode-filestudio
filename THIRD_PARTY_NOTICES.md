@@ -8,11 +8,12 @@ The list was made from the esbuild metafile of the production build (`node esbui
 DOMPurify is offered under MPL-2.0 OR Apache-2.0: FileStudio uses it under the Apache License 2.0. 
 pako is licensed under MIT AND Zlib: both texts are included.
 
-## Packages (170)
+## Packages (171)
 
 | Package | Version | Licence | Used in | Repository |
 | --- | --- | --- | --- | --- |
 | [@babel/runtime](#babel-runtime-7-20-1) | 7.20.1 | MIT | extension host (inside pptxtojson) | https://github.com/babel/babel/tree/HEAD/packages/babel-runtime |
+| [@borgar/fx](#borgar-fx-5-1-3) | 5.1.3 | MIT | extension host | https://github.com/borgar/fx |
 | [@braintree/sanitize-url](#braintree-sanitize-url-7-1-2) | 7.1.2 | MIT | webview | https://github.com/braintree/sanitize-url |
 | [@chevrotain/gast](#chevrotain-gast-13-2-0) | 13.2.0 | Apache-2.0 | webview (also inside @mermaid-js/parser) | https://github.com/Chevrotain/chevrotain |
 | [@chevrotain/regexp-to-ast](#chevrotain-regexp-to-ast-13-2-0) | 13.2.0 | Apache-2.0 | webview (also inside @mermaid-js/parser) | https://github.com/Chevrotain/chevrotain |
@@ -214,6 +215,24 @@ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
 LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
+<a id="borgar-fx-5-1-3"></a>
+### @borgar/fx 5.1.3
+
+- **@borgar/fx** 5.1.3 — MIT — https://github.com/borgar/fx  
+  Copyright 2021 Borgar Þorsteinsson
+
+````text
+MIT License
+
+Copyright 2021 Borgar Þorsteinsson
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ````
 
 <a id="braintree-sanitize-url-7-1-2"></a>

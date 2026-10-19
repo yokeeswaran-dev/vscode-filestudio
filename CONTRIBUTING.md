@@ -38,6 +38,7 @@ npm run build
 | `npm run build` | Bundles the extension and the webview into `dist/` with esbuild (development build with source maps). |
 | `npm run watch` | Same as `build`, and rebuilds on every change. |
 | `npm run typecheck` | Type-checks the TypeScript code (`tsc --noEmit`). |
+| `npm run typecheck:webview` | Type-checks `media/viewer.js` (plain JavaScript with JSDoc types) in TypeScript strict mode. |
 | `npm test` | Bundles the renderers, the webview script and the extension host code into `test/.out/`, then runs the unit tests in `test/unit/` and the host tests in `test/host/` (host code against a fake `vscode` module, `test/host/fake-vscode.js`) with Node's built-in test runner. |
 | `npm run test:integration` | Runs the integration tests in `test/integration/` inside a real VS Code (run `npm run build` first). See below. |
 | `npm run samples` | Regenerates the sample files in `test/samples/` (`node test/generate-samples.js`). |
@@ -127,6 +128,12 @@ The renderers in `src/renderers/` do not import `vscode`, so they can be tested 
 The message types shared by the extension and the webview are defined in `src/viewerProvider.ts`
 (and `src/renderers/*.ts`). Keep them in sync with `media/viewer.js`.
 
+Integration tests talk to the extension through a small **test API**: in the extension test host
+(`ExtensionMode.Test`) `activate()` returns an object with `version`, `post(uri, message)` (send a webview message as
+if from the first panel of that document and get the messages posted back), `state(uri)` and `answer(id, button)`
+(queue the answer to the next prompt of that kind; without one a prompt counts as Cancel). It is defined in
+`src/viewerProvider.ts` (section `TEST API`) and is never returned in a normal VS Code window.
+
 ## Coding style
 
 - Follow the **[.editorconfig](.editorconfig)**: UTF-8, LF line endings, 2 spaces, a final newline.
@@ -174,6 +181,7 @@ release steps), so all three branches start from the released code. Always `git 
 
    ```bash
    npm run typecheck
+   npm run typecheck:webview
    npm test
    npm run build
    npm run test:integration
@@ -210,7 +218,7 @@ docs: explain the Markdown default editor setting
 ### Pull request checklist
 
 - [ ] The change is focused on one topic.
-- [ ] `npm run typecheck`, `npm test`, `npm run build` and `npm run test:integration` pass.
+- [ ] `npm run typecheck`, `npm run typecheck:webview`, `npm test`, `npm run build` and `npm run test:integration` pass.
 - [ ] The change was tested in VS Code (light and dark theme).
 - [ ] Tests were added or updated where it makes sense.
 - [ ] `CHANGELOG.md` is updated (for changes users will notice).

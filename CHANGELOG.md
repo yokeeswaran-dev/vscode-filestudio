@@ -7,6 +7,13 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+#### General
+
+- New settings to turn editing off: **FileStudio > Editing: Enabled** (all formats), and one for each of
+  `.xlsx`, delimited text (`.csv` and similar) and Markdown. They are on by default.
+
 ## [0.1.2] - 2026-10-11
 
 ### Fixed
