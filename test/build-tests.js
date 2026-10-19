@@ -6,7 +6,7 @@
 //                          empty, DOMPurify is a stub (it needs a real DOM) and the lazily imported libraries (mermaid,
 //                          pdf.js, ECharts) stay external. The test provides the few browser globals it needs at load.
 //   test/.out/host.js    - src/extension.ts + src/viewerProvider.ts for test/host/ (`vscode` external: the tests map
-//                          it to test/host/fake-vscode.js).
+//                          it to test/host/fake-vscode.js). ViewerSession is exported too (in memory only).
 // Usage: node test/build-tests.js
 const esbuild = require('esbuild');
 const fs = require('fs');
@@ -50,6 +50,20 @@ const viewerTestPlugin = {
   },
 };
 
+// Exports the module-private ViewerSession class in the host bundle (in memory; src/ is not changed), so host tests can
+// install their own edit handlers the way the edit phases do.
+const exportSession = {
+  name: 'export-session',
+  setup(build) {
+    build.onLoad({ filter: /[\\/]viewerProvider\.ts$/ }, async (args) => {
+      const src = await fs.promises.readFile(args.path, 'utf8');
+      const out = src.replace('\nclass ViewerSession implements', '\nexport class ViewerSession implements');
+      if (out === src) throw new Error('ViewerSession declaration not found');
+      return { contents: out, loader: 'ts' };
+    });
+  },
+};
+
 const common = { absWorkingDir: ROOT, outdir: OUT, bundle: true, platform: 'node', format: 'cjs', target: 'node18', logLevel: 'warning' };
 
 Promise.all([
@@ -76,5 +90,6 @@ Promise.all([
       loader: 'ts',
     },
     external: ['vscode'],
+    plugins: [exportSession],
   }),
 ]).catch(() => process.exit(1));

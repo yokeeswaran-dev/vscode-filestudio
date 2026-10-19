@@ -152,6 +152,9 @@ class FileSystemError extends Error {
   }
 }
 const FileType = { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 };
+// enums the F code uses.
+const ExtensionMode = { Production: 1, Development: 2, Test: 3 };
+const EndOfLine = { LF: 1, CRLF: 2 };
 const ViewColumn = { Active: -1, Beside: -2, One: 1, Two: 2, Three: 3 };
 class TabInputText {
   constructor(uri) {
@@ -487,6 +490,8 @@ function reset() {
 }
 
 module.exports = {
+  ExtensionMode,
+  EndOfLine,
   Uri,
   EventEmitter,
   Position,
