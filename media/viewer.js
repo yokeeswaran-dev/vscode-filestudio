@@ -39,6 +39,29 @@ import DOMPurify from 'dompurify';
 /** @typedef {Extract<HostMessage, { type: 'stats' }>} StatsMessage */
 /** @typedef {Extract<HostMessage, { type: 'invalidate' }>} InvalidateMessage */
 /** @typedef {{ message: string, detail?: string, canReopenAsText?: boolean }} ErrorInfo */
+// (v0.2.0) Editing protocol (contract §2.7), declared once by track F; the editing phases use these names.
+/** @typedef {import('../src/renderers/sheet').SheetId} SheetId */
+/** @typedef {import('../src/renderers/sheet').CfPaint} CfPaint */
+/** @typedef {import('../src/renderers/sheet').EditIntent} EditIntent */
+/** @typedef {import('../src/renderers/sheet').EditKind} EditKind */
+/** @typedef {import('../src/renderers/sheet').FindQuery} FindQuery */
+/** @typedef {import('../src/renderers/sheet').StyleDelta} StyleDelta */
+/** @typedef {import('../src/renderers/sheet').BorderSide} BorderSide */
+/** @typedef {import('../src/renderers/markdown').MdBlock} MdSourceBlock (the name MdBlock is the preview's rendered block, MARKDOWN) */
+/** @typedef {import('../src/renderers/markdown').MdTextEdit} MdTextEdit */
+/** @typedef {import('../src/viewerProvider').EditRejectCode} EditRejectCode */
+/** @typedef {import('../src/viewerProvider').EditState} EditState */
+/** @typedef {import('../src/viewerProvider').RowsPatch} RowsPatch */
+/** @typedef {Extract<HostMessage, { type: 'editResult' }>} EditResultMessage */
+/** @typedef {Extract<HostMessage, { type: 'patch' }>} PatchMessage */
+/** @typedef {Extract<HostMessage, { type: 'editState' }>} EditStateMessage */
+/** @typedef {Extract<HostMessage, { type: 'recalcState' }>} RecalcStateMessage */
+/** @typedef {Extract<HostMessage, { type: 'findResult' }>} FindResultMessage */
+/** @typedef {Extract<HostMessage, { type: 'filterResult' }>} FilterResultMessage */
+/** @typedef {Extract<HostMessage, { type: 'columnTexts' }>} ColumnTextsMessage */
+/** @typedef {Extract<HostMessage, { type: 'revealLine' }>} RevealLineMessage */
+/** @typedef {Extract<HostMessage, { type: 'flushRequest' }>} FlushRequestMessage */
+/** @typedef {Extract<WebviewMessage, { type: 'edit' }>} EditMessage */
 
 // ===== BOOTSTRAP & MESSAGING =====
 
@@ -108,6 +131,25 @@ function dispatch(msg) {
     case 'error':
       showError(msg);
       break;
+    // ----- (v0.2.0) editing messages: declared by track F; the owning phase adds its call in its case -----
+    case 'editResult':
+      /* P2 grid, P3 csv, P6 markdown */ break;
+    case 'patch':
+      /* P2 */ break;
+    case 'editState':
+      /* P2 grid, P6 markdown */ break;
+    case 'recalcState':
+      /* P5 */ break;
+    case 'findResult':
+      /* P3 / P4 */ break;
+    case 'filterResult':
+      /* P4 */ break;
+    case 'columnTexts':
+      /* P4 */ break;
+    case 'revealLine':
+      /* P6 */ break;
+    case 'flushRequest':
+      /* P6 */ break;
   }
 }
 
@@ -6511,7 +6553,7 @@ function formatCount(n) {
 /**
  * @typedef {{ level: number, text: string, slug: string, line: number }} MdTocEntry
  * @typedef {{ type?: string, kind?: string, fileName?: string, html: string, toc?: MdTocEntry[], source?: string,
- *   mode?: string, version: number, readOnly?: boolean }} MdMessage  Fields shared by `init` (kind 'markdown') and
+ *   mode?: string, version: number, readOnly?: boolean, editState?: { editable?: boolean, reason?: string } }} MdMessage  Fields shared by `init` (kind 'markdown') and
  *   `markdownUpdate` (`readOnly`: the document cannot be edited, task checkboxes are disabled; an update without it
  *   keeps the current state).
  * @typedef {{ key: string, dark: boolean, variables: Record<string, string | boolean> }} MdMermaidTheme
@@ -6614,6 +6656,8 @@ const mdState = {
   version: 0,
   /** The document is read-only (a git: version, a file VS Code shows read-only): task checkboxes are disabled. */
   readOnly: false,
+  /** Why editing is off (editState.reason), shown as the tooltip of disabled task checkboxes; '' = plain read-only. */
+  readOnlyReason: '',
   /** Bumped on every render; async work belonging to an older render is dropped. */
   generation: 0,
   /** Mermaid theme of the diagrams on screen (set by every render). @type {MdMermaidTheme} */
@@ -6776,6 +6820,8 @@ function updateMarkdown(msg) {
  * @param {MdMessage} msg
  */
 function mdAcceptMessage(msg) {
+  const why = msg.editState && typeof msg.editState === 'object' ? msg.editState.reason : undefined;
+  if (typeof why === 'string' || msg.type === 'init' || typeof msg.readOnly === 'boolean') mdState.readOnlyReason = typeof why === 'string' && why ? why : '';
   if (msg.type === 'init') mdState.readOnly = msg.readOnly === true;
   else if (typeof msg.readOnly === 'boolean') mdState.readOnly = msg.readOnly;
   mdState.version = Number.isFinite(msg.version) ? msg.version : mdState.version;
@@ -8197,11 +8243,14 @@ function mdIsTaskCheckbox(el) {
 function mdSetTasksReadOnly(container) {
   const readOnly = mdState.readOnly;
   for (const input of mdTaskCheckboxes(container)) {
-    if (mdReadOnlyTasks.has(input) === readOnly) continue;
+    if (mdReadOnlyTasks.has(input) === readOnly) {
+      if (readOnly) input.title = mdState.readOnlyReason || MD_READ_ONLY_TASK_TITLE; // the reason can change while still read-only
+      continue;
+    }
     input.disabled = readOnly;
     if (readOnly) {
       mdReadOnlyTasks.add(input);
-      input.title = MD_READ_ONLY_TASK_TITLE;
+      input.title = mdState.readOnlyReason || MD_READ_ONLY_TASK_TITLE;
     } else {
       mdReadOnlyTasks.delete(input);
       input.removeAttribute('title');

@@ -38,7 +38,9 @@ npm run build
 | `npm run build` | Bundles the extension and the webview into `dist/` with esbuild (development build with source maps). |
 | `npm run watch` | Same as `build`, and rebuilds on every change. |
 | `npm run typecheck` | Type-checks the TypeScript code (`tsc --noEmit`). |
-| `npm test` | Bundles the renderers into `test/.out/` and runs the unit tests in `test/unit/` with Node's built-in test runner. |
+| `npm run typecheck:webview` | Type-checks `media/viewer.js` (plain JavaScript with JSDoc types) in TypeScript strict mode. |
+| `npm test` | Bundles the renderers, the webview script and the extension host code into `test/.out/`, then runs the unit tests in `test/unit/` and the host tests in `test/host/` (host code against a fake `vscode` module, `test/host/fake-vscode.js`) with Node's built-in test runner. |
+| `npm run test:integration` | Runs the integration tests in `test/integration/` inside a real VS Code (run `npm run build` first). See below. |
 | `npm run samples` | Regenerates the sample files in `test/samples/` (`node test/generate-samples.js`). |
 | `npm run package` | Production build (minified, no source maps). Used when packaging. |
 
@@ -58,6 +60,42 @@ Useful for debugging:
 About `npm run samples`: `large.xlsx` (100,000 rows × 50 columns, about 44 MB) is not in Git. The script creates it
 when it is missing. Use `node test/generate-samples.js --skip-large` to skip it.
 
+### Integration tests
+
+The integration tests start a real VS Code with FileStudio loaded from this folder (the build in `dist/`) and run
+`test/integration/*.test.js` in it with a small runner (`test/integration/suite/index.js`, no test framework). They
+open every sample with its FileStudio editor and check the tab, the dirty state, the file bytes and the logs, and that
+every viewer starts (reports 'ready'). The runner stops at once when `dist/` is older than `src/` or `media/`: run
+`npm run build` first.
+
+```bash
+npm run build
+npm run test:integration
+# Linux without a display (for example in CI or over SSH):
+xvfb-run -a npm run test:integration
+```
+
+- The first run downloads the latest stable VS Code into `.vscode-test/` (not in Git) and reuses it later.
+  To use a VS Code you already installed instead, set `FS_VSCODE_EXE` to its executable, for example
+  `FS_VSCODE_EXE="$LOCALAPPDATA/Programs/Microsoft VS Code/Code.exe"` (Git Bash on Windows).
+  `FS_VSCODE_VERSION` picks another version to download (for example `insiders` or `1.123.0`).
+- Every run uses its own profile and extensions folder in the OS temp folder, with all other extensions turned
+  off. The workspace is a temporary copy of `test/samples` without `large.xlsx`; the tests never change
+  `test/samples` itself. You can keep using your own VS Code window while the tests run.
+- After a passing run, the temporary folder is deleted. After a failing run, it is kept (the path is printed): its
+  `user-data/logs` folder has the FileStudio log. Set `FS_IT_KEEP=1` to keep it always, `FS_IT_TMPDIR` to put it
+  somewhere else, and `FS_IT_GREP=<text>` to run only the tests whose name contains the text.
+  In CI, a failing run uploads these logs as the artifact `integration-logs-<os>`.
+- To add tests, create `test/integration/<name>.test.js` and use the helpers in `test/integration/helpers.js`
+  (open a file with its FileStudio editor, wait for a condition, read file bytes, check the dirty state and the
+  log, close all editors). Work on a copy of a sample (`copyFile`) when the test changes a file.
+- A test file uses the globals `suite(title, fn)`, `test(title, fn)` or `test(title, { timeout: ms }, fn)` (the
+  default limit is 60 s), `suiteSetup`, `suiteTeardown`, `setup` and `teardown`, and `node:assert` for the checks.
+  Functions may be `async`; `done` callbacks are not supported. Each test prints a `PASS` or `FAIL` line.
+- The log check fails a test on errors and warnings in the FileStudio log, and on errors in the extension host
+  log (`exthost.log`) that name the extension or come from its code in `dist/` or `src/` (for example a listener
+  that throws, or an unhandled promise rejection).
+
 ## Project layout
 
 ```text
@@ -76,9 +114,11 @@ media/
 esbuild.js              Build script (extension, webview, pdf.js worker and data files)
 test/
   unit/                 Unit tests (Node's test runner)
+  host/                 Host tests: extension code against a fake `vscode` module (fake-vscode.js)
+  integration/          Integration tests in a real VS Code (@vscode/test-electron and a small runner)
   samples/              Sample files used for manual and automated tests
   generate-samples.js   Creates the sample files
-  build-tests.js        Bundles the renderers for the unit tests
+  build-tests.js        Bundles the renderers, the webview script and the host code for the unit and host tests
 assets/
   icon.png              Extension icon
   screenshots/          Screenshots used in the README
@@ -87,6 +127,12 @@ assets/
 The renderers in `src/renderers/` do not import `vscode`, so they can be tested with plain Node.
 The message types shared by the extension and the webview are defined in `src/viewerProvider.ts`
 (and `src/renderers/*.ts`). Keep them in sync with `media/viewer.js`.
+
+Integration tests talk to the extension through a small **test API**: in the extension test host
+(`ExtensionMode.Test`) `activate()` returns an object with `version`, `post(uri, message)` (send a webview message as
+if from the first panel of that document and get the messages posted back), `state(uri)` and `answer(id, button)`
+(queue the answer to the next prompt of that kind; without one a prompt counts as Cancel). It is defined in
+`src/viewerProvider.ts` (section `TEST API`) and is never returned in a normal VS Code window.
 
 ## Coding style
 
@@ -135,8 +181,10 @@ release steps), so all three branches start from the released code. Always `git 
 
    ```bash
    npm run typecheck
+   npm run typecheck:webview
    npm test
    npm run build
+   npm run test:integration
    ```
 
 5. Test the change by hand in the Extension Development Host (F5), in a light and a dark theme.
@@ -170,7 +218,7 @@ docs: explain the Markdown default editor setting
 ### Pull request checklist
 
 - [ ] The change is focused on one topic.
-- [ ] `npm run typecheck`, `npm test` and `npm run build` pass.
+- [ ] `npm run typecheck`, `npm run typecheck:webview`, `npm test`, `npm run build` and `npm run test:integration` pass.
 - [ ] The change was tested in VS Code (light and dark theme).
 - [ ] Tests were added or updated where it makes sense.
 - [ ] `CHANGELOG.md` is updated (for changes users will notice).

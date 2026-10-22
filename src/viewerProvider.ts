@@ -11,6 +11,8 @@
 import type { CellStyle, Range, RowData, SelectionStats, WorkbookMeta } from './renderers/sheet';
 import type { TaskMarker, TocEntry } from './renderers/markdown';
 import type { PptxDeckMeta, PptxSlide } from './renderers/pptx';
+import type { BorderSide, EditIntent, EditKind, FindQuery, SheetId, SheetMeta, StyleDelta } from './renderers/sheet';
+import type { MdBlock, MdTextEdit } from './renderers/markdown';
 
 import { execFile } from 'child_process';
 import { randomBytes } from 'crypto';
@@ -42,6 +44,46 @@ export type ViewKind = 'sheet' | 'csv' | 'markdown' | 'docx' | 'pdf' | 'pptx';
 export type DelimitedFormat = 'csv' | 'tsv' | 'psv' | 'ssv';
 export type MarkdownMode = 'preview' | 'split' | 'wysiwyg';
 
+// ----- editing (v0.2.0) -----
+// Declared once by track F (contract §2.7, D-062); later phases add handlers only. The host is the authority: every
+// `edit` is checked again on the host (SHARED: EDIT GATE) and answered with exactly one `editResult`.
+
+/** Why an edit was not applied (or why a document is not editable). Texts: EDIT_TEXT (SHARED: EDIT GATE). */
+export type EditRejectCode = 'stale' | 'readOnly' | 'disabled' | 'lossy' | 'fidelity' | 'blocked' | 'invalid' | 'failed' | 'internal';
+
+/** Whether a document can be edited now; sent in `init` / `invalidate` / `markdownUpdate` and as `editState`. */
+export interface EditState {
+  editable: boolean;
+  /** Why not editable. */
+  code?: EditRejectCode;
+  /** User text, shown in the banner / status line. */
+  reason?: string;
+  /** lossy (xlsx) / fidelity (csv, Markdown WYSIWYG): the host offers "Edit anyway" (a modal it shows itself). */
+  canEditAnyway?: { title: string; details: string[] };
+  /** Intents this document supports now (the webview shows only these actions). */
+  kinds?: EditKind[];
+}
+
+/** Replaces rows [start, end) of a sheet in the webview's row cache. */
+export interface RowsPatch {
+  sheetId: SheetId;
+  start: number;
+  end: number;
+  rows: RowData[];
+  styles: [number, CellStyle][];
+}
+
+/** Every modal question the host asks (`ask()`); integration tests answer them through the test API. */
+export type AskId =
+  | 'editAnyway'
+  | 'bakFailed'
+  | 'diskChangedOnSave'
+  | 'mergeClears'
+  | 'sheetDelete'
+  | 'fidelity'
+  | 'ownerFile'
+  | 'inPlaceNoBackup';
+
 /** Extension -> webview. */
 export type HostMessage =
   | {
@@ -54,6 +96,10 @@ export type HostMessage =
       banner?: string;
       /** kind 'csv' only: which delimited format and the delimiter actually used (' ' = runs of spaces). */
       delimited?: { format: DelimitedFormat; delimiter: string };
+      /** (v0.2.0) Host version of the document (one counter per document; +1 on every content change). */
+      version?: number;
+      /** (v0.2.0) Whether the grid may be edited; `readOnly` stays `!editState.editable`. */
+      editState?: EditState;
     }
   | {
       type: 'init';
@@ -71,6 +117,16 @@ export type HostMessage =
        * follows a change of this state while the file is open (a settings change).
        */
       readOnly?: boolean;
+      /** (v0.2.0) Whether FileStudio may change the document (task toggles, WYSIWYG); `readOnly` = `!editState.editable`. */
+      editState?: EditState;
+      /** (v0.2.0, P6) Top-level blocks of `source` for the WYSIWYG editor. */
+      blocks?: MdBlock[];
+      /** (v0.2.0, P6) Line break of the document. */
+      eol?: '\n' | '\r\n';
+      /** (v0.2.0, P6) Whether WYSIWYG can be used for this document (and why not). */
+      limits?: { wysiwyg: boolean; reason?: string };
+      /** (v0.2.0, P6) Webview URI base for relative resources in WYSIWYG mode. */
+      resourceBase?: string;
     }
   | {
       type: 'init';
@@ -121,6 +177,10 @@ export type HostMessage =
       c1?: number;
       rows: RowData[];
       styles: [number, CellStyle][];
+      /** (v0.2.0) Document version the rows were read from (the webview drops older ones). */
+      version?: number;
+      /** (v0.2.0) Sheet the rows belong to (the webview drops rows of a sheet it did not ask for). */
+      sheetId?: SheetId;
     }
   /**
    * Reply to getStats. Besides the numbers, `stats.errors` counts error cells (then the status bar shows only Count,
@@ -137,9 +197,26 @@ export type HostMessage =
        * removed on disk (a chart). Absent = keep the banner as it is (CSV).
        */
       banner?: string | null;
+      /** (v0.2.0) Host version of the document after the change. */
+      version?: number;
+      /** (v0.2.0) Edit state after the change. */
+      editState?: EditState;
     }
-  /** `readOnly`: as in the markdown init (sent again with every update, so a change of the state reaches the view). */
-  | { type: 'markdownUpdate'; html: string; toc: TocEntry[]; source: string; version: number; readOnly?: boolean }
+  /**
+   * `readOnly`: as in the markdown init (sent again with every update, so a change of the state reaches the view).
+   * (v0.2.0) `editState`, `blocks`, `eol`: as in the markdown init; `html` may be '' while the panel is in WYSIWYG.
+   */
+  | {
+      type: 'markdownUpdate';
+      html: string;
+      toc: TocEntry[];
+      source: string;
+      version: number;
+      readOnly?: boolean;
+      editState?: EditState;
+      blocks?: MdBlock[];
+      eol?: '\n' | '\r\n';
+    }
   /**
    * A link to the document itself was followed (`readme.md#usage` in readme.md, `file:///C:/x/self.docx#intro` in
    * self.docx): scroll the markdown / docx view to `fragment` (decoded; '' = the top), like an in-page `#usage` link.
@@ -165,7 +242,48 @@ export type HostMessage =
       detail?: string;
       /** csv/md: offer "Reopen as Text". xlsx/docx/pdf/pptx: offer "Reveal in Explorer" instead. */
       canReopenAsText: boolean;
-    };
+    }
+  // ---------- (v0.2.0) editing: declared by track F, handled by P1-P6 ----------
+  /** Answer to one `edit` (exactly one per edit): applied, with the new version and the changed rows. */
+  | { type: 'editResult'; editId: number; accepted: true; version: number; patches?: RowsPatch[]; select?: { sheetId: SheetId; range: Range } }
+  /** Answer to one `edit`: not applied; the webview rolls back its overlay and shows `reason` in the status line. */
+  | { type: 'editResult'; editId: number; accepted: false; code: EditRejectCode; reason: string; version: number; where?: string[] }
+  /**
+   * Content changed by another panel, undo/redo or recalc. `sheets` replaces those sheets' meta (by id) without
+   * dropping the row cache.
+   */
+  | { type: 'patch'; version: number; patches: RowsPatch[]; sheets?: SheetMeta[]; styles?: [number, CellStyle][] }
+  | { type: 'editState'; state: EditState }
+  /** P5: recalculation progress. */
+  | { type: 'recalcState'; busy: boolean; done?: number; total?: number; circular?: string }
+  /** P3/P4: answer to `find`. */
+  | {
+      type: 'findResult';
+      reqId: number;
+      version: number;
+      matches: { sheetId: SheetId; r: number; c: number }[];
+      total: number;
+      truncated: boolean;
+      error?: string;
+    }
+  /** P4: answer to `filter`. */
+  | {
+      type: 'filterResult';
+      reqId: number;
+      version: number;
+      sheetId: SheetId;
+      values?: { text: string; count: number }[];
+      hidden?: [start: number, end: number][];
+      truncated?: boolean;
+      /** The request could not be read (a read is never left unanswered). */
+      error?: string;
+    }
+  /** P4 auto-fit: answer to `measure` (the longest texts of a row / column). */
+  | { type: 'columnTexts'; reqId: number; version: number; sheetId: SheetId; axis: 'row' | 'col'; index: number; texts: { text: string; s?: number }[]; error?: string }
+  /** P6 split sync: scroll the preview to this (fractional) source line. */
+  | { type: 'revealLine'; line: number }
+  /** P6 WYSIWYG: send pending typing now (answered by `edit` messages, then `flushed`). */
+  | { type: 'flushRequest'; id: number };
 
 /** Webview -> extension. */
 export type WebviewMessage =
@@ -174,8 +292,9 @@ export type WebviewMessage =
    * Rows [start, end) of a sheet. Optional `c0` / `c1`: only the cells of columns c0..c1 (inclusive), e.g. to copy
    * a few columns of a large sheet without converting every cell of its rows.
    */
-  | { type: 'getRows'; reqId: number; sheet: number; start: number; end: number; c0?: number; c1?: number }
-  | { type: 'getStats'; reqId: number; sheet: number; ranges: Range[] }
+  | { type: 'getRows'; reqId: number; sheet: number; start: number; end: number; c0?: number; c1?: number; sheetId?: SheetId }
+  /** (v0.2.0) `sheetId` (getRows too): the host resolves the sheet by id when given; `sheet` stays for 0.1.2. */
+  | { type: 'getStats'; reqId: number; sheet: number; ranges: Range[]; sheetId?: SheetId }
   /** External URL (http/https/mailto), a path relative to the document, or a workspace file. */
   | { type: 'openLink'; href: string }
   /**
@@ -187,7 +306,29 @@ export type WebviewMessage =
   | { type: 'getSlide'; reqId: number; index: number }
   | { type: 'reopenAsText' }
   | { type: 'revealInExplorer' }
-  | { type: 'log'; level: 'info' | 'warn' | 'error'; message: string };
+  | { type: 'log'; level: 'info' | 'warn' | 'error'; message: string }
+  // ---------- (v0.2.0) editing: declared by track F, handled by P1-P6 ----------
+  /**
+   * One user action = one edit = one VS Code undo step. Always answered with exactly one `editResult` (same `editId`).
+   * `then: 'save'`: save the document after the edit was applied (Ctrl+S while the cell editor is open).
+   */
+  | { type: 'edit'; editId: number; baseVersion: number; intent: EditIntent; then?: 'save' }
+  /** "Edit anyway" was clicked: the host shows its own modal (lossy xlsx / fidelity csv, md); this is never consent. */
+  | { type: 'editAnyway' }
+  /** P3/P4: find cells (answered with `findResult`). */
+  | { type: 'find'; reqId: number; query: FindQuery; from?: { sheetId: SheetId; r: number; c: number }; direction: 'next' | 'prev' | 'all' }
+  /** P4: list a column's values (`keep` absent), filter to `keep`, or clear the filter (`keep` null). */
+  | { type: 'filter'; reqId: number; sheetId: SheetId; col: number; keep?: string[] | null }
+  /** P4 auto-fit: the longest texts of a row / column (answered with `columnTexts`). */
+  | { type: 'measure'; reqId: number; sheetId: SheetId; axis: 'row' | 'col'; index: number }
+  /** P6 WYSIWYG; P2 grid while an edit is in flight (D-067). The host runs it after the queued edits. */
+  | { type: 'command'; id: 'undo' | 'redo' | 'save' }
+  /** P6: switch the Markdown mode of this panel. */
+  | { type: 'setMode'; mode: MarkdownMode }
+  /** P6 split sync: the preview scrolled to this (fractional) source line. */
+  | { type: 'previewScrolled'; line: number }
+  /** P6 WYSIWYG: answer to `flushRequest`, sent after the flush's edit message. */
+  | { type: 'flushed'; id: number };
 
 // ===== IMPLEMENTATION =====
 
@@ -417,11 +558,403 @@ function toRange(value: unknown): Range | undefined {
   return { r0: Math.min(r0, r1), c0: Math.min(c0, c1), r1: Math.max(r0, r1), c1: Math.max(c0, c1) };
 }
 
+// ----- edit messages (v0.2.0, contract §2.7) -----
+// Shape and limits of every editing message. Unlike the read requests above, numbers in an `edit` are never clamped
+// or truncated (row -1 must not become row 0): a value out of range makes the whole edit `invalid`. The meaning is
+// checked again by the phase's planner (planEdit / planCsvEdit / Markdown checks).
+
+/** Limits of `parseWebviewMessage` for editing messages (contract §2.7). */
+export const EDIT_LIMITS = {
+  /** Cells in one setCells. */
+  cells: 1_000_000,
+  /** Characters of one cell value: xlsx (Excel's limit) and csv. */
+  xlsxValueChars: 32_767,
+  csvValueChars: 1024 * 1024,
+  /** All text of one edit together. */
+  totalChars: 16 * 1024 * 1024,
+  ranges: 1_000,
+  /** Rows / columns inserted or deleted at once (Excel's row count). */
+  count: 1_048_576,
+  /** FindQuery.text and the replace text. */
+  findChars: 1_000,
+  /** Markdown text edits in one mdText, and their characters (oldText + text). */
+  mdEdits: 256,
+  mdChars: 4 * 1024 * 1024,
+  sheetNameChars: 31,
+  /** OOXML number format codes (Excel's limit). */
+  numFmtChars: 255,
+  /** Values in one filter `keep` list. */
+  filterValues: 1_000_000,
+  /** Largest row height / column width in px. */
+  sizePx: 65_535,
+} as const;
+
+/** Excel's last row / column (0-based): a bound for xlsx (kind 'sheet') positions. */
+const XLSX_MAX_ROW = 1_048_575;
+const XLSX_MAX_COL = 16_383;
+/** xlsx: 's' + the <sheet sheetId> attribute; csv: 'csv' (SheetId, contract §2.1). */
+const SHEET_ID_RE = /^(?:s[0-9]{1,10}|csv)$/;
+const ARGB_RE = /^[0-9A-F]{8}$/i;
+/** C0 and C1 control characters and DEL (not allowed in sheet names). */
+const CONTROL_CHAR_RE = /[\u0000-\u001F\u007F-\u009F\uFFFE\uFFFF]/;
+/** C0 controls and U+FFFE / U+FFFF: not allowed in XML text (numFmt is written into styles.xml). */
+const XML_INVALID_RE = /[\u0000-\u001F\uFFFE\uFFFF]/;
+/** A UTF-16 surrogate without its partner: UTF-8 would silently store U+FFFD instead (D-071). */
+const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+const BORDER_STYLES = ['thin', 'medium', 'thick', 'dashed', 'dotted', 'double', 'hair'] as const;
+
+/** A refused editing message: `message` is the user text of the `editResult` (code 'invalid'). */
+class EditShapeError extends Error {}
+
+function badEdit(reason: string = EDIT_TEXT.invalid): never {
+  throw new EditShapeError(reason);
+}
+
+/** An integer in [0, max] exactly as sent (no truncation, no clamping), or undefined. */
+function toIndex(value: unknown, max: number): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= max ? value : undefined;
+}
+
+function toSheetId(value: unknown): SheetId | undefined {
+  return typeof value === 'string' && SHEET_ID_RE.test(value) ? value : undefined;
+}
+
+function editIndex(value: unknown, max: number): number {
+  return toIndex(value, max) ?? badEdit();
+}
+
+function editBool(value: unknown): boolean {
+  return typeof value === 'boolean' ? value : badEdit();
+}
+
+/** A sheet id; when the view kind is known, 'csv' for a CSV view and s<n> for a workbook view (nothing else). */
+function editSheetId(value: unknown, kind?: ViewKind): SheetId {
+  const id = toSheetId(value) ?? badEdit();
+  if (kind === 'csv' ? id !== 'csv' : kind === 'sheet' && id === 'csv') badEdit();
+  return id;
+}
+
+function editEnum<T extends string>(value: unknown, values: readonly T[]): T {
+  return typeof value === 'string' && (values as readonly string[]).includes(value) ? (value as T) : badEdit();
+}
+
+function editArgb(value: unknown): string {
+  return typeof value === 'string' && ARGB_RE.test(value) ? value : badEdit();
+}
+
+/** Text budget of one message (EDIT_LIMITS.totalChars) and whether its text goes into an xlsx file. */
+interface EditTextBudget {
+  chars: number;
+  readonly xlsx: boolean;
+}
+
+/** A string of at most `max` characters, counted against the message budget; text written to a file has no lone surrogate (it would become U+FFFD). */
+function editText(value: unknown, max: number, budget: EditTextBudget, tooLong: string): string {
+  if (typeof value !== 'string') badEdit();
+  if (value.length > max) badEdit(EDIT_TEXT.tooLarge(tooLong));
+  budget.chars += value.length;
+  if (budget.chars > EDIT_LIMITS.totalChars) badEdit(EDIT_TEXT.tooLarge('16 million characters of text'));
+  if (LONE_SURROGATE_RE.test(value)) badEdit(EDIT_TEXT.loneSurrogate);
+  return value;
+}
+
+/** Sheet name: 1-31 characters, no control characters (Excel's other name rules are the planner's). */
+function editSheetName(value: unknown, budget: EditTextBudget): string {
+  const name = editText(value, EDIT_LIMITS.sheetNameChars, budget, '31 characters in a sheet name');
+  if (name.length === 0 || CONTROL_CHAR_RE.test(name)) badEdit(EDIT_TEXT.badSheetName);
+  return name;
+}
+
+/** Row/column bounds of the document kind: Excel's grid for xlsx, MAX_INDEX otherwise (CSV may have more rows). */
+function gridBounds(kind: ViewKind | undefined): { maxRow: number; maxCol: number } {
+  return kind === 'sheet' ? { maxRow: XLSX_MAX_ROW, maxCol: XLSX_MAX_COL } : { maxRow: MAX_INDEX, maxCol: MAX_INDEX };
+}
+
+function editRange(value: unknown, kind: ViewKind | undefined): Range {
+  if (!isRecord(value)) badEdit();
+  const { maxRow, maxCol } = gridBounds(kind);
+  const r0 = editIndex(value.r0, maxRow);
+  const c0 = editIndex(value.c0, maxCol);
+  const r1 = editIndex(value.r1, maxRow);
+  const c1 = editIndex(value.c1, maxCol);
+  return { r0: Math.min(r0, r1), c0: Math.min(c0, c1), r1: Math.max(r0, r1), c1: Math.max(c0, c1) };
+}
+
+function editRanges(value: unknown, kind: ViewKind | undefined): Range[] {
+  if (!Array.isArray(value) || value.length === 0) badEdit();
+  if (value.length > EDIT_LIMITS.ranges) badEdit(EDIT_TEXT.tooLarge('1,000 ranges'));
+  return Array.from(value, (item) => editRange(item, kind)); // (Array.from visits holes; map would skip them)
+}
+
+/**
+ * FindQuery shape. `compileRegex`: a regular expression must compile (with the 'u' flag, else without it) — for replaceAll; a `find`
+ * with a bad pattern is passed on, so its handler can answer `findResult.error` (a read is never left unanswered).
+ */
+function editFindQuery(value: unknown, budget: EditTextBudget, compileRegex: boolean, kind?: ViewKind): FindQuery {
+  if (!isRecord(value)) badEdit();
+  const scope = value.scope === 'workbook' ? 'workbook' : editSheetId(value.scope, kind);
+  const text = editText(value.text, EDIT_LIMITS.findChars, budget, '1,000 characters to find');
+  const query: FindQuery = {
+    scope,
+    text,
+    matchCase: editBool(value.matchCase),
+    regex: editBool(value.regex),
+    wholeCell: editBool(value.wholeCell),
+    lookIn: editEnum(value.lookIn, ['values', 'formulas'] as const),
+  };
+  if (compileRegex && query.regex) {
+    try {
+      try {
+        new RegExp(text, 'u');
+      } catch {
+        new RegExp(text); // ordinary patterns (-, x{, a]) are valid only without 'u'; the matcher uses the flags that compile
+      }
+    } catch {
+      badEdit(EDIT_TEXT.badPattern);
+    }
+  }
+  return query;
+}
+
+function editBorderSide(value: unknown): BorderSide {
+  if (value === null) return null;
+  if (!isRecord(value)) badEdit();
+  const side: NonNullable<BorderSide> = { style: editEnum(value.style, BORDER_STYLES) };
+  if (value.color !== undefined) side.color = editArgb(value.color);
+  return side;
+}
+
+/** StyleDelta with only the known properties (unknown ones are dropped), each of the right type. */
+function editStyleDelta(value: unknown, budget: EditTextBudget): StyleDelta {
+  if (!isRecord(value)) badEdit();
+  const delta: StyleDelta = {};
+  for (const key of ['bold', 'italic', 'strike', 'wrap', 'quotePrefix'] as const) {
+    if (value[key] !== undefined) delta[key] = editBool(value[key]);
+  }
+  if (value.underline !== undefined) delta.underline = value.underline === null ? null : editEnum(value.underline, ['single', 'double'] as const);
+  if (value.fontColor !== undefined) delta.fontColor = value.fontColor === null ? null : editArgb(value.fontColor);
+  if (value.fill !== undefined) delta.fill = value.fill === null ? null : editArgb(value.fill);
+  if (value.hAlign !== undefined) {
+    delta.hAlign = value.hAlign === null ? null : editEnum(value.hAlign, ['left', 'center', 'right', 'justify'] as const);
+  }
+  if (value.vAlign !== undefined) delta.vAlign = value.vAlign === null ? null : editEnum(value.vAlign, ['top', 'center', 'bottom'] as const);
+  if (value.numFmt !== undefined) {
+    delta.numFmt = editText(value.numFmt, EDIT_LIMITS.numFmtChars, budget, '255 characters in a number format');
+    if (XML_INVALID_RE.test(delta.numFmt)) badEdit();
+  }
+  if (value.border !== undefined) {
+    if (!isRecord(value.border)) badEdit();
+    const border: NonNullable<StyleDelta['border']> = {};
+    for (const side of ['top', 'bottom', 'left', 'right'] as const) {
+      if (value.border[side] !== undefined) border[side] = editBorderSide(value.border[side]);
+    }
+    delta.border = border;
+  }
+  return delta;
+}
+
+/** mdText edits: sorted by offset, not overlapping, `oldText` as long as its range, at most 256 edits / 4 Mi chars. */
+function editMdTextEdits(value: unknown, budget: EditTextBudget): MdTextEdit[] {
+  if (!Array.isArray(value) || value.length === 0) badEdit();
+  if (value.length > EDIT_LIMITS.mdEdits) badEdit(EDIT_TEXT.tooLarge('256 text changes at once'));
+  const edits: MdTextEdit[] = [];
+  let chars = 0;
+  for (const item of value) {
+    if (!isRecord(item)) badEdit();
+    const start = editIndex(item.start, MAX_INDEX);
+    const end = editIndex(item.end, MAX_INDEX);
+    if (end < start || typeof item.oldText !== 'string' || typeof item.text !== 'string') badEdit();
+    if (item.oldText.length !== end - start) badEdit();
+    if (LONE_SURROGATE_RE.test(item.text)) badEdit(EDIT_TEXT.loneSurrogate);
+    chars += item.oldText.length + item.text.length;
+    if (chars > EDIT_LIMITS.mdChars) badEdit(EDIT_TEXT.tooLarge('4 million characters'));
+    const prev = edits[edits.length - 1];
+    // Sorted and not overlapping; two insertions at the same offset have no defined order.
+    if (prev && (start < prev.end || (start === prev.end && prev.start === prev.end && start === end))) badEdit();
+    budget.chars += item.oldText.length + item.text.length;
+    if (budget.chars > EDIT_LIMITS.totalChars) badEdit(EDIT_TEXT.tooLarge('16 million characters of text'));
+    edits.push({ start, end, oldText: item.oldText, text: item.text });
+  }
+  return edits;
+}
+
+/** Intent kinds each view can send (a message for another document kind is `invalid`). Views not listed: none. */
+const SHEET_INTENTS: ReadonlySet<string> = new Set([
+  'setCells', 'clear', 'insertRows', 'deleteRows', 'insertCols', 'deleteCols', 'sort', 'replaceAll', 'style', 'merge', 'unmerge',
+  'resize', 'sheetAdd', 'sheetRename', 'sheetDelete', 'sheetDuplicate', 'sheetMove', 'sheetHide', 'tabColor',
+]);
+const CSV_INTENTS: ReadonlySet<string> = new Set(['setCells', 'clear', 'insertRows', 'deleteRows', 'insertCols', 'deleteCols', 'sort', 'replaceAll']);
+const MD_INTENTS: ReadonlySet<string> = new Set(['mdText']);
+function intentAllowedIn(kind: ViewKind | undefined, intent: string): boolean {
+  if (kind === undefined) return true; // shape check only
+  const allowed = kind === 'sheet' ? SHEET_INTENTS : kind === 'csv' ? CSV_INTENTS : kind === 'markdown' ? MD_INTENTS : undefined;
+  return allowed?.has(intent) ?? false;
+}
+
+/** One EditIntent (contract §2.2) with every §2.7 limit; throws EditShapeError. */
+function editIntentOf(value: unknown, kind: ViewKind | undefined, budget: EditTextBudget): EditIntent {
+  if (!isRecord(value) || typeof value.kind !== 'string') badEdit();
+  if (!intentAllowedIn(kind, value.kind)) badEdit();
+  const { maxRow, maxCol } = gridBounds(kind);
+  switch (value.kind) {
+    case 'setCells': {
+      const sheetId = editSheetId(value.sheetId, kind);
+      if (!Array.isArray(value.cells) || value.cells.length === 0) badEdit();
+      if (value.cells.length > EDIT_LIMITS.cells) badEdit(EDIT_TEXT.tooLarge('1,000,000 cells'));
+      const [maxChars, tooLong] = budget.xlsx
+        ? [EDIT_LIMITS.xlsxValueChars, '32,767 characters in one cell']
+        : [EDIT_LIMITS.csvValueChars, '1,048,576 characters in one cell'];
+      const cells: [r: number, c: number, text: string][] = new Array(value.cells.length);
+      for (let i = 0; i < value.cells.length; i++) {
+        const cell: unknown = value.cells[i];
+        if (!Array.isArray(cell) || cell.length !== 3) badEdit();
+        cells[i] = [editIndex(cell[0], maxRow), editIndex(cell[1], maxCol), editText(cell[2], maxChars, budget, tooLong)];
+      }
+      return { kind: 'setCells', sheetId, cells };
+    }
+    case 'clear': {
+      const sheetId = editSheetId(value.sheetId, kind);
+      const ranges = editRanges(value.ranges, kind);
+      const what = editEnum(value.what, ['contents', 'formats', 'all'] as const);
+      if (kind === 'csv' && what !== 'contents') badEdit(); // a CSV cell has no format
+      return { kind: 'clear', sheetId, ranges, what };
+    }
+    case 'insertRows':
+    case 'deleteRows':
+    case 'insertCols':
+    case 'deleteCols': {
+      const count = editIndex(value.count, kind === 'csv' ? MAX_INDEX : EDIT_LIMITS.count); // (a CSV may have more rows than Excel)
+      if (count === 0) badEdit();
+      return { kind: value.kind, sheetId: editSheetId(value.sheetId, kind), at: editIndex(value.at, kind === 'sheet' ? (value.kind.endsWith('Rows') ? maxRow : maxCol) + 1 : MAX_INDEX), count };
+    }
+    case 'sort':
+      return {
+        kind: 'sort',
+        sheetId: editSheetId(value.sheetId, kind),
+        range: editRange(value.range, kind),
+        key: editIndex(value.key, maxCol),
+        desc: editBool(value.desc),
+        header: editBool(value.header),
+      };
+    case 'replaceAll': {
+      const query = editFindQuery(value.query, budget, true, kind);
+      return { kind: 'replaceAll', query, replace: editText(value.replace, EDIT_LIMITS.findChars, budget, '1,000 characters to replace with') };
+    }
+    case 'style':
+      return {
+        kind: 'style',
+        sheetId: editSheetId(value.sheetId, kind),
+        ranges: editRanges(value.ranges, kind),
+        delta: editStyleDelta(value.delta, budget),
+      };
+    case 'merge':
+    case 'unmerge':
+      return { kind: value.kind, sheetId: editSheetId(value.sheetId, kind), range: editRange(value.range, kind) };
+    case 'resize': {
+      const sheetId = editSheetId(value.sheetId, kind);
+      const axis = editEnum(value.axis, ['row', 'col'] as const);
+      if (!Array.isArray(value.index) || value.index.length === 0) badEdit();
+      if (value.index.length > EDIT_LIMITS.count) badEdit(EDIT_TEXT.tooLarge('1,048,576 rows or columns'));
+      const max = axis === 'row' ? maxRow : maxCol;
+      const index = Array.from(value.index as unknown[], (item) => editIndex(item, max));
+      let size: number | null = null;
+      if (value.size !== null) {
+        if (typeof value.size !== 'number' || !Number.isFinite(value.size) || value.size < 0 || value.size > EDIT_LIMITS.sizePx) badEdit();
+        size = value.size;
+      }
+      return { kind: 'resize', sheetId, axis, index, size };
+    }
+    case 'sheetAdd': {
+      const intent: Extract<EditIntent, { kind: 'sheetAdd' }> = { kind: 'sheetAdd', index: editIndex(value.index, MAX_INDEX) };
+      if (value.name !== undefined) intent.name = editSheetName(value.name, budget);
+      return intent;
+    }
+    case 'sheetRename':
+      return { kind: 'sheetRename', sheetId: editSheetId(value.sheetId, kind), name: editSheetName(value.name, budget) };
+    case 'sheetDelete':
+    case 'sheetDuplicate':
+      return { kind: value.kind, sheetId: editSheetId(value.sheetId, kind) };
+    case 'sheetMove':
+      return { kind: 'sheetMove', sheetId: editSheetId(value.sheetId, kind), index: editIndex(value.index, MAX_INDEX) };
+    case 'sheetHide':
+      return { kind: 'sheetHide', sheetId: editSheetId(value.sheetId, kind), hidden: editBool(value.hidden) };
+    case 'tabColor':
+      return { kind: 'tabColor', sheetId: editSheetId(value.sheetId, kind), argb: value.argb === null ? null : editArgb(value.argb) };
+    case 'mdText':
+      return { kind: 'mdText', edits: editMdTextEdits(value.edits, budget) };
+    default:
+      return badEdit(); // unknown kind
+  }
+}
+
+/** parseEditMessage: the edit, or why it was refused (`editId` when the message names one; it is answered `invalid`). */
+export type EditParseResult = { ok: true; msg: MessageOf<'edit'> } | { ok: false; reason: string; editId?: number };
+
+/**
+ * Validates an `edit` message (shape + every §2.7 limit). `kind` is the view the message came from: xlsx ('sheet')
+ * positions are bounded by Excel's grid and xlsx text may not contain a lone surrogate. Never throws.
+ */
+export function parseEditMessage(raw: unknown, kind?: ViewKind): EditParseResult {
+  const editId = isRecord(raw) ? toIndex(raw.editId, Number.MAX_SAFE_INTEGER) : undefined;
+  try {
+    if (!isRecord(raw) || raw.type !== 'edit' || editId === undefined) return badEdit();
+    const baseVersion = editIndex(raw.baseVersion, Number.MAX_SAFE_INTEGER);
+    if (raw.then !== undefined && raw.then !== 'save') badEdit();
+    const intent = editIntentOf(raw.intent, kind, { chars: 0, xlsx: kind === 'sheet' });
+    const msg: MessageOf<'edit'> = { type: 'edit', editId, baseVersion, intent };
+    if (raw.then === 'save') msg.then = 'save';
+    return { ok: true, msg };
+  } catch (err) {
+    if (err instanceof EditShapeError) return { ok: false, reason: err.message, editId };
+    // A bug in the validation itself (not a bad message): refuse the edit, never let it through.
+    return { ok: false, reason: EDIT_TEXT.internal, editId };
+  }
+}
+
+function parseFindMessage(raw: Record<string, unknown>): MessageOf<'find'> | undefined {
+  const reqId = toInt(raw.reqId, 0, Number.MAX_SAFE_INTEGER);
+  if (reqId === undefined) return undefined;
+  try {
+    const query = editFindQuery(raw.query, { chars: 0, xlsx: false }, false);
+    const direction = editEnum(raw.direction, ['next', 'prev', 'all'] as const);
+    const msg: MessageOf<'find'> = { type: 'find', reqId, query, direction };
+    if (raw.from !== undefined) {
+      if (!isRecord(raw.from)) return undefined;
+      msg.from = { sheetId: editSheetId(raw.from.sheetId), r: editIndex(raw.from.r, MAX_INDEX), c: editIndex(raw.from.c, MAX_INDEX) };
+    }
+    return msg;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseFilterMessage(raw: Record<string, unknown>): MessageOf<'filter'> | undefined {
+  const reqId = toInt(raw.reqId, 0, Number.MAX_SAFE_INTEGER);
+  const sheetId = toSheetId(raw.sheetId);
+  const col = toIndex(raw.col, MAX_INDEX);
+  if (reqId === undefined || sheetId === undefined || col === undefined) return undefined;
+  const msg: MessageOf<'filter'> = { type: 'filter', reqId, sheetId, col };
+  if (raw.keep === null) msg.keep = null;
+  else if (raw.keep !== undefined) {
+    if (!Array.isArray(raw.keep) || raw.keep.length > EDIT_LIMITS.filterValues) return undefined;
+    let chars = 0;
+    for (const item of raw.keep) {
+      if (typeof item !== 'string') return undefined;
+      chars += item.length;
+      if (chars > EDIT_LIMITS.totalChars) return undefined;
+    }
+    msg.keep = raw.keep.slice() as string[];
+  }
+  return msg;
+}
+
 /**
  * Validates a message posted by the webview. Unknown types and malformed payloads yield undefined; numbers are
- * truncated and clamped, row windows and range lists are bounded, strings are length-limited.
+ * truncated and clamped, row windows and range lists are bounded, strings are length-limited. (v0.2.0) Editing
+ * messages are validated exactly (contract §2.7, EDIT_LIMITS); `kind` is the view the message came from (xlsx
+ * limits apply to 'sheet'). A refused `edit` is answered `invalid` by the session (parseEditMessage tells why).
  */
-export function parseWebviewMessage(raw: unknown): WebviewMessage | undefined {
+export function parseWebviewMessage(raw: unknown, kind?: ViewKind): WebviewMessage | undefined {
   if (!isRecord(raw) || typeof raw.type !== 'string') return undefined;
   switch (raw.type) {
     case 'ready':
@@ -442,6 +975,11 @@ export function parseWebviewMessage(raw: unknown): WebviewMessage | undefined {
         msg.c0 = Math.min(c0, c1);
         msg.c1 = Math.max(c0, c1);
       }
+      if (raw.sheetId !== undefined) {
+        const sheetId = toSheetId(raw.sheetId);
+        if (sheetId === undefined) return undefined; // a malformed id: dropped (the session logs it)
+        msg.sheetId = sheetId;
+      }
       return msg;
     }
     case 'getStats': {
@@ -453,15 +991,22 @@ export function parseWebviewMessage(raw: unknown): WebviewMessage | undefined {
         const range = toRange(item);
         if (range) ranges.push(range);
       }
-      return { type: 'getStats', reqId, sheet, ranges };
+      const msg: MessageOf<'getStats'> = { type: 'getStats', reqId, sheet, ranges };
+      if (raw.sheetId !== undefined) {
+        const sheetId = toSheetId(raw.sheetId);
+        if (sheetId === undefined) return undefined;
+        msg.sheetId = sheetId;
+      }
+      return msg;
     }
     case 'openLink':
       return typeof raw.href === 'string' && raw.href.length > 0 && raw.href.length <= MAX_HREF_LENGTH
         ? { type: 'openLink', href: raw.href }
         : undefined;
     case 'toggleTask': {
-      const line = toInt(raw.line, 0, MAX_INDEX);
-      const version = toInt(raw.version, 0, Number.MAX_SAFE_INTEGER);
+      // Exact integers only (a message that changes a file is never clamped or truncated).
+      const line = toIndex(raw.line, MAX_INDEX);
+      const version = toIndex(raw.version, Number.MAX_SAFE_INTEGER);
       if (line === undefined || version === undefined || typeof raw.checked !== 'boolean') return undefined;
       return { type: 'toggleTask', line, checked: raw.checked, version };
     }
@@ -476,6 +1021,37 @@ export function parseWebviewMessage(raw: unknown): WebviewMessage | undefined {
       if (typeof raw.message !== 'string') return undefined;
       const level = raw.level === 'warn' || raw.level === 'error' ? raw.level : 'info';
       return { type: 'log', level, message: raw.message.slice(0, MAX_LOG_LENGTH) };
+    }
+    // ----- (v0.2.0) editing messages: declared by track F (contract §2.7); handlers come with P1-P6 -----
+    case 'edit': {
+      const parsed = parseEditMessage(raw, kind);
+      return parsed.ok ? parsed.msg : undefined;
+    }
+    case 'editAnyway':
+      return { type: 'editAnyway' };
+    case 'find':
+      return parseFindMessage(raw);
+    case 'filter':
+      return parseFilterMessage(raw);
+    case 'measure': {
+      const reqId = toInt(raw.reqId, 0, Number.MAX_SAFE_INTEGER);
+      const sheetId = toSheetId(raw.sheetId);
+      const index = toIndex(raw.index, MAX_INDEX);
+      if (reqId === undefined || sheetId === undefined || index === undefined) return undefined;
+      return raw.axis === 'row' || raw.axis === 'col' ? { type: 'measure', reqId, sheetId, axis: raw.axis, index } : undefined;
+    }
+    case 'command':
+      return raw.id === 'undo' || raw.id === 'redo' || raw.id === 'save' ? { type: 'command', id: raw.id } : undefined;
+    case 'setMode':
+      return raw.mode === 'preview' || raw.mode === 'split' || raw.mode === 'wysiwyg' ? { type: 'setMode', mode: raw.mode } : undefined;
+    case 'previewScrolled':
+      // A fractional source line (the scroll position inside a block).
+      return typeof raw.line === 'number' && Number.isFinite(raw.line) && raw.line >= 0
+        ? { type: 'previewScrolled', line: Math.min(raw.line, MAX_INDEX) }
+        : undefined;
+    case 'flushed': {
+      const id = toIndex(raw.id, Number.MAX_SAFE_INTEGER);
+      return id === undefined ? undefined : { type: 'flushed', id };
     }
     default:
       return undefined;
@@ -504,6 +1080,30 @@ function errorDetailOf(err: unknown): string {
 }
 
 /**
+ * (v0.2.0) Optional handlers of a view for the editing messages of contract §2.7. A view sets the ones its phase
+ * implements (`session.editHandlers = { onEdit: … }`, a one-line hook); a missing handler means "not available yet":
+ * an `edit` is answered `blocked` "This action is not available yet.", any other message is logged and dropped.
+ * `onEdit` must answer with exactly one `editResult` before the promise it returns settles (the session answers
+ * `internal` for an edit that is still unanswered then, and drops a second answer).
+ */
+export interface ViewEditHandlers {
+  /** The document's current host version (used when the session itself rejects an edit). Default 0. */
+  version?(): number;
+  onEdit?(msg: MessageOf<'edit'>): unknown;
+  onEditAnyway?(msg: MessageOf<'editAnyway'>): unknown;
+  onFind?(msg: MessageOf<'find'>): unknown;
+  onFilter?(msg: MessageOf<'filter'>): unknown;
+  onMeasure?(msg: MessageOf<'measure'>): unknown;
+  onCommand?(msg: MessageOf<'command'>): unknown;
+  onSetMode?(msg: MessageOf<'setMode'>): unknown;
+  onPreviewScrolled?(msg: MessageOf<'previewScrolled'>): unknown;
+  onFlushed?(msg: MessageOf<'flushed'>): unknown;
+}
+
+/** Every open session (the test API finds a document's first panel here). */
+const liveSessions = new Set<ViewerSession>();
+
+/**
  * One webview panel showing one document. Validates incoming messages, tracks the ready handshake (and logs when it
  * never happens), remembers what the webview currently shows and ties listeners to the panel's lifetime.
  */
@@ -511,6 +1111,17 @@ class ViewerSession implements vscode.Disposable {
   readonly fileName: string;
   /** What the webview displays: nothing yet (loading), a successful init, or the error view. */
   shown: 'nothing' | 'content' | 'error' = 'nothing';
+  /** (v0.2.0) The view's handlers for the editing messages (see ViewEditHandlers). */
+  editHandlers: ViewEditHandlers = {};
+  /**
+   * (v0.2.0) Edits received and not answered yet (each gets exactly one editResult). `epoch` = the webview life
+   * (counted up by every 'ready'): a reloaded webview restarts its editIds, so an answer from an older life is dropped
+   * and a new edit with the same id waits until the old one is closed. `closed` settles when the entry is removed.
+   */
+  private readonly openEdits = new Map<number, { epoch: number; closed: Promise<void>; close: () => void }>();
+  private epoch = 0;
+  /** (v0.2.0, test API) Lists that collect every message posted while a test message is handled. */
+  private readonly captures = new Set<HostMessage[]>();
 
   private ready = false;
   private disposed = false;
@@ -535,6 +1146,7 @@ class ViewerSession implements vscode.Disposable {
       }),
       panel.onDidDispose(() => this.dispose()),
     );
+    liveSessions.add(this);
     this.armReadyTimer();
   }
 
@@ -559,6 +1171,8 @@ class ViewerSession implements vscode.Disposable {
 
   post(msg: HostMessage): void {
     if (this.disposed) return;
+    if (msg.type === 'editResult' && !this.settleEdit(msg)) return;
+    for (const capture of this.captures) capture.push(msg);
     if (msg.type === 'init') this.shown = 'content';
     else if (msg.type === 'error') this.shown = 'error';
     try {
@@ -594,6 +1208,7 @@ class ViewerSession implements vscode.Disposable {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    liveSessions.delete(this);
     this.clearReadyTimer();
     for (const disposable of this.disposables.splice(0)) {
       try {
@@ -604,28 +1219,169 @@ class ViewerSession implements vscode.Disposable {
     }
   }
 
-  private receive(raw: unknown): void {
-    if (this.disposed) return;
-    const msg = parseWebviewMessage(raw);
+  /**
+   * (v0.2.0, test API) Handles `raw` as if the webview had posted it; resolves with the messages posted to this panel
+   * while it was handled.
+   */
+  async deliverForTest(raw: unknown): Promise<HostMessage[]> {
+    const captured: HostMessage[] = [];
+    this.captures.add(captured);
+    try {
+      await this.receive(raw);
+    } finally {
+      this.captures.delete(captured);
+    }
+    return captured;
+  }
+
+  /** Answers an edit with a rejection (the status line shows `reason`; never the error view, contract §0 rule 6). */
+  rejectEdit(editId: number, code: EditRejectCode, reason: string, where?: string[]): void {
+    const version = this.editHandlers.version?.() ?? 0;
+    this.post({ type: 'editResult', editId, accepted: false, code, reason, version, ...(where ? { where } : {}) });
+  }
+
+  private receive(raw: unknown): Promise<void> {
+    if (this.disposed) return Promise.resolve();
+    let msg: WebviewMessage | undefined;
+    if (isRecord(raw) && raw.type === 'edit') {
+      const openId = toIndex(raw.editId, Number.MAX_SAFE_INTEGER);
+      const open = openId === undefined ? undefined : this.openEdits.get(openId);
+      if (open) {
+        if (open.epoch !== this.epoch) return open.closed.then(() => this.receive(raw)); // the old webview's edit
+        // A buggy webview reused an id: the new message must not take the first edit's one answer.
+        getLog().error(`[${this.kind}] Ignored an 'edit' with editId ${openId} that is still open from the viewer of ${this.fileName}`);
+        return Promise.resolve();
+      }
+      // An edit is never dropped silently: a malformed one is answered 'invalid' (the webview rolls back its overlay).
+      const parsed = parseEditMessage(raw, this.kind);
+      if (!parsed.ok) {
+        if (parsed.editId === undefined) {
+          getLog().info(`[${this.kind}] Ignored an 'edit' message without a valid editId from the viewer of ${this.fileName}`);
+        } else {
+          this.openEdit(parsed.editId);
+          this.rejectEdit(parsed.editId, 'invalid', parsed.reason);
+        }
+        return Promise.resolve();
+      }
+      msg = parsed.msg;
+    } else {
+      msg = parseWebviewMessage(raw, this.kind);
+    }
     if (!msg) {
+      this.answerBadRead(raw);
       const type = isRecord(raw) && typeof raw.type === 'string' ? `'${raw.type.slice(0, 64)}'` : 'malformed';
       getLog().debug(`[${this.kind}] Ignored ${type} message from the viewer of ${this.fileName}`);
-      return;
+      return Promise.resolve();
     }
     if (msg.type === 'ready') {
       // A (re)loaded webview starts from the static loading page again.
       this.ready = true;
+      this.epoch++;
       this.shown = 'nothing';
       this.waitingForVisibility = false;
       this.clearReadyTimer();
     }
-    Promise.resolve()
-      .then(() => this.handler(msg))
+    const message = msg;
+    const epoch = this.epoch;
+    if (message.type === 'edit') this.openEdit(message.editId);
+    return Promise.resolve()
+      .then(() => this.route(message))
       .catch((err: unknown) => {
         if (this.disposed) return;
-        if (msg.type === 'ready') this.postError(`Could not open "${this.fileName}"`, err);
-        else logError(`[${this.kind}] Handling '${msg.type}' failed for ${this.fileName}`, err);
+        if (message.type === 'ready') this.postError(`Could not open "${this.fileName}"`, err);
+        else logError(`[${this.kind}] Handling '${message.type}' failed for ${this.fileName}`, err);
+      })
+      .then(() => {
+        // Every edit gets exactly one answer, also when its handler failed or did not answer.
+        if (message.type !== 'edit' || this.disposed) return;
+        const open = this.openEdits.get(message.editId);
+        if (!open || open.epoch !== epoch) return;
+        if (epoch !== this.epoch) {
+          this.closeEdit(message.editId); // the webview that sent it is gone: nobody to tell
+          return;
+        }
+        getLog().error(`[${this.kind}] Edit ${message.editId} of ${this.fileName} was not answered by its handler`);
+        this.rejectEdit(message.editId, 'internal', EDIT_TEXT.internal);
       });
+  }
+
+  /** (v0.2.0) Editing messages go to the view's optional handlers (editHandlers); everything else to `handler`. */
+  private route(msg: WebviewMessage): unknown {
+    const h = this.editHandlers;
+    switch (msg.type) {
+      case 'edit':
+        if (h.onEdit) return h.onEdit(msg);
+        this.rejectEdit(msg.editId, 'blocked', EDIT_TEXT.notAvailable);
+        return undefined;
+      case 'editAnyway':
+        return h.onEditAnyway ? h.onEditAnyway(msg) : this.notAvailable(msg);
+      case 'find':
+        return h.onFind ? h.onFind(msg) : this.notAvailable(msg);
+      case 'filter':
+        return h.onFilter ? h.onFilter(msg) : this.notAvailable(msg);
+      case 'measure':
+        return h.onMeasure ? h.onMeasure(msg) : this.notAvailable(msg);
+      case 'command':
+        return h.onCommand ? h.onCommand(msg) : this.notAvailable(msg);
+      case 'setMode':
+        return h.onSetMode ? h.onSetMode(msg) : this.notAvailable(msg);
+      case 'previewScrolled':
+        return h.onPreviewScrolled ? h.onPreviewScrolled(msg) : this.notAvailable(msg);
+      case 'flushed':
+        return h.onFlushed ? h.onFlushed(msg) : this.notAvailable(msg);
+      default:
+        return this.handler(msg);
+    }
+  }
+
+  /** A find / filter / measure that cannot be read but names its reqId is answered with an error: the webview is waiting for it. */
+  private answerBadRead(raw: unknown): void {
+    if (!isRecord(raw)) return;
+    const reqId = toInt(raw.reqId, 0, Number.MAX_SAFE_INTEGER);
+    if (reqId === undefined) return;
+    const version = this.editHandlers.version?.() ?? 0;
+    const error = EDIT_TEXT.badRequest;
+    const sheetId = toSheetId(raw.sheetId) ?? '';
+    if (raw.type === 'find') this.post({ type: 'findResult', reqId, version, matches: [], total: 0, truncated: false, error });
+    else if (raw.type === 'filter') this.post({ type: 'filterResult', reqId, version, sheetId, error });
+    else if (raw.type === 'measure') {
+      this.post({ type: 'columnTexts', reqId, version, sheetId, axis: raw.axis === 'row' ? 'row' : 'col', index: 0, texts: [], error });
+    }
+  }
+
+  private notAvailable(msg: WebviewMessage): void {
+    getLog().info(`[${this.kind}] Ignored '${msg.type}' from the viewer of ${this.fileName}: not available in this view yet`);
+  }
+
+  private openEdit(editId: number): void {
+    let close = (): void => undefined;
+    const closed = new Promise<void>((resolve) => (close = resolve));
+    this.openEdits.set(editId, { epoch: this.epoch, closed, close });
+  }
+
+  private closeEdit(editId: number): void {
+    const open = this.openEdits.get(editId);
+    this.openEdits.delete(editId);
+    open?.close();
+  }
+
+  /** Called for every editResult before it is posted: false (dropped, logged) for a second answer to one edit. */
+  private settleEdit(msg: Extract<HostMessage, { type: 'editResult' }>): boolean {
+    const open = this.openEdits.get(msg.editId);
+    if (!open) {
+      getLog().error(`[${this.kind}] Dropped a second answer to edit ${msg.editId} of ${this.fileName}`);
+      return false;
+    }
+    this.closeEdit(msg.editId);
+    if (open.epoch !== this.epoch) {
+      getLog().info(`[${this.kind}] Dropped the answer to edit ${msg.editId} of ${this.fileName}: the viewer was reloaded since`);
+      return false;
+    }
+    if (!msg.accepted) {
+      // Every rejection is logged (contract §3.4); the user sees it in the status line.
+      getLog().info(`[${this.kind}] Edit ${msg.editId} of ${this.fileName} not applied (${msg.code}): ${msg.reason}`);
+    }
+    return true;
   }
 
   private armReadyTimer(): void {
@@ -904,6 +1660,576 @@ export async function openLink(href: string, policy: LinkPolicy): Promise<void> 
     logError(`Could not open link "${link.slice(0, 200)}"`, err);
     void vscode.window.showErrorMessage(`FileStudio could not open the link: ${errorMessageOf(err)}`);
   }
+}
+
+// ===== SHARED: EDIT GATE =====
+// (v0.2.0, track F; contract §3) The extension host is the authority for every change FileStudio makes to a file.
+// Building blocks for every editable view: one serial queue per document, the kill switch (4 settings, read on every
+// call), the read-only check, checkEditable (§3.2 steps 1-3), the reject texts (§3.4), ask() for every modal prompt
+// (§3.6; answered by the test API in tests), checkTextFidelity (§8.6) and a registry of open documents whose edit
+// state follows the settings (one config listener). The document-specific steps (version rule, planning, applying)
+// belong to the phase that owns the document (P1/P2 xlsx, P3 csv, P6 Markdown WYSIWYG). Turning editing off stops
+// only NEW edits: save, revert, undo/redo and backup of a dirty document never check the kill switch (D-075).
+
+// ----- texts (contract §3.4) -----
+
+/** User texts of rejected edits and of not-editable states (status line, aria-live; every rejection is also logged). */
+export const EDIT_TEXT = {
+  disabled: (setting: string): string => `Editing is turned off (setting ${setting}).`,
+  /** `why`: 'files.readonlyInclude', 'Git version', 'no write permission', 'read-only file system'. */
+  readOnly: (why: string): string => `This file is read-only (${why}).`,
+  failed: 'VS Code did not apply the change. The file was not changed.',
+  stale: 'The file changed while you were editing. Your change was not applied; the view was refreshed.',
+  lossy: 'This file has content FileStudio cannot show or update. Choose "Edit anyway" to edit it.',
+  fidelity: 'Saving in VS Code would also change parts of this file you did not edit. Choose "Edit anyway" to edit it.',
+  fidelityTitle: 'Saving in VS Code changes parts of this file you did not edit.',
+  fidelityPending: 'FileStudio is still checking this file; try again in a moment.',
+  checking: 'Checking the file…',
+  fidelityUnreadable: 'FileStudio could not check how VS Code will save this file.',
+  invalid: 'FileStudio could not read this change. Nothing was changed.',
+  tooLarge: (limit: string): string => `This change is too large (max ${limit}).`,
+  badFormula: "There's a problem with this formula.",
+  badPattern: 'There is a problem with this search pattern.',
+  badRequest: 'FileStudio could not read this request.',
+  badSheetName: 'This sheet name cannot be used.',
+  loneSurrogate: 'The text has an unpaired surrogate character and cannot be saved.',
+  internal: 'Internal check failed. Nothing was changed.',
+  poisoned: 'An internal error happened. Your file on disk was not changed. Use Revert File to reload.',
+  notAvailable: 'This action is not available yet.',
+} as const;
+
+// ----- serial queue (contract §3.1) -----
+
+/**
+ * Runs jobs one at a time, in the order they were added (FIFO). A job that throws or rejects does not stop the
+ * queue: its own promise rejects and the next job starts. One queue per document runs edits, VS Code undo/redo
+ * callbacks, save, revert, disk reloads and Markdown task toggles (contract §3.1); reads do not wait.
+ */
+export class SerialQueue {
+  private tail: Promise<void> = Promise.resolve();
+  private waiting = 0;
+
+  /** Jobs added and not finished yet (running included). */
+  get size(): number {
+    return this.waiting;
+  }
+
+  run<T>(job: () => T | Promise<T>): Promise<T> {
+    this.waiting++;
+    const result = this.tail.then(job);
+    const done = (): void => {
+      this.waiting--;
+    };
+    this.tail = result.then(done, done);
+    return result;
+  }
+}
+
+// ----- prompts (contract §3.6) -----
+
+/**
+ * Every modal question FileStudio asks goes through here (contract §0 rule 7). In ExtensionMode.Test the answer comes
+ * from the test API queue (TEST API `answer`); with no queued answer it is undefined (= Cancel), so a test never waits
+ * on a dialog. A queued answer that is not one of `buttons` also counts as Cancel. Every question is logged.
+ */
+export async function ask(
+  id: AskId,
+  message: string,
+  options: { modal: true; detail?: string },
+  ...buttons: string[]
+): Promise<string | undefined> {
+  if (testApiEnabled) {
+    const queued = testAnswers.get(id);
+    const hasAnswer = queued !== undefined && queued.length > 0;
+    const answer = hasAnswer ? queued.shift() : undefined;
+    const chosen = answer !== undefined && buttons.includes(answer) ? answer : undefined;
+    getLog().info(
+      `[test] ask('${id}') "${message}" -> ${chosen === undefined ? 'Cancel' : `"${chosen}"`}` +
+        (hasAnswer ? '' : ' (no queued answer)'),
+    );
+    return chosen;
+  }
+  const answer = await vscode.window.showWarningMessage(message, options, ...buttons);
+  getLog().info(`Asked (${id}) "${message}" -> ${answer === undefined ? 'Cancel' : `"${answer}"`}`);
+  return answer;
+}
+
+// ----- kill switch and read-only (contract §3.2 steps 1-2) -----
+
+/** The document formats FileStudio can change. */
+export type EditFormat = 'xlsx' | 'csv' | 'markdown';
+
+/** The four editing settings (contract §11): the master switch and one per format. */
+export const EDIT_SETTINGS = [
+  'fileStudio.editing.enabled',
+  'fileStudio.xlsx.editing',
+  'fileStudio.csv.editing',
+  'fileStudio.markdown.editing',
+] as const;
+
+/**
+ * The setting that turns editing of `f` off for `uri` (the master switch first), or undefined when editing is on.
+ * Read on every call (no cache). Only an explicit `false` turns editing off (the default is true).
+ */
+export function disabledEditSetting(f: EditFormat, uri: vscode.Uri): string | undefined {
+  const config = vscode.workspace.getConfiguration('fileStudio', uri);
+  // Off for any value but true: a hand-edited "false", 0 or null must not leave editing on. Unset (undefined) = on.
+  const off = (v: unknown): boolean => v !== undefined && v !== true;
+  if (off(config.get<unknown>('editing.enabled'))) return 'fileStudio.editing.enabled';
+  if (off(config.get<unknown>(`${f}.editing`))) return `fileStudio.${f}.editing`;
+  return undefined;
+}
+
+/** Kill switch (contract §3.1): `fileStudio.editing.enabled` && `fileStudio.<f>.editing`, read on every call. */
+export function editingEnabled(f: EditFormat, uri: vscode.Uri): boolean {
+  return disabledEditSetting(f, uri) === undefined;
+}
+
+/**
+ * Why VS Code's own editor treats `uri` as read-only (filesConfigurationService.isReadonly), or undefined: a read-only
+ * file system ('Git version' for git:), then `files.readonlyInclude`, or `files.readonlyFromPermissions` with a file
+ * that cannot be written ('no write permission'), both unless `files.readonlyExclude` matches. Like VS Code, a glob
+ * matches the path relative to the workspace folder or the absolute path. "Set Active Editor Read-only in Session" is
+ * not visible to extensions (an edit is then refused by VS Code: EDIT_TEXT.failed). `target`: the TextDocument when
+ * there is one; otherwise (xlsx) a minimal {uri, languageId} object stands in for it in languages.match (F WP7 checks
+ * this in a real VS Code).
+ */
+export async function readonlyReasonOf(uri: vscode.Uri, target?: vscode.TextDocument): Promise<string | undefined> {
+  if (vscode.workspace.fs.isWritableFileSystem(uri.scheme) === false) {
+    return uri.scheme === 'git' ? 'Git version' : 'read-only file system';
+  }
+  const document = target ?? ({ uri, languageId: '' } as unknown as vscode.TextDocument);
+  const files = vscode.workspace.getConfiguration('files', uri);
+  const folder = vscode.workspace.getWorkspaceFolder(uri);
+  const matches = (setting: string): boolean =>
+    Object.entries(files.get<Record<string, boolean>>(setting) ?? {}).some(
+      ([glob, on]) =>
+        on === true &&
+        (vscode.languages.match({ pattern: glob }, document) > 0 ||
+          (folder !== undefined && vscode.languages.match({ pattern: new vscode.RelativePattern(folder, glob) }, document) > 0)),
+    );
+  if (matches('readonlyInclude')) return matches('readonlyExclude') ? undefined : 'files.readonlyInclude';
+  // files.readonlyFromPermissions is window-scoped: read it without a resource (as VS Code does), or the extension
+  // host logs "Accessing a window scoped configuration for a resource is not expected".
+  if (uri.scheme === 'file' && vscode.workspace.getConfiguration('files').get<boolean>('readonlyFromPermissions') === true) {
+    try {
+      await access(uri.fsPath, fsConstants.W_OK);
+    } catch (err) {
+      // A file that is gone is not read-only: VS Code shows it as deleted, and a save writes it again.
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') return matches('readonlyExclude') ? undefined : 'no write permission';
+    }
+  }
+  return undefined;
+}
+
+/** `isReadonlyDocument` generalised to a Uri (contract §3.1). */
+export async function isReadonlyResource(uri: vscode.Uri): Promise<boolean> {
+  return (await readonlyReasonOf(uri)) !== undefined;
+}
+
+// ----- gate (contract §3.1, §3.2) -----
+
+export type GateResult = { ok: true } | { ok: false; code: EditRejectCode; reason: string };
+
+/** The document's own state for the gate (contract §3.1), kept by the phase that owns the document. */
+export interface DocGateState {
+  /** xlsx: an undo/redo/rollback step failed (contract §3.5). */
+  poisoned?: boolean;
+  /** xlsx: lossy features, "Edit anyway" accepted or not. */
+  lossy?: { accepted: boolean };
+  /** csv / Markdown WYSIWYG: checkTextFidelity result (pending = not finished yet = not editable, D-072). */
+  fidelity?: { pending?: boolean; ok: boolean; accepted: boolean; blocked?: string };
+  /** A hard block (unpatchable package, unclosed quote, …): user text. */
+  block?: string;
+}
+
+/** §3.2 step 3 (synchronous): document state → poisoned, lossy, fidelity (pending first), hard blocks. */
+export function documentGate(s: DocGateState): GateResult {
+  if (s.poisoned) return { ok: false, code: 'internal', reason: EDIT_TEXT.poisoned };
+  if (s.lossy && !s.lossy.accepted) return { ok: false, code: 'lossy', reason: EDIT_TEXT.lossy };
+  if (s.fidelity) {
+    if (s.fidelity.pending) return { ok: false, code: 'fidelity', reason: EDIT_TEXT.fidelityPending };
+    if (s.fidelity.blocked !== undefined) return { ok: false, code: 'blocked', reason: s.fidelity.blocked };
+    if (!s.fidelity.ok && !s.fidelity.accepted) return { ok: false, code: 'fidelity', reason: EDIT_TEXT.fidelity };
+  }
+  if (s.block !== undefined) return { ok: false, code: 'blocked', reason: s.block };
+  return { ok: true };
+}
+
+/**
+ * §3.2 steps 1-3 for one edit or toggle (call it inside the document queue): kill switch (sync) → read-only (async)
+ * → document state. The kill switch is read again after the read-only await, so a setting turned off meanwhile still
+ * wins. The caller then runs step 4 (version rule → plan → apply) synchronously, with no await in between.
+ * Never rejects: a check that fails unexpectedly refuses the edit ('internal').
+ */
+export async function checkEditable(
+  f: EditFormat,
+  uri: vscode.Uri,
+  s: DocGateState = {},
+  target?: vscode.TextDocument,
+): Promise<GateResult> {
+  try {
+    let off = disabledEditSetting(f, uri);
+    if (off !== undefined) return { ok: false, code: 'disabled', reason: EDIT_TEXT.disabled(off) };
+    const readOnly = await readonlyReasonOf(uri, target);
+    off = disabledEditSetting(f, uri);
+    if (off !== undefined) return { ok: false, code: 'disabled', reason: EDIT_TEXT.disabled(off) };
+    if (readOnly !== undefined) return { ok: false, code: 'readOnly', reason: EDIT_TEXT.readOnly(readOnly) };
+    return documentGate(s);
+  } catch (err) {
+    logError(`Could not check whether ${uri.toString(true)} can be edited`, err);
+    return { ok: false, code: 'internal', reason: EDIT_TEXT.internal };
+  }
+}
+
+/** EditState for a gate result: editable with `kinds`, or not editable with the code and reason (and no kinds). */
+export function editStateOf(result: GateResult, kinds: EditKind[]): EditState {
+  return result.ok ? { editable: true, kinds } : { editable: false, code: result.code, reason: result.reason, kinds: [] };
+}
+
+/** xlsx and CSV until their editing phases land (contract §14 F): view-only exactly as 0.1.2, no banner or message. */
+export function viewOnlyEditState(): EditState {
+  return { editable: false, kinds: [] };
+}
+
+function sameEditState(a: EditState | undefined, b: EditState | undefined): boolean {
+  return a !== undefined && b !== undefined && JSON.stringify(a) === JSON.stringify(b);
+}
+
+// ----- text fidelity (contract §8.6, D-035, D-072) -----
+
+/** Largest file checkTextFidelity reads (VS Code gives extensions at most 50 MB of text anyway). */
+const FIDELITY_MAX_BYTES = 50 * 1024 * 1024;
+
+/** Result of checkTextFidelity (the caller stores it in DocGateState.fidelity and its EditState). */
+export interface TextFidelity {
+  /** Saving in VS Code writes back exactly the bytes on disk (or there is nothing on disk to change: untitled). */
+  ok: boolean;
+  /** Never editable: the text was decoded with the wrong encoding (user text, no "Edit anyway"). */
+  blocked?: string;
+  /** Not ok and not blocked: what VS Code's save would change, for the "Edit anyway" question and the banner. */
+  canEditAnyway?: { title: string; details: string[] };
+}
+
+/** VS Code API newer than @types/vscode 1.90 (engine ^1.123): workspace.encode / decode and TextDocument.encoding. */
+interface TextCodecApi {
+  encode(text: string, options: { encoding: string }): Thenable<Uint8Array>;
+  decode(content: Uint8Array, options: { encoding: string }): Thenable<string>;
+}
+
+function fidelityChanges(details: string[]): TextFidelity {
+  return { ok: false, canEditAnyway: { title: EDIT_TEXT.fidelityTitle, details } };
+}
+
+function plural(n: number, word: string): string {
+  return `${n.toLocaleString('en-US')} ${word}${n === 1 ? '' : 's'}`;
+}
+
+/** Line breaks in `text` by kind. */
+function countLineBreaks(text: string): { crlf: number; lf: number; cr: number } {
+  let crlf = 0;
+  let lf = 0;
+  let cr = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charCodeAt(i);
+    if (ch === 13) {
+      if (text.charCodeAt(i + 1) === 10) {
+        crlf++;
+        i++;
+      } else cr++;
+    } else if (ch === 10) lf++;
+  }
+  return { crlf, lf, cr };
+}
+
+function countChar(text: string, code: number): number {
+  let n = 0;
+  for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === code) n++;
+  return n;
+}
+
+/** Byte sequence of U+FFFD / of a BOM in `encoding` (undefined: the encoding cannot store it). */
+function encodedMark(encoding: string, mark: 'replacement' | 'bom'): number[] | undefined {
+  const enc = encoding.toLowerCase();
+  if (enc === 'utf8' || enc === 'utf8bom') return mark === 'replacement' ? [0xef, 0xbf, 0xbd] : [0xef, 0xbb, 0xbf];
+  if (enc === 'utf16le') return mark === 'replacement' ? [0xfd, 0xff] : [0xff, 0xfe];
+  if (enc === 'utf16be') return mark === 'replacement' ? [0xff, 0xfd] : [0xfe, 0xff];
+  return undefined;
+}
+
+function startsWithAt(bytes: Uint8Array, at: number, seq: number[]): boolean {
+  for (let k = 0; k < seq.length; k++) if (bytes[at + k] !== seq[k]) return false;
+  return true;
+}
+
+/** U+FFFD characters really stored in the bytes (UTF-16: at character boundaries only). */
+function countReplacementBytes(bytes: Uint8Array, encoding: string): number {
+  const seq = encodedMark(encoding, 'replacement');
+  if (!seq) return 0;
+  const step = seq.length === 2 ? 2 : 1;
+  let n = 0;
+  for (let i = 0; i + seq.length <= bytes.length; i += step) if (startsWithAt(bytes, i, seq)) n++;
+  return n;
+}
+
+/** Byte order marks at the very start of the bytes. */
+function countLeadingBoms(bytes: Uint8Array, encoding: string): number {
+  const seq = encodedMark(encoding, 'bom');
+  if (!seq) return 0;
+  let n = 0;
+  while (startsWithAt(bytes, n * seq.length, seq)) n++;
+  return n;
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/** Lines that end in spaces or tabs (VS Code's trimTrailingWhitespace). A plain loop: no array of matches, linear. */
+function countTrailingWhitespaceLines(text: string): number {
+  let n = 0;
+  let inRun = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charCodeAt(i);
+    if (ch === 32 || ch === 9) inRun = true;
+    else {
+      if (inRun && (ch === 10 || ch === 13)) n++;
+      inRun = false;
+    }
+  }
+  return inRun ? n + 1 : n;
+}
+
+/**
+ * What VS Code's save participants will change in `text` with the user's settings (read for the document, so the
+ * `[csv]` / `[markdown]` language overrides apply): trailing whitespace, a missing final newline, extra final newlines.
+ */
+function saveSettingChanges(document: vscode.TextDocument, text: string): string[] {
+  const files = vscode.workspace.getConfiguration('files', document);
+  const details: string[] = [];
+  if (files.get<unknown>('trimTrailingWhitespace') === true) {
+    const lines = countTrailingWhitespaceLines(text);
+    if (lines > 0) {
+      details.push(`VS Code will remove spaces at the end of ${plural(lines, 'line')} (setting files.trimTrailingWhitespace).`);
+    }
+  }
+  if (files.get<unknown>('insertFinalNewline') === true && text.length > 0 && !/[\r\n]$/.test(text) && !/(?:^|[\r\n])[ \t]+$/.test(text)) {
+    // (VS Code adds nothing when the last line is only spaces or tabs.)
+    details.push('VS Code will add a line break at the end of the file (setting files.insertFinalNewline).');
+  }
+  if (files.get<unknown>('trimFinalNewlines') === true) {
+    // VS Code's rule (checked in 1.142): only truly empty lines are trimmed (a line of spaces stays and stops the
+    // trimming); a file of line breaks only becomes empty. The last "line" after the final line break is not extra.
+    // Scans from the end: no array of lines for a big file.
+    let blank = 0;
+    let e = text.length;
+    for (;;) {
+      const prev = e > 0 ? text.charCodeAt(e - 1) : -1;
+      if (e > 0 && prev !== 10 && prev !== 13) break; // a line with text
+      blank++; // the line that ends at e is empty
+      if (e === 0) break;
+      e -= prev === 10 && e >= 2 && text.charCodeAt(e - 2) === 13 ? 2 : 1;
+    }
+    const extra = blank - 1;
+    if (extra > 0) {
+      details.push(`VS Code will remove ${plural(extra, 'empty line')} at the end of the file (setting files.trimFinalNewlines).`);
+    }
+  }
+  return details;
+}
+
+/**
+ * Checks whether saving `document` in VS Code writes back the bytes on disk unchanged (contract §8.6, D-035, D-072):
+ * CSV and Markdown WYSIWYG call it (P3, P6) once per open and again after a non-own change that leaves the document
+ * clean; Markdown task toggles are exempt. `untitled:` → ok. The file's bytes are compared with
+ * `workspace.encode(getText(), {encoding: document.encoding})`; a difference is explained (mixed / CR-only line
+ * breaks with counts; several leading BOMs are the same bytes), and VS Code's save settings are counted (trim trailing whitespace,
+ * insert / trim final newlines). Replacement characters that are not in the bytes (wrong encoding) → `blocked`.
+ * Unreadable bytes, a file over 50 MB or a VS Code without the encoding API → not ok with "Edit anyway"
+ * (EDIT_TEXT.fidelityUnreadable). A document already dirty is judged by the line breaks on disk only.
+ */
+export async function checkTextFidelity(document: vscode.TextDocument): Promise<TextFidelity> {
+  const uri = document.uri;
+  if (uri.scheme === 'untitled') return { ok: true };
+  const text = document.getText();
+  let details: string[];
+  try {
+    details = saveSettingChanges(document, text);
+  } catch (err) {
+    logError(`[fidelity] Could not read the save settings for ${uri.toString(true)}`, err);
+    return fidelityChanges([EDIT_TEXT.fidelityUnreadable]);
+  }
+  const codec = vscode.workspace as unknown as Partial<TextCodecApi>;
+  const encoding = (document as unknown as { encoding?: unknown }).encoding;
+  let disk: Uint8Array;
+  let diskText: string;
+  try {
+    if (typeof codec.encode !== 'function' || typeof codec.decode !== 'function' || typeof encoding !== 'string') {
+      throw new Error('this VS Code has no text encoding API');
+    }
+    const stat = await vscode.workspace.fs.stat(uri);
+    if (stat.size > FIDELITY_MAX_BYTES) throw new Error('the file is larger than 50 MB');
+    disk = await vscode.workspace.fs.readFile(uri);
+    if (!document.isDirty) {
+      const encoded = await codec.encode(text, { encoding });
+      // VS Code strips every leading BOM from the text but writes them all back on save (checked in 1.142): a file with
+      // several BOMs is the same bytes when only the extra BOMs differ.
+      const boms = countLeadingBoms(disk, encoding);
+      const bomLength = encodedMark(encoding, 'bom')?.length ?? 0;
+      if (sameBytes(encoded, disk) || (boms > 1 && sameBytes(encoded, disk.subarray((boms - 1) * bomLength)))) {
+        return details.length === 0 ? { ok: true } : fidelityChanges(details);
+      }
+    }
+    diskText = await codec.decode(disk, { encoding });
+  } catch (err) {
+    getLog().info(`[fidelity] Could not check how VS Code will save ${uri.toString(true)}: ${errorMessageOf(err)}`);
+    return fidelityChanges([EDIT_TEXT.fidelityUnreadable, ...details]);
+  }
+  // Wrong encoding: decoding put replacement characters where the bytes have none; a save would write U+FFFD there.
+  if (countChar(diskText, 0xfffd) > countReplacementBytes(disk, encoding)) {
+    return {
+      ok: false,
+      blocked:
+        `FileStudio cannot edit this file safely: it is not valid ${encoding} text. ` +
+        'Use "Reopen with Encoding" in VS Code to open it with the right encoding.',
+    };
+  }
+  const explained: string[] = [];
+  const breaks = countLineBreaks(diskText);
+  const toCrlf = document.eol === vscode.EndOfLine.CRLF;
+  const target = toCrlf ? 'CRLF' : 'LF';
+  const changes: [number, string][] = toCrlf
+    ? [
+        [breaks.lf, 'LF'],
+        [breaks.cr, 'CR'],
+      ]
+    : [
+        [breaks.crlf, 'CRLF'],
+        [breaks.cr, 'CR'],
+      ];
+  for (const [count, from] of changes) {
+    if (count > 0) explained.push(`VS Code will change ${plural(count, 'line break')} (${from} → ${target}).`);
+  }
+  // A clean document whose bytes differ for no reason found above: still not the same bytes.
+  if (!document.isDirty && explained.length === 0) {
+    explained.push(`VS Code will save some characters differently (encoding ${encoding}).`);
+  }
+  const all = [...explained, ...details];
+  return all.length === 0 ? { ok: true } : fidelityChanges(all);
+}
+
+// ----- open documents and the config listener (contract §3.6) -----
+
+/** What a view registers for its document (the first panel's spec is used; all panels of a document share it). */
+export interface EditGateDocSpec {
+  format: EditFormat;
+  uri: vscode.Uri;
+  /** The document's edit state now (gate checks + the document's own state). */
+  computeEditState(): EditState | Promise<EditState>;
+  /** For the test API `state()`: the document's host version and dirty flag (0 / false when absent). */
+  version?(): number;
+  dirty?(): boolean;
+}
+
+/** One open document known to the edit gate, shared by all its panels. */
+export class EditGateDoc {
+  /** The document's queue for F's Markdown task toggles (xlsx and CSV keep their queue in SheetDocument / CsvDocState). */
+  readonly queue = new SerialQueue();
+  /** The last edit state computed (undefined before the first refresh). */
+  state: EditState | undefined;
+  /** One callback per attached panel. */
+  readonly listeners = new Set<(state: EditState) => void>();
+  private refreshes = 0;
+
+  constructor(
+    readonly key: string,
+    readonly spec: EditGateDocSpec,
+  ) {}
+
+  /**
+   * Computes the edit state again (settings and read-only state are read now) and calls every panel's callback when
+   * it changed (not for the first state: each view sends that in its init). Resolves with the fresh state; never rejects (a failing computation gives a not-editable 'internal'
+   * state, so nothing is changed by mistake).
+   */
+  async refresh(): Promise<EditState> {
+    const seq = ++this.refreshes;
+    let state: EditState;
+    try {
+      state = await this.spec.computeEditState();
+    } catch (err) {
+      logError(`Could not compute the edit state of ${this.spec.uri.toString(true)}`, err);
+      state = { editable: false, code: 'internal', reason: EDIT_TEXT.internal, kinds: [] };
+    }
+    if (seq === this.refreshes && !sameEditState(state, this.state)) {
+      const first = this.state === undefined; // the views send the first state in their init
+      this.state = state;
+      for (const listener of first ? [] : [...this.listeners]) {
+        try {
+          listener(state);
+        } catch (err) {
+          logError(`Could not send the edit state of ${this.spec.uri.toString(true)}`, err);
+        }
+      }
+    }
+    return state;
+  }
+}
+
+/** A panel's attachment to its document's EditGateDoc; dispose it with the panel. */
+export interface EditGateHandle extends vscode.Disposable {
+  readonly doc: EditGateDoc;
+}
+
+const editGateDocs = new Map<string, EditGateDoc>();
+let editConfigListener: vscode.Disposable | undefined;
+
+/**
+ * Attaches one panel to the EditGateDoc of its document (made by the first panel, removed with the last one).
+ * `onState` runs whenever the document's edit state changes (a setting, the read-only state, the document's own
+ * state) and sends it to the panel (`editState`, or the view's own update message).
+ */
+export function attachEditGateDoc(spec: EditGateDocSpec, onState: (state: EditState) => void): EditGateHandle {
+  const key = `${spec.format}:${spec.uri.toString()}`;
+  let doc = editGateDocs.get(key);
+  if (!doc) {
+    doc = new EditGateDoc(key, spec);
+    editGateDocs.set(key, doc);
+    void doc.refresh();
+  }
+  doc.listeners.add(onState);
+  watchEditSettings();
+  const attached = doc;
+  let disposed = false;
+  return {
+    doc: attached,
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      attached.listeners.delete(onState);
+      if (attached.listeners.size === 0 && editGateDocs.get(key) === attached) editGateDocs.delete(key);
+      if (editGateDocs.size === 0) {
+        editConfigListener?.dispose();
+        editConfigListener = undefined;
+      }
+    },
+  };
+}
+
+/**
+ * The one configuration listener (contract §3.6): a change of an editing setting or a read-only setting recomputes
+ * the edit state of every open document it affects and sends it to the document's panels. Exists while documents are
+ * attached. The settings are still read again for every edit.
+ */
+function watchEditSettings(): void {
+  if (editConfigListener) return;
+  editConfigListener = vscode.workspace.onDidChangeConfiguration((e) => {
+    const settings: readonly string[] = [...EDIT_SETTINGS, ...READONLY_SETTINGS];
+    for (const doc of [...editGateDocs.values()]) {
+      if (settings.some((setting) => e.affectsConfiguration(setting, doc.spec.uri))) void doc.refresh();
+    }
+  });
 }
 
 // ===== SHARED: DEBOUNCE & FILE WATCHING =====
@@ -1488,6 +2814,9 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
     );
     document.panels.add(panel);
     this.sessions.set(panel, session);
+    // (v0.2.0, F) Edit gate registry: view-only until the xlsx editing phases (P1/P2) give it a real edit state.
+    const gate = { format: 'xlsx', uri: document.uri, computeEditState: viewOnlyEditState, dirty: () => document.hasUnsavedChanges } as const;
+    session.onDispose(attachEditGateDoc(gate, (state) => session.post({ type: 'editState', state })));
     session.onDispose({
       dispose: () => {
         document.panels.delete(panel);
@@ -1559,6 +2888,7 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
         meta: model.getMeta(),
         readOnly: true,
         banner: lossyBanner(document.lossyFeatures),
+        editState: viewOnlyEditState(),
       });
     } catch (err) {
       session.postError(`Could not open "${document.fileName}"`, err);
@@ -1585,7 +2915,12 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
       return;
     }
     try {
-      session.post({ type: 'invalidate', meta: model.getMeta(), banner: lossyBanner(document.lossyFeatures) ?? null });
+      session.post({
+        type: 'invalidate',
+        meta: model.getMeta(),
+        banner: lossyBanner(document.lossyFeatures) ?? null,
+        editState: viewOnlyEditState(),
+      });
     } catch (err) {
       session.postError(`Could not reload "${document.fileName}"`, err);
     }
@@ -1816,6 +3151,9 @@ class CsvView {
   ) {
     this.format = delimitedFormatOf(document.uri);
     this.session = new ViewerSession(panel, document.uri, 'csv', (msg) => this.onMessage(msg));
+    // (v0.2.0, F) Edit gate registry: view-only until P3 (CsvDocState) gives it a real edit state.
+    const gate = { format: 'csv', uri: document.uri, computeEditState: viewOnlyEditState, dirty: () => document.isDirty } as const;
+    this.session.onDispose(attachEditGateDoc(gate, (state) => this.session.post({ type: 'editState', state })));
     this.reparse = debounce(() => this.refresh(), TEXT_DEBOUNCE_MS);
     this.session.onDispose(this.reparse);
     this.session.onDispose(onTextDocumentChanged(document, () => this.reparse.schedule()));
@@ -1884,6 +3222,7 @@ class CsvView {
         meta: this.model.getMeta(),
         readOnly: true,
         delimited: { format: this.format, delimiter: this.delimiter },
+        editState: viewOnlyEditState(),
       });
       this.initDelimiter = this.delimiter;
     } catch (err) {
@@ -1902,7 +3241,7 @@ class CsvView {
       return;
     }
     try {
-      this.session.post({ type: 'invalidate', meta: this.model.getMeta() });
+      this.session.post({ type: 'invalidate', meta: this.model.getMeta(), editState: viewOnlyEditState() });
     } catch (err) {
       this.session.postError(`Could not display "${this.session.fileName}"`, err);
     }
@@ -1921,39 +3260,6 @@ function markdownMode(uri: vscode.Uri): MarkdownMode {
 
 /** Settings that make VS Code treat a file as read-only (re-checked when one of them changes). */
 const READONLY_SETTINGS = ['files.readonlyInclude', 'files.readonlyExclude', 'files.readonlyFromPermissions'];
-
-/**
- * Whether VS Code's text editor treats the document as read-only (filesConfigurationService.isReadonly), so a task
- * checkbox must not change it either: a read-only file system (git:, a commit), then `files.readonlyInclude`, or
- * `files.readonlyFromPermissions` with a file that cannot be written, both unless `files.readonlyExclude` matches.
- * Like VS Code, a glob matches the path relative to the workspace folder or the absolute path. "Set Active Editor
- * Read-only in Session" is not visible to extensions.
- */
-async function isReadonlyDocument(document: vscode.TextDocument): Promise<boolean> {
-  const uri = document.uri;
-  if (vscode.workspace.fs.isWritableFileSystem(uri.scheme) === false) return true;
-  const files = vscode.workspace.getConfiguration('files', uri);
-  const folder = vscode.workspace.getWorkspaceFolder(uri);
-  const matches = (setting: string): boolean =>
-    Object.entries(files.get<Record<string, boolean>>(setting) ?? {}).some(
-      ([glob, on]) =>
-        on === true &&
-        (vscode.languages.match({ pattern: glob }, document) > 0 ||
-          (folder !== undefined && vscode.languages.match({ pattern: new vscode.RelativePattern(folder, glob) }, document) > 0)),
-    );
-  if (matches('readonlyInclude')) return !matches('readonlyExclude');
-  // files.readonlyFromPermissions is window-scoped: read it without a resource (as VS Code does), or the extension
-  // host logs "Accessing a window scoped configuration for a resource is not expected".
-  if (uri.scheme === 'file' && vscode.workspace.getConfiguration('files').get<boolean>('readonlyFromPermissions') === true) {
-    try {
-      await access(uri.fsPath, fsConstants.W_OK);
-    } catch (err) {
-      // A file that is gone is not read-only: VS Code shows it as deleted, and a save writes it again.
-      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') return !matches('readonlyExclude');
-    }
-  }
-  return false;
-}
 
 /** dist + media, plus the document's folder and all workspace folders (for relative images). */
 function markdownResourceRoots(extensionUri: vscode.Uri, documentUri: vscode.Uri): vscode.Uri[] {
@@ -2000,10 +3306,17 @@ class MarkdownView {
    * only knows versions it got from us, so a toggle for the current version is checked against exactly what it showed.
    */
   private rendered: { version: number; tasks: Map<number, TaskMarker> } | undefined;
-  /** VS Code treats the document as read-only (isReadonlyDocument): task toggles are refused, the webview disables them. */
-  private readOnly = false;
-  /** The first read-only check; 'ready' waits for it, so the init already says whether the checkboxes work. */
-  private readonly firstReadOnlyCheck: Promise<boolean>;
+  /**
+   * (v0.2.0) Whether FileStudio may change the document (SHARED: EDIT GATE: kill switch, VS Code's read-only state).
+   * Not editable: task toggles are refused and the webview disables them (`readOnly` = !editable).
+   */
+  private editState: EditState = { editable: true, kinds: [] };
+  /** The document's edit gate entry, shared by all its panels (queue, state, settings listener). */
+  private readonly gate: EditGateHandle;
+  /** The first edit-state check; 'ready' waits for it, so the init already says whether the checkboxes work. */
+  private readonly firstEditStateCheck: Promise<EditState>;
+  /** Set when the first check is done: later changes of the state go to the webview at once. */
+  private editStateKnown = false;
 
   constructor(
     private readonly document: vscode.TextDocument,
@@ -2013,18 +3326,26 @@ class MarkdownView {
     this.rerender = debounce(() => this.pushUpdate(), TEXT_DEBOUNCE_MS);
     this.session.onDispose(this.rerender);
     this.session.onDispose(onTextDocumentChanged(document, () => this.onDocumentChanged()));
-    this.firstReadOnlyCheck = this.refreshReadOnly(false);
-    this.session.onDispose(
-      vscode.workspace.onDidChangeConfiguration((e) => {
-        if (READONLY_SETTINGS.some((setting) => e.affectsConfiguration(setting, document.uri))) void this.refreshReadOnly(true);
-      }),
+    // (v0.2.0) Kill switch + read-only through the edit gate; its one settings listener re-checks every open document.
+    this.gate = attachEditGateDoc(
+      {
+        format: 'markdown',
+        uri: document.uri,
+        computeEditState: async () => editStateOf(await checkEditable('markdown', document.uri, {}, document), []),
+        version: () => document.version,
+        dirty: () => document.isDirty,
+      },
+      (state) => this.setEditState(state, this.editStateKnown),
     );
+    this.session.onDispose(this.gate);
+    this.session.editHandlers = { version: () => document.version };
+    this.firstEditStateCheck = this.refreshEditState(false);
   }
 
   private onMessage(msg: WebviewMessage): Promise<void> | void {
     switch (msg.type) {
       case 'ready':
-        return this.firstReadOnlyCheck.then(() => this.sendInit());
+        return this.firstEditStateCheck.then(() => this.sendInit());
       case 'toggleTask':
         return this.toggleTask(msg);
       default:
@@ -2063,27 +3384,38 @@ class MarkdownView {
       source: rendered.source,
       mode: markdownMode(this.document.uri),
       version: rendered.version,
-      readOnly: this.readOnly,
+      readOnly: !this.editState.editable,
+      editState: this.editState,
     });
   }
 
   /**
-   * Checks again whether the document is read-only. With `push`, a change goes to the webview at once (a settings
-   * change, a file made read-only since the last check), so its task checkboxes follow. Never rejects.
+   * Checks again whether FileStudio may change the document (kill switch, read-only; SHARED: EDIT GATE). With `push`,
+   * a change goes to the webview at once (a settings change, a file made read-only since the last check), so its task
+   * checkboxes follow. Resolves with the state just computed; never rejects.
    */
-  private async refreshReadOnly(push: boolean): Promise<boolean> {
-    let readOnly = false;
-    try {
-      readOnly = await isReadonlyDocument(this.document);
-    } catch (err) {
-      logError(`[markdown] Could not check whether ${this.session.fileName} is read-only`, err);
+  private async refreshEditState(push: boolean): Promise<EditState> {
+    const state = await this.gate.doc.refresh();
+    this.setEditState(this.gate.doc.state ?? state, push);
+    this.editStateKnown = true;
+    return state;
+  }
+
+  private setEditState(state: EditState, push: boolean): void {
+    if (JSON.stringify(state) === JSON.stringify(this.editState)) return;
+    const wasEditable = this.editState.editable;
+    this.editState = state;
+    if (state.editable !== wasEditable) {
+      const name = this.session.fileName;
+      getLog().info(
+        state.editable
+          ? `[markdown] ${name} can be changed again (no longer read-only)`
+          : state.code === 'readOnly'
+            ? `[markdown] ${name} is read-only: its task checkboxes are disabled`
+            : `[markdown] ${name}: ${state.reason ?? 'not editable'} Its task checkboxes are disabled.`,
+      );
     }
-    if (readOnly !== this.readOnly) {
-      this.readOnly = readOnly;
-      getLog().info(`[markdown] ${this.session.fileName} is ${readOnly ? 'read-only: its task checkboxes are disabled' : 'no longer read-only'}`);
-      if (push) this.pushUpdate();
-    }
-    return readOnly;
+    if (push) this.pushUpdate();
   }
 
   /** Sends the current rendering: a cheap markdownUpdate when content is shown, otherwise a full init. */
@@ -2101,7 +3433,8 @@ class MarkdownView {
       toc: rendered.toc,
       source: rendered.source,
       version: rendered.version,
-      readOnly: this.readOnly,
+      readOnly: !this.editState.editable,
+      editState: this.editState,
     });
   }
 
@@ -2122,16 +3455,25 @@ class MarkdownView {
    * version on screen can edit the document, and only the marker character the renderer located for it: never a
    * line guessed by a pattern, nor a checkbox written in raw HTML.
    */
-  private async toggleTask(msg: MessageOf<'toggleTask'>): Promise<void> {
+  private toggleTask(msg: MessageOf<'toggleTask'>): Promise<void> {
+    // (v0.2.0) In the document's queue: toggles from all its panels run one at a time (contract §3.1).
+    return this.gate.doc.queue.run(() => this.applyToggle(msg));
+  }
+
+  private async applyToggle(msg: MessageOf<'toggleTask'>): Promise<void> {
     const document = this.document;
     const where = `line ${msg.line + 1} of ${this.session.fileName}`;
-    // Checked again at the click (the file may have been made read-only since): VS Code's own editor refuses edits to
-    // a read-only document, and an edit applied anyway would change it in memory only (not dirty, never saved).
-    if (await this.refreshReadOnly(true)) {
-      getLog().info(`[markdown] Task toggle on ${where} refused: the document is read-only`);
-      this.answerToggle(msg, false, 'the document is read-only');
+    // Checked again at the click (SHARED: EDIT GATE): the kill switch, then VS Code's read-only state (the file may
+    // have been made read-only since: VS Code's own editor refuses edits to a read-only document, and an edit applied
+    // anyway would change it in memory only, not dirty, never saved). A refusal answers here, never with the error view.
+    const state = await this.refreshEditState(true);
+    if (!state.editable) {
+      const reason = state.code === 'readOnly' ? 'the document is read-only' : (state.reason ?? EDIT_TEXT.internal);
+      getLog().info(`[markdown] Task toggle on ${where} refused: ${reason}`);
+      this.answerToggle(msg, false, reason);
       return;
     }
+    // No await from here to the applyEdit call: the version check must hold when the edit is made (contract §3.2).
     if (msg.version !== document.version) {
       // The webview clicked an older rendering; the change already scheduled the one it is missing.
       getLog().info(`[markdown] Task toggle on ${where} ignored: the document changed (v${msg.version} -> v${document.version})`);
@@ -2565,6 +3907,64 @@ export class PptxViewerProvider implements vscode.CustomReadonlyEditorProvider<R
       slidesShown = Math.max(slidesShown, deck.slideCount);
     });
   }
+}
+
+// ===== TEST API =====
+// (v0.2.0, track F; contract §13.3) What integration tests use to drive FileStudio: deliver webview messages, read a
+// document's state and answer modal prompts (ask). activate() returns it only when VS Code runs extension tests
+// (ExtensionMode.Test); in normal use it does not exist and ask() shows real dialogs.
+
+export interface FileStudioTestApi {
+  version: 1;
+  /** Deliver a WebviewMessage as if from the first panel of that document; resolves with the messages posted back to it while handling. */
+  post(uri: string, msg: WebviewMessage): Promise<HostMessage[]>;
+  /** Host state of an open document (`version` 0 / `dirty` false until the owning phase registers them). */
+  state(uri: string): {
+    version: number;
+    dirty: boolean;
+    editState?: EditState;
+    stateId?: number;
+    savedStateId?: number;
+    generation?: number;
+    poisoned?: boolean;
+  };
+  /** Queue answers for the next ask() prompts (button text, or undefined = Cancel). */
+  answer(id: AskId, button: string | undefined): void;
+}
+
+/** True once activate() created the test API (ExtensionMode.Test): ask() then answers from `testAnswers`. */
+let testApiEnabled = false;
+/** Answers queued by FileStudioTestApi.answer, per prompt id, used in order. */
+const testAnswers = new Map<AskId, (string | undefined)[]>();
+
+/** Creates the test API (only for ExtensionMode.Test; see extension.ts). */
+export function createTestApi(): FileStudioTestApi {
+  testApiEnabled = true;
+  const key = (uri: string): string => vscode.Uri.parse(uri, true).toString();
+  return {
+    version: 1,
+    post(uri: string, msg: WebviewMessage): Promise<HostMessage[]> {
+      const target = key(uri);
+      const session = [...liveSessions].find((s) => !s.isDisposed && s.uri.toString() === target);
+      if (!session) return Promise.reject(new Error(`No FileStudio panel shows ${uri}`));
+      return session.deliverForTest(msg);
+    },
+    state(uri: string) {
+      const target = key(uri);
+      const doc = [...editGateDocs.values()].find((d) => d.spec.uri.toString() === target);
+      if (!doc) throw new Error(`FileStudio has no open document ${uri}`);
+      return {
+        version: doc.spec.version?.() ?? 0,
+        dirty: doc.spec.dirty?.() ?? false,
+        ...(doc.state ? { editState: doc.state } : {}),
+      };
+    },
+    answer(id: AskId, button: string | undefined): void {
+      const queue = testAnswers.get(id) ?? [];
+      queue.push(button);
+      testAnswers.set(id, queue);
+    },
+  };
 }
 
 // ===== LOGGING =====
