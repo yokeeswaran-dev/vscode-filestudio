@@ -6,7 +6,8 @@ const H = require('./harness');
 const F = require('./fixtures');
 
 const LONG_URL = 'https://example.com/' + 'averyveryverylongpathsegment'.repeat(12);
-const WORDS = ['Quantity', 'Description', 'Unit price', 'Discount', 'Shipping', 'Warehouse', 'Supplier', 'Category'];
+const WORDS = ['Quantity', 'Description', 'Discount', 'Shipping', 'Category'];
+const NOTE = 'the quick brown fox jumps over the lazy dog and keeps running far away from here again and again until night';
 const cell = (text) => `<w:tc><w:p><w:r><w:t xml:space="preserve">${text}</w:t></w:r></w:p></w:tc>`;
 const row = (cells) => `<w:tr>${cells.map(cell).join('')}</w:tr>`;
 
@@ -34,8 +35,18 @@ const LINKS = [
   { id: 'rIdL3', target: 'https://ok.example/after' },
 ];
 const doc = () => H.docxHost('regressions.docx', () => F.docx(BODY, LINKS));
-/** An 8-column table of ordinary words, and a table with one long URL. */
-const WORDS_TABLE = `<w:tbl>${row(WORDS)}${row(WORDS.map((w) => `${w} value`))}</w:tbl>`;
+/**
+ * R2H3-G: five columns of single long words and one column with a long sentence. The result must not depend on the
+ * fonts of the machine (Windows has Calibri / Segoe UI, a Linux runner has wider fallback fonts):
+ * - the words alone always fit the page (the table needs about 430 px in Calibri and 540 px even in Courier New, of
+ *   the 657 px the page has), so a correct layout never splits one;
+ * - the sentence makes the table wider than the page in every font, so the browser has to squeeze it: with
+ *   overflow-wrap: anywhere on every cell (the bug) it squeezes the word columns below their words ('Qua/ntit/y').
+ * Do not add columns or longer words: a table whose longest words do not fit the page is wrapped inside its cells on
+ * purpose (docxFitTables, as Word does), which is not what this test is about.
+ */
+const WORDS_TABLE = `<w:tbl>${row([...WORDS, 'Notes'])}${row([...WORDS.map((w) => `${w} value`), NOTE])}</w:tbl>`;
+/** A table with one long URL. */
 const URL_TABLE = `<w:tbl>${row(['Link', LONG_URL])}${row(['Note', 'short words only'])}</w:tbl>`;
 
 /** Paragraph text directions and the gaps between text and paragraph edges. */

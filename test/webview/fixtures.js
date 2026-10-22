@@ -178,8 +178,9 @@ async function render() {
   ws.getCell('B9').alignment = { horizontal: 'fill' };
   ws.getCell('D9').value = 'fill-aligned long text must not overflow';
   ws.getCell('D9').alignment = { horizontal: 'fill' };
-  // 11: H4-F6 distributed + indent 1.
-  ws.getCell('D11').value = 'distrib ind';
+  // 11: H4-F6 distributed + indent 1. Two short words: they stay on one line in the 84 px column even with a wide font
+  // (the text and the 9 px indent on both sides must fit in it), so the test does not depend on the fonts installed.
+  ws.getCell('D11').value = 'ab cd';
   ws.getCell('D11').alignment = { horizontal: 'distributed', indent: 1 };
   // 13: H4-F13 double underline + strike; H4-F14 superscript run of 24 pt.
   ws.getCell('A13').value = 'dbl+strike';

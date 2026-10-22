@@ -74,7 +74,8 @@ H.suite('sheet: rendering (0.1.x regressions)', ({ test }) => {
   test("H4-F6 'distributed' alignment spreads the text with the indent on both sides", (h) =>
     h.use(render(), {}, async (view) => {
       await H.grid(view).ready();
-      const g = await geo(view, 'distrib', 10, 3);
+      const g = await geo(view, 'ab cd', 10, 3);
+      assert.ok(g.textB - g.textT <= g.cellB - g.cellT, `the two words stay on one line (a wrapped text cannot be spread): ${JSON.stringify(g)}`);
       assert.ok(g.textL >= g.cellL + 9, `indent on the left: ${JSON.stringify(g)}`);
       assert.ok(Math.abs(g.textR - (g.cellR - 2 - 9)) <= 3, `indent on the right: ${JSON.stringify(g)}`);
     }));
