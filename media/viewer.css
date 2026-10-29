@@ -1488,8 +1488,8 @@ body.vscode-reduce-motion .fv-status-stats {
   --md-hl-deleted: var(--vscode-gitDecoration-deletedResourceForeground, var(--vscode-editor-foreground));
   --md-hl-deleted-bg: var(--vscode-diffEditor-removedTextBackground, transparent);
 
-  position: fixed;
-  inset: 0;
+  /* (v0.2.0) the frame (.md-app) covers the webview; the preview is the scroller beside the TOC */
+  position: relative;
   overflow: auto;
   scroll-padding-top: 16px;
   background: var(--vscode-editor-background);
@@ -2273,6 +2273,340 @@ body.vscode-high-contrast-light .docx-view .docx-page mark {
   .md-view .md-article {
     padding: 16px 16px 48px;
   }
+}
+
+/* ----- MARKDOWN: FRAME & TOOLBAR ----- */
+/* (v0.2.0, P6) .md-app holds the toolbar and the body (TOC | preview | WYSIWYG); it is what covers the webview, .md-view
+   is only the scroller of the preview. */
+.md-app {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-editor-foreground);
+  font-family: var(--vscode-font-family, system-ui, sans-serif);
+}
+.md-app [hidden] {
+  display: none !important;
+}
+.md-toolbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 2px 8px;
+  box-sizing: border-box;
+  background: var(--fv-chrome-bg);
+  border-bottom: 1px solid var(--fv-chrome-border);
+  color: var(--vscode-foreground);
+  font-family: var(--fv-ui-font);
+  font-size: var(--fv-ui-size);
+  user-select: none;
+}
+.md-toolbar .md-toc-btn[aria-pressed='true'] {
+  background: var(--vscode-inputOption-activeBackground, rgba(128, 128, 128, 0.25));
+  color: var(--vscode-inputOption-activeForeground, var(--vscode-foreground));
+  border-color: var(--vscode-inputOption-activeBorder, transparent);
+}
+.md-modes {
+  flex: none;
+  display: inline-flex;
+  border: 1px solid var(--vscode-contrastBorder, var(--vscode-widget-border, var(--fv-chrome-border)));
+  border-radius: 4px;
+  overflow: hidden;
+}
+.md-mode-btn {
+  margin: 0;
+  padding: 2px 10px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--vscode-foreground);
+  font: inherit;
+  line-height: 18px;
+  cursor: pointer;
+}
+.md-mode-btn + .md-mode-btn {
+  border-left: 1px solid var(--vscode-contrastBorder, var(--vscode-widget-border, var(--fv-chrome-border)));
+}
+.md-mode-btn:hover:not([aria-checked='true']):not([aria-disabled='true']) {
+  background: var(--vscode-toolbar-hoverBackground, rgba(128, 128, 128, 0.18));
+}
+.md-mode-btn[aria-checked='true'] {
+  background: var(--vscode-button-background);
+  color: var(--vscode-button-foreground);
+}
+.md-mode-btn[aria-disabled='true'] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.md-mode-btn:focus-visible,
+.md-anyway:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+.md-status {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vscode-descriptionForeground);
+}
+.md-anyway {
+  flex: none;
+  padding: 1px 10px;
+  border: 1px solid var(--vscode-button-border, transparent);
+  border-radius: 2px;
+  background: var(--vscode-button-secondaryBackground);
+  color: var(--vscode-button-secondaryForeground);
+  font: inherit;
+  cursor: pointer;
+}
+.md-anyway:hover {
+  background: var(--vscode-button-secondaryHoverBackground);
+}
+.md-body {
+  position: relative;
+  flex: 1 1 auto;
+  display: flex;
+  min-height: 0;
+}
+/* The preview is the scroller beside the sidebar; WYSIWYG is another scroller in the same place. */
+.md-body > .md-view {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+}
+@media (max-width: 480px) {
+  .md-status {
+    display: none;
+  }
+}
+
+/* ----- MARKDOWN: TOC ----- */
+.md-toc {
+  flex: none;
+  width: 240px;
+  max-width: 40%;
+  overflow: auto;
+  box-sizing: border-box;
+  background: var(--vscode-sideBar-background, var(--fv-chrome-bg));
+  color: var(--vscode-sideBar-foreground, var(--vscode-foreground));
+  border-right: 1px solid var(--vscode-sideBar-border, var(--fv-chrome-border));
+  font-family: var(--fv-ui-font);
+  font-size: var(--fv-ui-size);
+}
+.md-toc-list {
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+}
+.md-toc-list .md-toc-list {
+  padding: 0 0 0 12px;
+}
+.md-toc-item {
+  margin: 0;
+  padding: 0;
+}
+.md-toc-row {
+  display: flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 6px 0 4px;
+  cursor: pointer;
+  outline: none;
+}
+.md-toc-row:hover {
+  background: var(--vscode-list-hoverBackground, rgba(128, 128, 128, 0.12));
+}
+.md-toc-row[aria-current='location'] {
+  font-weight: 600;
+}
+.md-toc-row:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+.md-toc-toggle {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.md-toc-row[aria-expanded='true'] .md-toc-toggle .fv-icon {
+  transform: rotate(90deg);
+}
+.md-toc-toggle .fv-icon {
+  transition: transform 0.1s ease;
+}
+.md-toc-text {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.md-toc-empty {
+  margin: 8px;
+  color: var(--vscode-descriptionForeground);
+}
+@media (max-width: 520px) {
+  .md-toc {
+    max-width: 55%;
+  }
+}
+
+/* ----- MARKDOWN: WYSIWYG ----- */
+/* The editor is Milkdown Crepe, themed with the VS Code colours: --crepe-color-* are mapped to --vscode-* (Crepe's own
+   theme CSS is imported statically and scoped to .milkdown). Protected blocks (fs_raw) are plain text with a label. */
+.md-wysiwyg {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  scroll-padding-top: 16px;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-editor-foreground);
+}
+.md-wysiwyg .milkdown {
+  --crepe-color-background: var(--vscode-editor-background);
+  --crepe-color-on-background: var(--vscode-editor-foreground);
+  --crepe-color-surface: var(--vscode-editorWidget-background);
+  --crepe-color-surface-low: var(--vscode-textCodeBlock-background, var(--vscode-editorWidget-background));
+  --crepe-color-on-surface: var(--vscode-editorWidget-foreground, var(--vscode-foreground));
+  --crepe-color-on-surface-variant: var(--vscode-descriptionForeground);
+  --crepe-color-outline: var(--vscode-widget-border, var(--vscode-contrastBorder, var(--vscode-panel-border)));
+  --crepe-color-primary: var(--vscode-textLink-foreground);
+  --crepe-color-secondary: var(--vscode-button-secondaryBackground, var(--vscode-editorWidget-background));
+  --crepe-color-on-secondary: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+  --crepe-color-inverse: var(--vscode-editorHoverWidget-background);
+  --crepe-color-on-inverse: var(--vscode-editorHoverWidget-foreground);
+  --crepe-color-inline-code: var(--vscode-textPreformat-foreground);
+  --crepe-color-error: var(--vscode-errorForeground);
+  --crepe-color-hover: var(--vscode-list-hoverBackground, var(--vscode-toolbar-hoverBackground));
+  --crepe-color-selected: var(--vscode-list-activeSelectionBackground, var(--vscode-editor-selectionBackground));
+  --crepe-color-inline-area: var(--vscode-textCodeBlock-background);
+  --crepe-font-default: var(--vscode-markdown-font-family, var(--vscode-font-family));
+  --crepe-font-title: var(--crepe-font-default);
+  --crepe-font-code: var(--vscode-editor-font-family);
+  --crepe-base-font-size: var(--vscode-markdown-font-size, 14px);
+  --crepe-shadow-1: 0 0 8px 2px var(--vscode-widget-shadow, transparent);
+  --crepe-shadow-2: 0 0 12px 4px var(--vscode-widget-shadow, transparent);
+}
+body.vscode-dark .md-wysiwyg,
+body.vscode-high-contrast:not(.vscode-high-contrast-light) .md-wysiwyg {
+  color-scheme: dark;
+}
+body.vscode-light .md-wysiwyg,
+body.vscode-high-contrast-light .md-wysiwyg {
+  color-scheme: light;
+}
+/* The page: like the preview's article (Crepe's own 60px 120px padding is for a full-page editor). */
+.md-wysiwyg .milkdown .ProseMirror {
+  box-sizing: border-box;
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 32px 48px 72px;
+  min-height: 100%;
+  outline: none;
+  line-height: 1.6;
+}
+/* Focus ring (Crepe removes the browser's). */
+.md-wysiwyg .milkdown :focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+.md-wysiwyg .milkdown .ProseMirror:focus-visible {
+  outline: none;
+}
+/* List markers (bullets, numbers, task boxes) use Crepe's outline colour = a pale border colour in the light theme:
+   they would nearly vanish. Use the text colour, like the preview does. */
+.md-wysiwyg .milkdown .milkdown-list-item-block li .label-wrapper {
+  color: var(--vscode-editor-foreground);
+}
+.md-wysiwyg .milkdown .milkdown-list-item-block li .label-wrapper svg {
+  fill: var(--vscode-editor-foreground);
+}
+.md-wysiwyg .milkdown pre.fs-raw {
+  position: relative;
+  margin: 8px 0;
+  padding: 6px 10px;
+  white-space: pre-wrap;
+  font-family: var(--vscode-editor-font-family);
+  font-size: var(--vscode-editor-font-size);
+  background: var(--vscode-textCodeBlock-background);
+  border-left: 3px solid var(--vscode-textBlockQuote-border, var(--vscode-focusBorder));
+}
+.md-wysiwyg .milkdown pre.fs-raw::before {
+  content: 'Markdown source: ' attr(data-kind);
+  display: block;
+  font-family: var(--vscode-font-family);
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+}
+.md-wysiwyg .milkdown .md-wysiwyg-readonly,
+.md-wysiwyg .md-wysiwyg-readonly .ProseMirror {
+  cursor: default;
+}
+.md-wysiwyg .md-wysiwyg-readonly .milkdown-block-handle,
+.md-wysiwyg .md-wysiwyg-readonly .milkdown-slash-menu {
+  display: none;
+}
+@media (max-width: 720px) {
+  .md-wysiwyg .milkdown .ProseMirror {
+    padding: 16px 16px 48px;
+  }
+}
+
+/* ----- MARKDOWN: FRAME HIGH CONTRAST ----- */
+body.vscode-high-contrast .md-mode-btn[aria-checked='true'],
+body.vscode-high-contrast-light .md-mode-btn[aria-checked='true'] {
+  outline: 1px solid var(--vscode-contrastActiveBorder, var(--vscode-focusBorder));
+  outline-offset: -2px;
+}
+body.vscode-high-contrast .md-toc-row:hover,
+body.vscode-high-contrast-light .md-toc-row:hover,
+body.vscode-high-contrast .md-mode-btn:hover:not([aria-checked='true']):not([aria-disabled='true']),
+body.vscode-high-contrast-light .md-mode-btn:hover:not([aria-checked='true']):not([aria-disabled='true']) {
+  outline: 1px dashed var(--vscode-contrastActiveBorder, var(--vscode-focusBorder));
+  outline-offset: -1px;
+  background: transparent;
+}
+body.vscode-high-contrast .md-toc-row[aria-current='location'],
+body.vscode-high-contrast-light .md-toc-row[aria-current='location'] {
+  text-decoration: underline;
+}
+body.vscode-high-contrast .md-wysiwyg .milkdown pre.fs-raw,
+body.vscode-high-contrast-light .md-wysiwyg .milkdown pre.fs-raw {
+  border: 1px solid var(--vscode-contrastBorder);
+  border-left-width: 3px;
+}
+@media (forced-colors: active) {
+  .md-mode-btn[aria-checked='true'] {
+    forced-color-adjust: none;
+    background: Highlight;
+    color: HighlightText;
+  }
+  .md-toc-row[aria-current='location'] {
+    text-decoration: underline;
+  }
+}
+
+/* ----- MARKDOWN: FRAME MOTION ----- */
+@media (prefers-reduced-motion: reduce) {
+  .md-toc-toggle .fv-icon {
+    transition: none;
+  }
+}
+body.vscode-reduce-motion .md-toc-toggle .fv-icon {
+  transition: none;
 }
 
 /* ===== DOCX ===== */

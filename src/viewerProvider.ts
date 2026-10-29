@@ -31,7 +31,7 @@ import {
   type GridSource,
   type WorkbookModel,
 } from './renderers/sheet';
-import { markdownHeadings, renderMarkdown, type RenderResult } from './renderers/markdown';
+import { applyMdTextEdits, markdownBlocks, markdownHeadings, renderMarkdown, verifyMdEdit, type RenderResult } from './renderers/markdown';
 import { renderDocx, type DocxResult } from './renderers/docx';
 import { checkPdf, PDF_HEADER_SEARCH_BYTES } from './renderers/pdf';
 import { renderPptx, type PptxDocument as PptxDeck } from './renderers/pptx';
@@ -216,6 +216,9 @@ export type HostMessage =
       editState?: EditState;
       blocks?: MdBlock[];
       eol?: '\n' | '\r\n';
+      /** (v0.2.0, P6) As in the markdown init (additive, decisions P6-12). */
+      limits?: { wysiwyg: boolean; reason?: string };
+      resourceBase?: string;
     }
   /**
    * A link to the document itself was followed (`readme.md#usage` in readme.md, `file:///C:/x/self.docx#intro` in
@@ -3295,12 +3298,165 @@ function resolveMarkdownResource(href: string, documentUri: vscode.Uri, webview:
   return target ? webview.asWebviewUri(target).toString() : undefined;
 }
 
-/** One Markdown preview panel: renders on 'ready', re-renders (debounced) on change, applies task toggles. */
+// ----- markdown: WYSIWYG, Split, commands (v0.2.0, P6; contract §9) -----
+
+/** WYSIWYG is off above this many characters or top-level blocks (contract §9.3). */
+const MD_WYSIWYG_MAX_CHARS = 200_000;
+const MD_WYSIWYG_MAX_BLOCKS = 3_000;
+const MD_TOO_LARGE = 'This file is too large for WYSIWYG editing. Use Split to edit the Markdown source.';
+const MD_OTHER_PARTS = 'This change would also change other parts of the file; it was not applied.';
+/** Our own `revealRange` and the scroll events it causes (Split) are ignored for this long. */
+const MD_REVEAL_ECHO_MS = 150;
+/** `onWillSaveTextDocument` waits this long for the webview's last typing; then the save goes on without it. */
+const MD_FLUSH_TIMEOUT_MS = 1_000;
+/** After a change that leaves the document clean (a reload from disk), the fidelity check runs again after this pause. */
+const MD_FIDELITY_RECHECK_MS = 300;
+const MD_NOT_SAVED_YET = 'FileStudio: Your last typing was not saved yet.';
+
+/** Result of checkTextFidelity as the Markdown view keeps it (contract §8.6, D-072). */
+interface MdFidelity {
+  /** The first check has not finished: not editable (D-072). A re-check keeps the old verdict (edits wait for it). */
+  pending: boolean;
+  ok: boolean;
+  /** "Edit anyway" was chosen for this document session. */
+  accepted: boolean;
+  blocked?: string;
+  canEditAnyway?: { title: string; details: string[] };
+}
+
+/** What all panels of one Markdown document share: the fidelity verdict. (The queue lives in its EditGateDoc.) */
+interface MdDocState {
+  fidelity: MdFidelity;
+  /** Number of the newest fidelity check (an older one that finishes later is dropped). */
+  seq: number;
+  started: boolean;
+  /** A re-check is scheduled or running: edits wait for it (never judged against a stale verdict). */
+  recheck?: { timer: ReturnType<typeof setTimeout> | undefined; done: Promise<void>; finish: () => void };
+  /** Recomputes the edit state of the document and tells its panels (set by the panels). */
+  refreshers: Set<() => Promise<unknown>>;
+}
+
+const mdDocStates = new WeakMap<vscode.TextDocument, MdDocState>();
+
+function mdDocState(document: vscode.TextDocument): MdDocState {
+  let state = mdDocStates.get(document);
+  if (!state) {
+    state = { fidelity: { pending: true, ok: false, accepted: false }, seq: 0, started: false, refreshers: new Set() };
+    mdDocStates.set(document, state);
+  }
+  return state;
+}
+
+async function refreshMdDocument(state: MdDocState): Promise<void> {
+  const first = [...state.refreshers][0];
+  if (first) await first();
+}
+
+/** Runs checkTextFidelity and stores the verdict. An earlier "Edit anyway" is kept only when the verdict did not change. */
+async function runMdFidelityCheck(document: vscode.TextDocument, state: MdDocState): Promise<void> {
+  const seq = ++state.seq;
+  let result: TextFidelity;
+  try {
+    result = await checkTextFidelity(document);
+  } catch (err) {
+    logError(`[markdown] The fidelity check of ${document.uri.toString(true)} failed`, err);
+    result = { ok: false, canEditAnyway: { title: EDIT_TEXT.fidelityTitle, details: [EDIT_TEXT.fidelityUnreadable] } };
+  }
+  if (seq !== state.seq) return; // a newer check is on its way
+  const before = state.fidelity;
+  const same =
+    !before.pending &&
+    before.ok === result.ok &&
+    before.blocked === result.blocked &&
+    JSON.stringify(before.canEditAnyway) === JSON.stringify(result.canEditAnyway);
+  state.fidelity = {
+    pending: false,
+    ok: result.ok,
+    accepted: same ? before.accepted : false,
+    ...(result.blocked === undefined ? {} : { blocked: result.blocked }),
+    ...(result.canEditAnyway === undefined ? {} : { canEditAnyway: result.canEditAnyway }),
+  };
+  if (!same) getLog().info(`[markdown] ${document.uri.toString(true)}: save check ${result.ok ? 'ok' : result.blocked ? 'blocked' : 'needs "Edit anyway"'}`);
+  await refreshMdDocument(state);
+}
+
+/** The first check of a document (started by its first panel). */
+function startMdFidelityCheck(document: vscode.TextDocument, state: MdDocState): void {
+  if (state.started) return;
+  state.started = true;
+  void runMdFidelityCheck(document, state);
+}
+
+/**
+ * A content change that leaves the document clean was not typed in an editor: VS Code reloaded the file from disk (or
+ * Revert File). The save check runs again; edits wait for it (D-072).
+ */
+function scheduleMdFidelityRecheck(document: vscode.TextDocument, state: MdDocState): void {
+  if (!state.started) return;
+  let recheck = state.recheck;
+  if (!recheck) {
+    let finish: () => void = () => undefined;
+    const done = new Promise<void>((resolve) => (finish = resolve));
+    recheck = { timer: undefined, done, finish };
+    state.recheck = recheck;
+  }
+  if (recheck.timer !== undefined) clearTimeout(recheck.timer);
+  const current = recheck;
+  current.timer = setTimeout(() => {
+    current.timer = undefined;
+    runMdFidelityCheck(document, state)
+      .catch((err: unknown) => logError('[markdown] The fidelity re-check failed', err))
+      .finally(() => {
+        if (current.timer !== undefined) return; // another change came while the check ran: its timer finishes it
+        if (state.recheck === current) state.recheck = undefined;
+        current.finish();
+      });
+  }, MD_FIDELITY_RECHECK_MS);
+}
+
+/**
+ * The edit state of a Markdown document: kill switch and read-only state (task toggles and WYSIWYG), then the save
+ * fidelity (WYSIWYG only; task toggles are exempt). Fidelity pending / not accepted / blocked keep `editable: true`
+ * (the checkboxes work) but leave `kinds` empty with the `code` and the reason, so only WYSIWYG is read-only.
+ */
+async function markdownEditState(document: vscode.TextDocument): Promise<EditState> {
+  const gate = await checkEditable('markdown', document.uri, {}, document);
+  if (!gate.ok) return editStateOf(gate, []);
+  const fidelity = mdDocState(document).fidelity;
+  const text = documentGate({ fidelity });
+  if (text.ok) return { editable: true, kinds: ['mdText'] };
+  return {
+    editable: true,
+    kinds: [],
+    code: text.code,
+    reason: fidelity.pending ? EDIT_TEXT.checking : text.reason,
+    ...(!fidelity.pending && !fidelity.accepted && fidelity.canEditAnyway ? { canEditAnyway: fidelity.canEditAnyway } : {}),
+  };
+}
+
+/** Whether WYSIWYG can be used for `source` (size limits only; `blockCount` when known). */
+function mdLimitsOf(source: string, blockCount?: number): { wysiwyg: boolean; reason?: string } {
+  if (source.length > MD_WYSIWYG_MAX_CHARS || (blockCount !== undefined && blockCount > MD_WYSIWYG_MAX_BLOCKS)) {
+    return { wysiwyg: false, reason: MD_TOO_LARGE };
+  }
+  return { wysiwyg: true };
+}
+
+/** Whether the edit state allows showing the WYSIWYG editor (read-only while the save check is open: "Edit anyway"). */
+function mdWysiwygShown(state: EditState): boolean {
+  return state.editable && (state.kinds?.includes('mdText') === true || state.code === 'fidelity');
+}
+
+/** One Markdown preview panel: renders on 'ready', re-renders (debounced) on change, applies task toggles and WYSIWYG edits. */
 class MarkdownView {
   private readonly session: ViewerSession;
   private readonly rerender: Debounced;
-  /** Document version our own pending task toggle will produce (that change is pushed at once, never re-inited). */
-  private selfEditVersion: number | undefined;
+  /**
+   * Our own change that is on its way (a task toggle or a WYSIWYG edit): the text the document will have. The change
+   * event that brings exactly this text is ours (compared by text, not by "+1": two panels, undo and typing between
+   * cannot mix it up). A toggle pushes the new rendering at once; a WYSIWYG edit is answered first, then pushed.
+   */
+  private own: { text: string; kind: 'toggle' | 'md' } | undefined;
   /**
    * Task checkboxes of the last rendering sent to the webview, by line, and the version it was made from. The webview
    * only knows versions it got from us, so a toggle for the current version is checked against exactly what it showed.
@@ -3317,12 +3473,33 @@ class MarkdownView {
   private readonly firstEditStateCheck: Promise<EditState>;
   /** Set when the first check is done: later changes of the state go to the webview at once. */
   private editStateKnown = false;
+  /** (v0.2.0, P6) What this panel shows (the toolbar choice); starts with fileStudio.markdown.defaultMode. */
+  private mode: MarkdownMode;
+  private readonly docState: MdDocState;
+  /** The size limits of the last rendering (an edit is refused when WYSIWYG is not allowed for the document any more). */
+  private limits: { wysiwyg: boolean; reason?: string } = { wysiwyg: true };
+  /** Split: the text editor the user scrolled last, and when we revealed a line ourselves (echo guard). */
+  private lastUserEditor: vscode.TextEditor | undefined;
+  private lastReveal = 0;
+  /** WYSIWYG: flush requests the webview has not answered yet. */
+  private flushId = 0;
+  private readonly flushes = new Map<number, () => void>();
+  /** WYSIWYG: `edit` jobs queued or running (a `flushed` waits for them). */
+  private readonly editJobs = new Set<Promise<void>>();
 
   constructor(
     private readonly document: vscode.TextDocument,
     panel: vscode.WebviewPanel,
   ) {
     this.session = new ViewerSession(panel, document.uri, 'markdown', (msg) => this.onMessage(msg));
+    this.mode = markdownMode(document.uri);
+    this.docState = mdDocState(document);
+    if (this.docState.refreshers.size === 0) {
+      // The first panel of this document (again): the save check is made once per open, so start from "pending".
+      this.docState.fidelity = { pending: true, ok: false, accepted: false };
+      this.docState.started = false;
+      this.docState.seq++;
+    }
     this.rerender = debounce(() => this.pushUpdate(), TEXT_DEBOUNCE_MS);
     this.session.onDispose(this.rerender);
     this.session.onDispose(onTextDocumentChanged(document, () => this.onDocumentChanged()));
@@ -3331,14 +3508,31 @@ class MarkdownView {
       {
         format: 'markdown',
         uri: document.uri,
-        computeEditState: async () => editStateOf(await checkEditable('markdown', document.uri, {}, document), []),
+        computeEditState: () => markdownEditState(document),
         version: () => document.version,
         dirty: () => document.isDirty,
       },
       (state) => this.setEditState(state, this.editStateKnown),
     );
     this.session.onDispose(this.gate);
-    this.session.editHandlers = { version: () => document.version };
+    const refresh = (): Promise<unknown> => this.gate.doc.refresh();
+    this.docState.refreshers.add(refresh);
+    this.session.onDispose({ dispose: () => this.docState.refreshers.delete(refresh) });
+    this.session.editHandlers = {
+      version: () => document.version,
+      onEdit: (msg) => this.onEdit(msg),
+      onEditAnyway: () => this.onEditAnyway(),
+      onCommand: (msg) => this.onCommand(msg),
+      onSetMode: (msg) => this.onSetMode(msg),
+      onPreviewScrolled: (msg) => this.onPreviewScrolled(msg),
+      onFlushed: (msg) => this.onFlushed(msg),
+    };
+    // Split: the source editor scrolled -> the preview follows. WYSIWYG: Save All / auto save ask the editor to flush.
+    this.session.onDispose(vscode.window.onDidChangeTextEditorVisibleRanges((e) => this.onEditorScrolled(e)));
+    this.session.onDispose(vscode.workspace.onWillSaveTextDocument((e) => this.onWillSave(e)));
+    this.session.onDispose(onTextDocumentChanged(document, () => this.onCleanChange()));
+    this.session.onDispose({ dispose: () => this.endFlushes() });
+    startMdFidelityCheck(document, this.docState);
     this.firstEditStateCheck = this.refreshEditState(false);
   }
 
@@ -3357,15 +3551,50 @@ class MarkdownView {
     }
   }
 
-  private render(): (RenderResult & { source: string; version: number }) | undefined {
+  // ----- rendering -----
+
+  /**
+   * What the webview gets for the current text. In WYSIWYG mode the HTML is left out ('') and the blocks go along;
+   * otherwise the HTML. A mode that cannot be used now (too large, editing off, wrong encoding) falls back to Preview.
+   */
+  private render(): MdPayload | undefined {
     const source = this.document.getText();
     const version = this.document.version;
     try {
+      let limits = mdLimitsOf(source);
+      let blocks: MdBlock[] | undefined;
+      // The block count is needed in WYSIWYG and when the file has more lines than the block limit (every block has at
+      // least one line of its own, so a file with fewer lines is always under the limit: Preview and Split open without
+      // parsing the document for blocks nobody asked for).
+      const countBlocks = this.mode === 'wysiwyg' || this.document.lineCount > MD_WYSIWYG_MAX_BLOCKS;
+      if (limits.wysiwyg && countBlocks) {
+        blocks = markdownBlocks(source, { contextCheck: this.mode === 'wysiwyg' });
+        limits = mdLimitsOf(source, blocks.filter((block) => block.kind !== 'gap').length);
+        if (!limits.wysiwyg) blocks = undefined;
+      }
+      if (this.mode === 'wysiwyg' && !(limits.wysiwyg && mdWysiwygShown(this.editState))) {
+        getLog().info(`[markdown] ${this.session.fileName}: WYSIWYG is not available (${limits.reason ?? this.editState.reason ?? 'editing is off'}); showing the preview`);
+        this.mode = 'preview';
+        blocks = undefined;
+      }
+      this.limits = limits;
+      const eol: '\n' | '\r\n' = this.document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+      const base: Pick<MdPayload, 'source' | 'version' | 'eol' | 'limits' | 'resourceBase'> = {
+        source,
+        version,
+        eol,
+        limits,
+        ...(this.document.uri.scheme === 'untitled' ? {} : { resourceBase: resourceBaseOf(this.document.uri, this.session.webview) }),
+      };
+      if (this.mode === 'wysiwyg') {
+        this.rendered = undefined;
+        return { ...base, html: '', toc: markdownHeadings(source), blocks: blocks ?? [] };
+      }
       const result = renderMarkdown(source, {
         resolveResource: (href: string) => resolveMarkdownResource(href, this.document.uri, this.session.webview),
       });
       this.rendered = { version, tasks: new Map((result.tasks ?? []).map((task) => [task.line, task])) };
-      return { html: result.html, toc: result.toc, source, version };
+      return { ...base, html: result.html, toc: result.toc };
     } catch (err) {
       this.session.postError(`Could not render "${this.session.fileName}"`, err);
       return undefined;
@@ -3379,11 +3608,8 @@ class MarkdownView {
       type: 'init',
       kind: 'markdown',
       fileName: this.session.fileName,
-      html: rendered.html,
-      toc: rendered.toc,
-      source: rendered.source,
-      mode: markdownMode(this.document.uri),
-      version: rendered.version,
+      ...rendered,
+      mode: this.mode,
       readOnly: !this.editState.editable,
       editState: this.editState,
     });
@@ -3429,26 +3655,284 @@ class MarkdownView {
     if (!rendered) return;
     this.session.post({
       type: 'markdownUpdate',
-      html: rendered.html,
-      toc: rendered.toc,
-      source: rendered.source,
-      version: rendered.version,
+      ...rendered,
       readOnly: !this.editState.editable,
       editState: this.editState,
     });
   }
 
   private onDocumentChanged(): void {
-    if (this.selfEditVersion !== undefined && this.document.version === this.selfEditVersion) {
-      // Our own toggle: the checkbox is already in its new state; send the new version right away so a quick second
-      // toggle is not rejected as stale.
-      this.selfEditVersion = undefined;
-      this.rerender.cancel();
-      this.pushUpdate();
+    const own = this.own;
+    if (own !== undefined && this.document.getText() === own.text) {
+      if (own.kind === 'toggle') {
+        // Our own toggle: the checkbox is already in its new state; send the new version right away so a quick second
+        // toggle is not rejected as stale.
+        this.own = undefined;
+        this.rerender.cancel();
+        this.pushUpdate();
+      }
+      // A WYSIWYG edit: applyMdEdit answers the edit first, then sends the update.
       return;
     }
     this.rerender.schedule();
   }
+
+  /** A change that leaves the document clean was not typed in an editor (reload from disk, Revert): check the save again. */
+  private onCleanChange(): void {
+    if (!this.document.isDirty) scheduleMdFidelityRecheck(this.document, this.docState);
+  }
+
+  // ----- toolbar mode, Split -----
+
+  private async onSetMode(msg: MessageOf<'setMode'>): Promise<void> {
+    // The settings and the read-only state are read again now: a mode that is off must not be shown.
+    await this.refreshEditState(false);
+    this.mode = msg.mode;
+    // Always answered with the current rendering (the mode may fall back to Preview: the update says why).
+    this.rerender.cancel();
+    this.pushUpdate();
+    if (this.mode === 'split') void this.openSourceBeside();
+  }
+
+  /** Split: shows the Markdown source in a text editor beside the preview (an editor that is already visible is reused). */
+  async openSourceBeside(): Promise<void> {
+    try {
+      if (vscode.window.visibleTextEditors.some((editor) => editor.document === this.document)) return;
+      await vscode.window.showTextDocument(this.document, {
+        viewColumn: vscode.ViewColumn.Beside,
+        preserveFocus: true,
+        preview: false,
+      });
+    } catch (err) {
+      logError(`[markdown] Could not open the source of ${this.session.fileName} beside the preview`, err);
+    }
+  }
+
+  /** Editor -> preview: the first visible line of a text editor of this document. */
+  private onEditorScrolled(e: vscode.TextEditorVisibleRangesChangeEvent): void {
+    if (e.textEditor.document !== this.document) return;
+    if (Date.now() - this.lastReveal < MD_REVEAL_ECHO_MS) return; // the echo of our own revealRange
+    this.lastUserEditor = e.textEditor;
+    const line = e.visibleRanges[0]?.start.line;
+    if (this.mode !== 'split' || line === undefined || !this.session.isReady || this.session.shown !== 'content') return;
+    this.session.post({ type: 'revealLine', line });
+  }
+
+  /** Preview -> editor: the preview's first visible source line. */
+  private onPreviewScrolled(msg: MessageOf<'previewScrolled'>): void {
+    if (this.mode !== 'split') return;
+    const editors = vscode.window.visibleTextEditors.filter((editor) => editor.document === this.document);
+    const editor = this.lastUserEditor && editors.includes(this.lastUserEditor) ? this.lastUserEditor : editors[0];
+    if (!editor) return;
+    const line = Math.max(0, Math.min(Math.floor(msg.line), this.document.lineCount - 1));
+    this.lastReveal = Date.now();
+    editor.revealRange(new vscode.Range(line, 0, line, 0), vscode.TextEditorRevealType.AtTop);
+  }
+
+  // ----- WYSIWYG edits -----
+
+  private onEdit(msg: MessageOf<'edit'>): Promise<void> {
+    // In the document's queue: edits, task toggles, undo / redo / save of all panels run one at a time (contract §3.1).
+    const job = this.gate.doc.queue.run(() => this.applyMdEdit(msg));
+    this.editJobs.add(job);
+    const forget = (): void => {
+      this.editJobs.delete(job);
+    };
+    job.then(forget, forget);
+    return job;
+  }
+
+  /** Answers a rejected edit; the webview rolls back and (for the reasons that need it) reloads from the source. */
+  private rejectMdEdit(msg: MessageOf<'edit'>, code: EditRejectCode, reason: string, refresh: boolean): void {
+    getLog().info(`[markdown] Edit ${msg.editId} of ${this.session.fileName} refused (${code}): ${reason}`);
+    this.session.rejectEdit(msg.editId, code, reason);
+    if (refresh) {
+      this.rerender.cancel();
+      this.pushUpdate();
+    }
+  }
+
+  /**
+   * Applies one WYSIWYG edit (contract §9.3) and always answers it with exactly one editResult: gate (kill switch,
+   * read-only, fidelity), then synchronously version -> oldText -> line breaks -> verify -> one WorkspaceEdit.
+   */
+  private async applyMdEdit(msg: MessageOf<'edit'>): Promise<void> {
+    const document = this.document;
+    if (msg.intent.kind !== 'mdText') {
+      this.rejectMdEdit(msg, 'invalid', EDIT_TEXT.invalid, false);
+      return;
+    }
+    const edits = msg.intent.edits;
+    const state = this.docState;
+    // A re-check after a reload from disk is running: the edit is judged against its verdict (D-072).
+    while (state.recheck) await state.recheck.done;
+    const gate = await checkEditable('markdown', document.uri, { fidelity: state.fidelity }, document);
+    if (!gate.ok) {
+      this.rejectMdEdit(msg, gate.code, gate.reason, gate.code === 'fidelity' || gate.code === 'blocked');
+      return;
+    }
+    // No await from here to the applyEdit call (contract §3.2 step 4): the version check must hold when the edit is made.
+    if (msg.baseVersion !== document.version) {
+      this.rejectMdEdit(msg, 'stale', EDIT_TEXT.stale, true);
+      return;
+    }
+    const text = document.getText();
+    if (text.length > MD_WYSIWYG_MAX_CHARS || !this.limits.wysiwyg) {
+      this.rejectMdEdit(msg, 'blocked', MD_TOO_LARGE, true);
+      return;
+    }
+    for (const edit of edits) {
+      if (edit.start < 0 || edit.end < edit.start || edit.end > text.length || text.slice(edit.start, edit.end) !== edit.oldText) {
+        this.rejectMdEdit(msg, 'invalid', EDIT_TEXT.invalid, true);
+        return;
+      }
+    }
+    // VS Code stores the document's line break; the editor works with "\n" (or what it read): normalise the new text.
+    const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+    const fixed = edits.map((edit) => ({ ...edit, text: edit.text.replace(/\r\n|\r|\n/g, eol) }));
+    let newText: string;
+    try {
+      newText = applyMdTextEdits(text, fixed);
+    } catch (err) {
+      getLog().info(`[markdown] Edit ${msg.editId} of ${this.session.fileName}: ${errorMessageOf(err)}`);
+      this.rejectMdEdit(msg, 'invalid', EDIT_TEXT.invalid, true);
+      return;
+    }
+    const verdict = verifyMdEdit(text, fixed, newText);
+    if (!verdict.ok) {
+      getLog().warn(
+        `[markdown] Edit ${msg.editId} of ${this.session.fileName} would change other parts of the file (` +
+          verdict.bad.slice(0, 5).map((b) => `${b.kind} at line ${b.line + 1}`).join(', ') +
+          '): refused',
+      );
+      this.rejectMdEdit(msg, 'blocked', MD_OTHER_PARTS, true);
+      return;
+    }
+    const workspaceEdit = new vscode.WorkspaceEdit();
+    for (const edit of fixed) {
+      workspaceEdit.replace(document.uri, new vscode.Range(document.positionAt(edit.start), document.positionAt(edit.end)), edit.text);
+    }
+    this.own = { text: newText, kind: 'md' };
+    let applied = false;
+    try {
+      applied = await vscode.workspace.applyEdit(workspaceEdit);
+    } catch (err) {
+      logError(`[markdown] Could not apply edit ${msg.editId} to ${this.session.fileName}`, err);
+    }
+    this.own = undefined;
+    if (!applied) {
+      this.rejectMdEdit(msg, 'failed', EDIT_TEXT.failed, true);
+      return;
+    }
+    if (document.getText() !== newText) {
+      getLog().warn(`[markdown] Edit ${msg.editId} of ${this.session.fileName}: the document text is not the expected result`);
+    }
+    this.session.post({ type: 'editResult', editId: msg.editId, accepted: true, version: document.version });
+    // The rendering of a large document takes a while on this thread: first let what is waiting (keystrokes, other
+    // extensions) have its turn, so the check of the edit and the rendering are two short pauses, not one long one. The
+    // rendering is made from the document as it is then (a change in between is shown by it, nothing is lost).
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    this.rerender.cancel();
+    this.pushUpdate();
+    if (msg.then === 'save') {
+      try {
+        await document.save();
+      } catch (err) {
+        logError(`[markdown] Could not save ${this.session.fileName} after the edit`, err);
+      }
+    }
+  }
+
+  /** "Edit anyway" for a file VS Code would not save byte for byte: the host asks itself; the message is never consent. */
+  private async onEditAnyway(): Promise<void> {
+    const state = this.docState;
+    const before = state.fidelity;
+    if (before.pending || before.ok || before.accepted || before.blocked !== undefined || !before.canEditAnyway) {
+      getLog().info(`[markdown] "Edit anyway" for ${this.session.fileName} ignored: nothing to accept`);
+      await this.gate.doc.refresh();
+      return;
+    }
+    const answer = await ask(
+      'fidelity',
+      before.canEditAnyway.title,
+      { modal: true, detail: `${before.canEditAnyway.details.join('\n')}\n\nDo you want to edit this file in WYSIWYG anyway?` },
+      'Edit anyway',
+    );
+    if (answer !== 'Edit anyway' || state.fidelity !== before) return; // not accepted, or the verdict changed meanwhile
+    state.fidelity = { ...before, accepted: true };
+    getLog().info(`[markdown] "Edit anyway" accepted for ${this.session.fileName} (this session)`);
+    await this.gate.doc.refresh();
+  }
+
+  // ----- keys (undo / redo / save) and flush -----
+
+  private onCommand(msg: MessageOf<'command'>): Promise<void> {
+    // Behind every edit already queued: never dropped, never reordered (contract §9.5).
+    return this.gate.doc.queue.run(() => this.runCommand(msg.id));
+  }
+
+  /** True when the tab the user is looking at is this custom editor (VS Code's undo / save act on the active editor). */
+  private isActiveTab(): boolean {
+    const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+    return (
+      input instanceof vscode.TabInputCustom &&
+      isSameFile(input.uri, this.document.uri) &&
+      (input.viewType === VIEW_TYPES.markdown || input.viewType === VIEW_TYPES.csv)
+    );
+  }
+
+  private async runCommand(id: 'undo' | 'redo' | 'save'): Promise<void> {
+    if (!this.isActiveTab()) {
+      getLog().info(`[markdown] '${id}' for ${this.session.fileName} not run: this editor is not the active tab`);
+      vscode.window.setStatusBarMessage(`FileStudio: ${id} was not run because this editor is not the active tab.`, 5000);
+      return;
+    }
+    try {
+      if (id === 'save') await this.document.save();
+      else await vscode.commands.executeCommand(id);
+    } catch (err) {
+      logError(`[markdown] '${id}' failed for ${this.session.fileName}`, err);
+    }
+  }
+
+  /** Save All / auto save: the WYSIWYG editor sends its pending typing first (contract §9.3). */
+  private onWillSave(e: vscode.TextDocumentWillSaveEvent): void {
+    if (e.document !== this.document || this.mode !== 'wysiwyg' || !this.session.isReady || this.session.shown !== 'content') return;
+    e.waitUntil(this.flush());
+  }
+
+  /** Asks the webview to send its pending typing; resolves (with nothing to add) after its `flushed` or the time limit. */
+  private flush(): Promise<vscode.TextEdit[]> {
+    const id = ++this.flushId;
+    return new Promise<vscode.TextEdit[]>((resolve) => {
+      const timer = setTimeout(() => {
+        this.flushes.delete(id);
+        getLog().warn(`[markdown] ${this.session.fileName}: the editor did not answer the flush request in time`);
+        vscode.window.setStatusBarMessage(MD_NOT_SAVED_YET, 6000);
+        resolve([]);
+      }, MD_FLUSH_TIMEOUT_MS);
+      this.flushes.set(id, () => {
+        clearTimeout(timer);
+        resolve([]);
+      });
+      this.session.post({ type: 'flushRequest', id });
+    });
+  }
+
+  /** `flushed` comes after the flush's edit message: it is answered when that edit (and every earlier one) is done. */
+  private onFlushed(msg: MessageOf<'flushed'>): Promise<void> | void {
+    const done = this.flushes.get(msg.id);
+    if (!done) return;
+    this.flushes.delete(msg.id);
+    return Promise.allSettled([...this.editJobs]).then(done);
+  }
+
+  private endFlushes(): void {
+    for (const done of [...this.flushes.values()]) done();
+    this.flushes.clear();
+  }
+
+  // ----- task toggles -----
 
   /**
    * Applies a task toggle and always answers with toggleTaskResult. Only a checkbox the renderer produced for the
@@ -3492,8 +3976,11 @@ class MarkdownView {
       return;
     }
     const edit = new vscode.WorkspaceEdit();
-    edit.replace(document.uri, new vscode.Range(msg.line, task.column, msg.line, task.column + 1), msg.checked ? 'x' : ' ');
-    this.selfEditVersion = document.version + 1;
+    const mark = msg.checked ? 'x' : ' ';
+    edit.replace(document.uri, new vscode.Range(msg.line, task.column, msg.line, task.column + 1), mark);
+    const whole = document.getText();
+    const at = document.offsetAt(new vscode.Position(msg.line, task.column));
+    this.own = { text: whole.slice(0, at) + mark + whole.slice(at + 1), kind: 'toggle' };
     let applied = false;
     try {
       applied = await vscode.workspace.applyEdit(edit);
@@ -3501,11 +3988,12 @@ class MarkdownView {
       logError(`[markdown] Could not toggle the task on ${where}`, err);
     }
     if (!applied) {
-      this.selfEditVersion = undefined;
+      this.own = undefined;
       getLog().warn(`[markdown] Task toggle on ${where} was not applied`);
       this.answerToggle(msg, false, 'the edit could not be applied');
       return;
     }
+    this.own = undefined;
     this.answerToggle(msg, true); // the new rendering went out with the document change (onDocumentChanged)
   }
 
@@ -3519,6 +4007,24 @@ class MarkdownView {
       ...(reason === undefined ? {} : { reason }),
     });
   }
+}
+
+/** The fields of a Markdown init / markdownUpdate that come from the document text (see MarkdownView.render). */
+interface MdPayload {
+  html: string;
+  toc: TocEntry[];
+  source: string;
+  version: number;
+  blocks?: MdBlock[];
+  eol: '\n' | '\r\n';
+  limits: { wysiwyg: boolean; reason?: string };
+  resourceBase?: string;
+}
+
+/** Webview URI of the document's folder (with a final "/"): WYSIWYG shows relative images from there (display only). */
+function resourceBaseOf(uri: vscode.Uri, webview: vscode.Webview): string {
+  const folder = webview.asWebviewUri(vscode.Uri.joinPath(uri.with({ query: '', fragment: '' }), '..')).toString();
+  return folder.endsWith('/') ? folder : `${folder}/`;
 }
 
 // ===== DOCX =====

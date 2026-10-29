@@ -1435,6 +1435,334 @@ function getMarkdownIt(): MarkdownItInstance {
   return sharedMarkdownIt;
 }
 
+// ===== EDIT BLOCKS =====
+// Markdown WYSIWYG editing (0.2.0) works on top-level blocks of the exact document text. The host sends the blocks to
+// the webview; the webview sends back `MdTextEdit`s (UTF-16 offsets of TextDocument.getText(), each with the text it
+// replaces); the host applies them only when every block the edits do not touch keeps its exact text and kind
+// (verifyMdEdit). Untouched bytes are never re-serialized.
+
+
+/** Block kinds the WYSIWYG editor never parses or re-serializes: they are edited as raw Markdown text. */
+const MD_FIXED_KINDS: Record<string, string> = {
+  front_matter: 'front matter',
+  html_block: 'HTML block',
+  footnote: 'footnote definition',
+  math_block: 'math block',
+  alert: 'GitHub alert',
+  gap: 'text the preview does not show (for example link reference definitions)',
+  code_block: 'indented code block',
+  overlap: 'overlapping blocks',
+};
+
+/** Kind of a top-level token: its type without `_open` (`paragraph`, `heading`, `bullet_list`, `fence`, …) or `alert`. */
+function mdBlockKind(t: Token): string {
+  if (t.type === 'blockquote_open' && (t.meta as { alert?: string } | null)?.alert) return 'alert';
+  return t.type.replace(/_open$/, '');
+}
+
+/** Offsets of the first character of every line of `src`: `\r\n`, `\n` and a lone `\r` each end a line (like VS Code). */
+function mdLineStarts(src: string): number[] {
+  const starts = [0];
+  for (let i = 0; i < src.length; i++) {
+    const c = src.charCodeAt(i);
+    if (c === 13 && src.charCodeAt(i + 1) === 10) {
+      starts.push(i + 2);
+      i++;
+    } else if (c === 10 || c === 13) {
+      starts.push(i + 1);
+    }
+  }
+  return starts;
+}
+
+/** HTML of a block without the attributes that depend on its position (source lines, heading/footnote ids). */
+function mdStripPositions(html: string): string {
+  return html.replace(/ data-(?:source-)?line="\d+"/g, '').replace(/ id="[^"]*"/g, '').trim();
+}
+
+// ----- parse cache -----
+
+/** A top-level token range (lines [a, b)) of a parse: the tokens `open`..`close` of the block that starts at line `a`. */
+interface MdRawRange {
+  a: number;
+  b: number;
+  kind: string;
+  open: number;
+  close: number;
+}
+
+/** What one parse of a text gives: the blocks before the context check, and what the context check needs. */
+interface MdParsed {
+  text: string;
+  blocks: MdBlock[];
+  tokens: Token[];
+  env: RenderEnv;
+  firstLine: Map<number, MdRawRange>;
+}
+
+// The host asks for the blocks of the same text several times per WYSIWYG edit (verifyMdEdit: the old and the new text;
+// then the rendering with the context check; then the headings), and a large document takes 60-110 ms per parse on the
+// extension host thread. The last parses are kept, so a text is parsed once. Only the pure result of a text is kept
+// (nothing depends on the caller), every caller gets copies, and the entries go after a pause or when they are many.
+const MD_PARSE_CACHE_ENTRIES = 2;
+const MD_PARSE_CACHE_MAX_CHARS = 400_000;
+const MD_PARSE_CACHE_IDLE_MS = 30_000;
+const mdParseCache: MdParsed[] = []; // most recently used first
+let mdParseCacheTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** Restarts the pause after which the kept parses are dropped (a timer that never keeps the process alive). */
+function mdParseCacheTouch(): void {
+  if (mdParseCacheTimer !== undefined) clearTimeout(mdParseCacheTimer);
+  mdParseCacheTimer = setTimeout(() => {
+    mdParseCache.length = 0;
+    mdParseCacheTimer = undefined;
+  }, MD_PARSE_CACHE_IDLE_MS);
+  (mdParseCacheTimer as { unref?: () => void }).unref?.();
+}
+
+function mdParseCacheFind(text: string): MdParsed | undefined {
+  const i = mdParseCache.findIndex((entry) => entry.text === text);
+  if (i < 0) return undefined;
+  const [hit] = mdParseCache.splice(i, 1);
+  mdParseCache.unshift(hit);
+  mdParseCacheTouch();
+  return hit;
+}
+
+function mdParseCacheStore(parsed: MdParsed): void {
+  if (parsed.text.length > MD_PARSE_CACHE_MAX_CHARS) return;
+  mdParseCache.unshift(parsed);
+  mdParseCache.length = Math.min(mdParseCache.length, MD_PARSE_CACHE_ENTRIES);
+  mdParseCacheTouch();
+}
+
+/** Parses `text` into blocks (see markdownBlocks), or takes the parse kept from an earlier call. Throws only if markdown-it does. */
+function mdParse(text: string): MdParsed {
+  const kept = mdParseCacheFind(text);
+  if (kept) return kept;
+  const bom = text.charCodeAt(0) === 0xfeff ? 1 : 0;
+  const src = bom ? text.slice(1) : text;
+  const env: RenderEnv = { slugs: new Map<string, number>(), toc: [], tasks: [] };
+  const md = getMarkdownIt();
+  const tokens = md.parse(src, env);
+  const starts = mdLineStarts(src);
+  const lineCount = starts.length;
+  /** Offset just after the last character of line `l` (before its line break). */
+  const lineEnd = (l: number): number => {
+    if (l + 1 >= lineCount) return src.length;
+    let e = starts[l + 1];
+    if (src.charCodeAt(e - 1) === 10) e--;
+    if (src.charCodeAt(e - 1) === 13) e--;
+    return e;
+  };
+  const blank = (l: number): boolean => /^[ \t]*$/.test(src.slice(starts[l], lineEnd(l)));
+
+  // ----- top-level token ranges (lines [a, b)) -----
+  const raw: MdRawRange[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t.level !== 0 || t.nesting === -1) continue;
+    let close = i;
+    if (t.nesting === 1) {
+      for (let j = i, depth = 0; j < tokens.length; j++) {
+        depth += tokens[j].nesting;
+        if (depth === 0) {
+          close = j;
+          break;
+        }
+      }
+    }
+    if (t.type === 'footnote_block_open') {
+      // Built after parsing (markdown-it-footnote moves every referenced definition here, without maps): a definition
+      // spans the lines of its own mapped tokens.
+      for (let j = i + 1; j < close; j++) {
+        if (tokens[j].type !== 'footnote_open') continue;
+        let a = Infinity;
+        let b = -Infinity;
+        for (let k = j + 1; k < close && tokens[k].type !== 'footnote_close'; k++) {
+          const map = tokens[k].map;
+          if (map) {
+            a = Math.min(a, map[0]);
+            b = Math.max(b, map[1]);
+          }
+        }
+        if (a < b) raw.push({ a, b, kind: 'footnote', open: j, close: j });
+      }
+    } else if (t.map) {
+      raw.push({ a: t.map[0], b: t.map[1], kind: mdBlockKind(t), open: i, close });
+    }
+    i = close;
+  }
+  raw.sort((x, y) => x.a - y.a || x.b - y.b);
+  // Overlapping ranges (a footnote definition inside a list or quote) become one fixed block.
+  const merged: typeof raw = [];
+  for (const r of raw) {
+    const last = merged[merged.length - 1];
+    if (last && r.a < last.b) {
+      last.b = Math.max(last.b, r.b);
+      last.kind = 'overlap';
+      continue;
+    }
+    merged.push({ ...r });
+  }
+
+  // ----- blocks and gaps -----
+  const out: MdBlock[] = [];
+  const firstLine = new Map<number, MdRawRange>();
+  const push = (a: number, b: number, kind: string, r?: MdRawRange): void => {
+    while (b - 1 > a && blank(b - 1)) b--; // trailing blank lines belong to no block
+    while (a < b - 1 && blank(a)) a++;
+    if (b <= a || (b - a === 1 && blank(a))) return;
+    const reason = MD_FIXED_KINDS[kind];
+    const block: MdBlock = { start: starts[a] + bom, end: lineEnd(b - 1) + bom, line: a, endLine: b - 1, kind, fixed: reason !== undefined };
+    if (reason !== undefined) block.reason = reason;
+    out.push(block);
+    if (r && kind !== 'overlap') firstLine.set(a, r);
+  };
+  const hasText = (from: number, to: number): boolean => {
+    for (let l = from; l < to; l++) if (!blank(l)) return true;
+    return false;
+  };
+  let prevEnd = 0;
+  for (const r of merged) {
+    const b = Math.min(r.b, lineCount);
+    if (hasText(prevEnd, r.a)) push(prevEnd, r.a, 'gap');
+    push(r.a, b, r.kind, r);
+    prevEnd = Math.max(prevEnd, b);
+  }
+  if (hasText(prevEnd, lineCount)) push(prevEnd, lineCount, 'gap');
+  const parsed: MdParsed = { text, blocks: out, tokens, env, firstLine };
+  mdParseCacheStore(parsed);
+  return parsed;
+}
+
+/**
+ * The top-level blocks of a Markdown text, in order, from markdown-it's token maps on the exact text (`\r\n`, `\n`
+ * and lone `\r` line breaks; a leading BOM is skipped but counted in the offsets). Blank lines belong to no block;
+ * other text between blocks (link reference definitions, unreferenced footnotes …) becomes a `gap` block. Footnote
+ * definitions are blocks of their own. `fixed` blocks (MD_FIXED_KINDS) are edited as raw text only.
+ * `contextCheck`: a block that renders differently alone than inside the document (reference links, footnote
+ * references …) is fixed too. Throws only if markdown-it does. The blocks returned are the caller's (copies).
+ */
+export function markdownBlocks(source: string, opts?: { contextCheck?: boolean }): MdBlock[] {
+  const text = typeof source === 'string' ? source : String(source ?? '');
+  const { blocks, tokens, env, firstLine } = mdParse(text);
+  const out = blocks.map((block) => ({ ...block }));
+
+  // ----- context check -----
+  if (opts?.contextCheck) {
+    const md = getMarkdownIt();
+    for (const block of out) {
+      const r = firstLine.get(block.line);
+      if (block.fixed || !r || block.kind === 'fence' || block.kind === 'hr') continue; // fences and rules never depend on context
+      const alone = md.render(text.slice(block.start, block.end), { slugs: new Map<string, number>(), toc: [], tasks: [] } as RenderEnv);
+      const inContext = md.renderer.render(tokens.slice(r.open, r.close + 1), md.options, env);
+      if (mdStripPositions(alone) !== mdStripPositions(inContext)) {
+        block.fixed = true;
+        block.reason = 'depends on other parts of the document';
+      }
+    }
+  }
+  return out;
+}
+
+const isHighSurrogate = (c: number): boolean => c >= 0xd800 && c <= 0xdbff;
+const isLowSurrogate = (c: number): boolean => c >= 0xdc00 && c <= 0xdfff;
+
+/** True if `text` has a high surrogate without a low one after it, or a low one without a high one before it. */
+function hasLoneSurrogate(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (isHighSurrogate(c)) {
+      if (!isLowSurrogate(text.charCodeAt(i + 1))) return true;
+      i++;
+    } else if (isLowSurrogate(c)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Applies `edits` to `text` and returns the new text. Throws (and changes nothing) when an edit is malformed, its
+ * `oldText` is not the text at [start, end), two edits overlap or start at the same offset, an edit boundary would
+ * split (or the new text would create) a `\r\n` pair or a UTF-16 surrogate pair, or the new text has a lone surrogate.
+ */
+export function applyMdTextEdits(text: string, edits: MdTextEdit[]): string {
+  if (!Array.isArray(edits)) throw new Error('Invalid Markdown edit.');
+  for (const e of edits) {
+    const ok =
+      typeof e === 'object' && e !== null && Number.isInteger(e.start) && Number.isInteger(e.end) &&
+      typeof e.oldText === 'string' && typeof e.text === 'string' && e.start >= 0 && e.start <= e.end && e.end <= text.length;
+    if (!ok) throw new Error('Invalid Markdown edit.');
+  }
+  const sorted = [...edits].sort((x, y) => x.start - y.start || x.end - y.end);
+  const parts: string[] = [];
+  let pos = 0;
+  let prev: MdTextEdit | undefined;
+  for (const e of sorted) {
+    if (prev && (e.start < prev.end || e.start === prev.start)) throw new Error(`Overlapping Markdown edits at offset ${e.start}.`);
+    if (text.slice(e.start, e.end) !== e.oldText) throw new Error(`The text at offset ${e.start} is not the text the edit expects.`);
+    // the characters on both sides of each boundary, before and after the edit
+    const before = text.charCodeAt(e.start - 1);
+    const after = text.charCodeAt(e.end);
+    const first = e.text.length ? e.text.charCodeAt(0) : after;
+    const last = e.text.length ? e.text.charCodeAt(e.text.length - 1) : before;
+    const splitsPair = (isPair: (a: number, b: number) => boolean): boolean =>
+      isPair(before, text.charCodeAt(e.start)) || isPair(text.charCodeAt(e.end - 1), after);
+    const crlf = (a: number, b: number): boolean => a === 13 && b === 10;
+    if (splitsPair(crlf) || crlf(before, first) || crlf(last, after)) {
+      throw new Error(`A Markdown edit at offset ${e.start} would split or join a line break.`);
+    }
+    if (splitsPair((a, b) => isHighSurrogate(a) && isLowSurrogate(b)) || hasLoneSurrogate(e.text)) {
+      throw new Error(`A Markdown edit at offset ${e.start} would split a character.`);
+    }
+    parts.push(text.slice(pos, e.start), e.text);
+    pos = e.end;
+    prev = e;
+  }
+  parts.push(text.slice(pos));
+  return parts.join('');
+}
+
+/**
+ * Host check for a WYSIWYG edit: `newText` must be `oldText` with `edits` applied, a leading BOM must stay as it was,
+ * and every block of `oldText` that no edit touches (an edit touches a block when it overlaps it or meets one of
+ * its ends) must still be a block of the same kind with the same text at its shifted offset. `bad` lists the old
+ * blocks that changed (line = their 0-based first line in `oldText`; line -1 = the edits themselves are wrong).
+ */
+export function verifyMdEdit(oldText: string, edits: MdTextEdit[], newText: string): { ok: boolean; bad: { line: number; kind: string }[] } {
+  let before: MdBlock[];
+  let after: MdBlock[];
+  try {
+    if (applyMdTextEdits(oldText, edits) !== newText) return { ok: false, bad: [{ line: -1, kind: 'edits' }] };
+    before = markdownBlocks(oldText);
+    after = markdownBlocks(newText);
+  } catch {
+    return { ok: false, bad: [{ line: -1, kind: 'edits' }] };
+  }
+  const bad: { line: number; kind: string }[] = [];
+  if ((oldText.charCodeAt(0) === 0xfeff) !== (newText.charCodeAt(0) === 0xfeff)) bad.push({ line: 0, kind: 'bom' });
+  const sorted = [...edits].sort((x, y) => x.start - y.start);
+  const byStart = new Map(after.map((b) => [b.start, b]));
+  let k = 0;
+  let delta = 0;
+  for (const b of before) {
+    // edits that end before this block shift it; one that reaches it touches it
+    while (k < sorted.length && sorted[k].end < b.start) {
+      delta += sorted[k].text.length - (sorted[k].end - sorted[k].start);
+      k++;
+    }
+    const touched = k < sorted.length && sorted[k].start <= b.end;
+    if (touched) continue;
+    const n = byStart.get(b.start + delta);
+    if (!n || n.kind !== b.kind || n.end - n.start !== b.end - b.start || newText.slice(n.start, n.end) !== oldText.slice(b.start, b.end)) {
+      bad.push({ line: b.line, kind: b.kind });
+    }
+  }
+  return { ok: bad.length === 0, bad };
+}
+
 // ===== PUBLIC API =====
 
 /** Largest slice of the source echoed back in the error block. */
@@ -1480,6 +1808,10 @@ export function renderMarkdown(source: string, opts?: RenderOptions): RenderResu
  */
 export function markdownHeadings(source: string): TocEntry[] {
   const text = typeof source === 'string' ? source : String(source ?? '');
+  // The headings of a text whose blocks were just parsed (same pipeline, same env) need no second parse. Only looked up,
+  // never stored: the headings of other documents (links) must not push the open document out.
+  const kept = mdParseCacheFind(text);
+  if (kept) return kept.env.toc.map((entry) => ({ ...entry }));
   const env: RenderEnv = { slugs: new Map<string, number>(), toc: [], tasks: [] };
   try {
     getMarkdownIt().parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text, env);

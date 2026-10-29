@@ -14,6 +14,18 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - New settings to turn editing off: **FileStudio > Editing: Enabled** (all formats), and one for each of
   `.xlsx`, delimited text (`.csv` and similar) and Markdown. They are on by default.
 
+#### Markdown (`.md`, `.markdown`)
+
+- A toolbar with three modes: **Preview**, **Split** and **WYSIWYG**. The setting
+  **FileStudio > Markdown: Default Mode** chooses the mode a file opens in.
+- **Split** shows the text editor beside the preview. Scrolling in one follows the other.
+- **WYSIWYG** lets you edit the formatted document directly: headings, lists, tables, links, images and more.
+  Only the parts you change are written to the file. Line endings, spaces and everything you did not touch stay as they were.
+- Parts that cannot be edited safely in WYSIWYG (for example raw HTML, front matter and some special blocks) are
+  shown as protected blocks. A file that cannot be edited without risk opens read-only with a short reason.
+- Undo, Redo and Save work in every mode, also with **Save All**.
+- A table of contents panel shows the headings of the document. Click a heading to jump to it.
+
 ## [0.1.2] - 2026-10-11
 
 ### Fixed

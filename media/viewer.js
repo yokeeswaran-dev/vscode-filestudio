@@ -16,6 +16,28 @@
 
 // @ts-ignore -- side-effect CSS import: esbuild emits it as dist/viewer.css (KaTeX styles for the Markdown view).
 import 'katex/dist/katex.min.css';
+// (v0.2.0, P6) The WYSIWYG editor's styles (Milkdown Crepe theme, only the parts of the features used; every rule is scoped
+// to .milkdown). Static, like KaTeX: esbuild adds them to dist/viewer.css; the editor code itself loads lazily.
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/prosemirror.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/reset.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/block-edit.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/cursor.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/link-tooltip.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/list-item.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/placeholder.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/toolbar.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/table.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/frame.css';
 // @ts-ignore -- side-effect CSS import: esbuild adds the pdf.js viewer styles (page, text and annotation layers) to dist/viewer.css.
 import 'pdfjs-dist/web/pdf_viewer.css';
 import { describePdfFailure, missingPdfEngineFeatures, PDF_ENGINE_UNSUPPORTED } from '../src/renderers/pdf';
@@ -133,11 +155,13 @@ function dispatch(msg) {
       break;
     // ----- (v0.2.0) editing messages: declared by track F; the owning phase adds its call in its case -----
     case 'editResult':
-      /* P2 grid, P3 csv, P6 markdown */ break;
+      mdwOnEditResult(msg); // P6 (ignored unless the view is Markdown)
+      /* P2 grid, P3 csv */ break;
     case 'patch':
       /* P2 */ break;
     case 'editState':
-      /* P2 grid, P6 markdown */ break;
+      mdOnEditState(msg); // P6 (ignored unless the view is Markdown)
+      /* P2 grid */ break;
     case 'recalcState':
       /* P5 */ break;
     case 'findResult':
@@ -147,9 +171,11 @@ function dispatch(msg) {
     case 'columnTexts':
       /* P4 */ break;
     case 'revealLine':
-      /* P6 */ break;
+      mdSplitReveal(msg.line); // P6
+      break;
     case 'flushRequest':
-      /* P6 */ break;
+      mdwOnFlushRequest(msg.id); // P6
+      break;
   }
 }
 
@@ -6553,7 +6579,8 @@ function formatCount(n) {
 /**
  * @typedef {{ level: number, text: string, slug: string, line: number }} MdTocEntry
  * @typedef {{ type?: string, kind?: string, fileName?: string, html: string, toc?: MdTocEntry[], source?: string,
- *   mode?: string, version: number, readOnly?: boolean, editState?: { editable?: boolean, reason?: string } }} MdMessage  Fields shared by `init` (kind 'markdown') and
+ *   mode?: string, version: number, readOnly?: boolean, editState?: EditState, blocks?: MdSourceBlock[], eol?: string,
+ *   limits?: { wysiwyg: boolean, reason?: string }, resourceBase?: string }} MdMessage  Fields shared by `init` (kind 'markdown') and
  *   `markdownUpdate` (`readOnly`: the document cannot be edited, task checkboxes are disabled; an update without it
  *   keeps the current state).
  * @typedef {{ key: string, dark: boolean, variables: Record<string, string | boolean> }} MdMermaidTheme
@@ -6646,7 +6673,7 @@ const mdState = {
   /** Blocks of a large document not built yet (see MD_FIRST_PAINT_CHARS); null when the article is complete. */
   deferred: /** @type {MdDeferredBlocks | null} */ (null),
   fileName: '',
-  mode: 'preview',
+  mode: /** @type {MdMode} */ ('preview'),
   source: '',
   /** HTML of the latest requested render (identical updates skip the DOM work). */
   html: '',
@@ -6701,7 +6728,8 @@ let mdBlocks = [];
 function showMarkdown(msg) {
   try {
     mdResetTasks();
-    const mode = msg.mode || 'preview';
+    mdAcceptEditing(msg);
+    const mode = mdStartMode(msg.mode);
     const view = h('div', {
       class: 'md-view',
       tabindex: '-1', // focusable so keyboard scrolling works right away
@@ -6751,7 +6779,7 @@ function showMarkdown(msg) {
     view.append(article);
     mdState.article = article;
     mdBlocks = [...blocks, ...deferred];
-    root.replaceChildren(view);
+    root.replaceChildren(mdBuildFrame(view));
 
     mdHoldOnResize(view, article, mdState.scroll);
     mdRestoreScroll(view, article, saved);
@@ -6760,6 +6788,7 @@ function showMarkdown(msg) {
     if (deferred.length) mdStartDeferredBlocks(raws.slice(eager), deferred);
     keepScrollerFocus(view);
     view.focus({ preventScroll: true });
+    mdFrameStart(msg);
   } catch (err) {
     mdFail(err, 'Could not display the Markdown preview.', true);
   }
@@ -6767,6 +6796,7 @@ function showMarkdown(msg) {
 
 /** View disposal (new `init`, error page): stop async work and observers that belong to the old view. */
 function mdDispose() {
+  mdFrameDispose();
   mdState.generation++; // drops updates still waiting for diagrams
   mdCancelDeferredBlocks();
   mdState.view = null;
@@ -6799,6 +6829,7 @@ function updateMarkdown(msg) {
   try {
     const html = typeof msg.html === 'string' ? msg.html : '';
     mdAcceptMessage(msg);
+    if (mdFrameOnUpdate(msg)) return; // WYSIWYG / frame (P6)
     if (html === mdState.html) {
       // Same output (the change did not affect the rendering): only the document version moved on. A pending
       // update for this html stamps the latest version itself when it lands.
@@ -6820,7 +6851,8 @@ function updateMarkdown(msg) {
  * @param {MdMessage} msg
  */
 function mdAcceptMessage(msg) {
-  const why = msg.editState && typeof msg.editState === 'object' ? msg.editState.reason : undefined;
+  mdAcceptEditing(msg);
+  const why = msg.editState && typeof msg.editState === 'object' && msg.editState.editable === false ? msg.editState.reason : undefined;
   if (typeof why === 'string' || msg.type === 'init' || typeof msg.readOnly === 'boolean') mdState.readOnlyReason = typeof why === 'string' && why ? why : '';
   if (msg.type === 'init') mdState.readOnly = msg.readOnly === true;
   else if (typeof msg.readOnly === 'boolean') mdState.readOnly = msg.readOnly;
@@ -8709,6 +8741,2058 @@ function mdPreventDefault(event) {
 function mdFail(err, message, canReopenAsText) {
   logError(message, err);
   showError({ message, detail: errorDetail(err), canReopenAsText });
+}
+
+// ----- MARKDOWN: FRAME & TOOLBAR -----
+// (v0.2.0, P6; contract §9.1) The preview sits in `div.md-app`: a toolbar (TOC toggle, the radiogroup Preview | Split |
+// WYSIWYG, a status text and "Edit anyway") over `div.md-body` = [`nav.md-toc` | `.md-view` | `.md-wysiwyg`]. `.md-view`
+// stays the scroller of the preview. The mode is per panel: the host's `defaultMode` is only the start; the toolbar
+// choice is kept in the webview state (`markdownMode`) and reported to the host with `setMode` (the host opens the
+// source beside the preview for Split and sends blocks, not html, for WYSIWYG). A mode that cannot be used (kill switch,
+// read-only file, too large, wrong encoding) stays focusable with `aria-disabled` and says why.
+
+/** @typedef {'preview' | 'split' | 'wysiwyg'} MdMode */
+/**
+ * @typedef {object} MdFrame
+ * @property {HTMLElement} app
+ * @property {HTMLElement} body
+ * @property {HTMLElement} toc  `nav.md-toc`
+ * @property {HTMLButtonElement} tocBtn
+ * @property {Record<MdMode, HTMLButtonElement>} radios
+ * @property {HTMLElement} status  polite live region of the toolbar
+ * @property {HTMLButtonElement} anyway  "Edit anyway" (hidden unless the host offers it)
+ * @property {HTMLElement} wysiwyg  `.md-wysiwyg`: the editor's holder (hidden unless the mode is WYSIWYG)
+ */
+/**
+ * @typedef {object} MdAvailability  whether the WYSIWYG editor may be shown, and may be typed in
+ * @property {'ok' | 'readonly' | 'disabled'} state  ok: editable; readonly: shown but not editable (save check open); disabled: not offered
+ * @property {string} reason
+ */
+
+const MD_STATE_MODE_KEY = 'markdownMode';
+const MD_MODES = /** @type {MdMode[]} */ (['preview', 'split', 'wysiwyg']);
+const MD_MODE_LABELS = { preview: 'Preview', split: 'Split', wysiwyg: 'WYSIWYG' };
+/** A message in the status line (an edit that was refused, a mode that is off) stays this long, then the base text returns. */
+const MD_STATUS_MS = 6000;
+const MD_FRAME_ICONS = {
+  toc: '<svg viewBox="0 0 16 16" width="16" height="16"><path d="M2.5 4h1M2.5 8h1M2.5 12h1M6 4h7.5M6 8h7.5M6 12h7.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
+};
+
+/** What the webview knows besides the preview: edit state, limits, line break, blocks (only while the host is in WYSIWYG). */
+const mdx = {
+  /** @type {EditState | null} */
+  editState: null,
+  /** @type {{ wysiwyg: boolean, reason?: string } | null} */
+  limits: null,
+  eol: /** @type {'\n' | '\r\n'} */ ('\n'),
+  /** @type {MdSourceBlock[] | null} */
+  blocks: null,
+  resourceBase: '',
+  /** A message for the status line and when it goes away. */
+  flash: '',
+  flashTimer: 0,
+};
+
+/** @type {MdFrame | null} */
+let mdFrame = null;
+
+/**
+ * The fields of an init / markdownUpdate that belong to editing (read by mdAcceptMessage).
+ * @param {MdMessage} msg
+ */
+function mdAcceptEditing(msg) {
+  if (msg.editState && typeof msg.editState === 'object') mdx.editState = msg.editState;
+  if (msg.limits && typeof msg.limits === 'object') mdx.limits = msg.limits;
+  if (msg.eol === '\n' || msg.eol === '\r\n') mdx.eol = msg.eol;
+  mdx.blocks = Array.isArray(msg.blocks) ? msg.blocks : null;
+  if (typeof msg.resourceBase === 'string') mdx.resourceBase = msg.resourceBase;
+}
+
+/** The mode this panel starts in: the toolbar choice of an earlier view of this webview, else the host's default. */
+function mdStartMode(/** @type {string | undefined} */ hostMode) {
+  const stored = /** @type {unknown} */ (getStateKey(MD_STATE_MODE_KEY));
+  const wanted = MD_MODES.find((m) => m === stored) ?? MD_MODES.find((m) => m === hostMode) ?? 'preview';
+  return wanted === 'wysiwyg' && mdWysiwygAvailability().state === 'disabled' ? /** @type {MdMode} */ ('preview') : wanted;
+}
+
+/**
+ * Whether WYSIWYG can be used now, from the host's edit state and size limits (contract §9.5).
+ * @returns {MdAvailability}
+ */
+function mdWysiwygAvailability() {
+  const limits = mdx.limits;
+  if (limits && !limits.wysiwyg) return { state: 'disabled', reason: limits.reason || 'This file is too large for WYSIWYG editing. Use Split to edit the Markdown source.' };
+  const es = mdx.editState;
+  if (!es) return { state: 'disabled', reason: 'WYSIWYG is not available in this version.' };
+  if (!es.editable) return { state: 'disabled', reason: es.reason || 'Editing is not available for this file.' };
+  if (Array.isArray(es.kinds) && es.kinds.includes('mdText')) return { state: 'ok', reason: '' };
+  if (es.code === 'fidelity') return { state: 'readonly', reason: es.reason || 'Saving in VS Code would change parts of this file you did not edit.' };
+  return { state: 'disabled', reason: es.reason || 'WYSIWYG editing is not available for this file.' };
+}
+
+/**
+ * The toolbar and the body around the preview. Called by showMarkdown with the finished `.md-view`.
+ * @param {HTMLElement} view
+ * @returns {HTMLElement} `.md-app`
+ */
+function mdBuildFrame(view) {
+  /** @type {Record<string, HTMLButtonElement>} */
+  const radios = {};
+  const group = h('div', { class: 'md-modes', role: 'radiogroup', 'aria-label': 'Markdown view' });
+  for (const mode of MD_MODES) {
+    const button = /** @type {HTMLButtonElement} */ (
+      h('button', { class: 'md-mode-btn', type: 'button', role: 'radio', 'aria-checked': 'false', tabindex: '-1', dataset: { mode }, onclick: () => mdChooseMode(mode) }, MD_MODE_LABELS[mode])
+    );
+    radios[mode] = button;
+    group.append(button);
+  }
+  group.addEventListener('keydown', mdOnModeKeyDown);
+  const tocBtn = /** @type {HTMLButtonElement} */ (
+    h('button', { class: 'fv-icon-btn md-toc-btn', type: 'button', title: 'Table of contents', 'aria-label': 'Table of contents', 'aria-pressed': 'false', 'aria-controls': 'md-toc', onclick: () => mdTocToggle() }, icon(MD_FRAME_ICONS.toc))
+  );
+  const status = h('span', { class: 'md-status', role: 'status', 'aria-live': 'polite' });
+  const anyway = /** @type {HTMLButtonElement} */ (
+    h('button', { class: 'md-anyway', type: 'button', hidden: true, onclick: () => post({ type: 'editAnyway' }) }, 'Edit anyway…')
+  );
+  const toolbar = h('div', { class: 'md-toolbar', role: 'toolbar', 'aria-label': 'Markdown toolbar' }, tocBtn, group, status, anyway);
+  const toc = h('nav', { class: 'md-toc', id: 'md-toc', 'aria-label': 'Table of contents', hidden: true });
+  const wysiwyg = h('div', { class: 'md-wysiwyg', hidden: true });
+  const body = h('div', { class: 'md-body' }, toc, view, wysiwyg);
+  const app = h('div', { class: 'md-app', dataset: { mode: mdState.mode } }, toolbar, body);
+  mdFrame = { app, body, toc, tocBtn, radios: /** @type {Record<MdMode, HTMLButtonElement>} */ (radios), status, anyway, wysiwyg };
+  return app;
+}
+
+/** After the first init: the table of contents, the toolbar state and the mode the host has to know about. */
+function mdFrameStart(/** @type {MdMessage} */ msg) {
+  mdTocInit();
+  mdSplitInit();
+  mdFrameRefresh();
+  // The host starts in its default mode: tell it the mode this panel is really in (Split opens the source editor).
+  if (mdState.mode !== msg.mode || mdState.mode === 'split') post({ type: 'setMode', mode: mdState.mode });
+  if (mdState.mode === 'wysiwyg') mdwEnter();
+}
+
+/** Radio states, status text, "Edit anyway", the table of contents and the task checkboxes follow the latest state. */
+function mdFrameRefresh() {
+  const frame = mdFrame;
+  if (!frame) return;
+  const availability = mdWysiwygAvailability();
+  for (const mode of MD_MODES) {
+    const button = frame.radios[mode];
+    const checked = mode === mdState.mode;
+    button.setAttribute('aria-checked', String(checked));
+    button.tabIndex = checked ? 0 : -1;
+    const off = mode === 'wysiwyg' && availability.state === 'disabled';
+    if (off) button.setAttribute('aria-disabled', 'true');
+    else button.removeAttribute('aria-disabled');
+    button.title = off ? `WYSIWYG is not available: ${availability.reason}` : mode === 'split' ? 'Split: the preview beside the Markdown source' : mode === 'wysiwyg' ? 'Edit in a rich editor' : 'Read-only rendering';
+  }
+  // (a panel whose mode is off falls back to the preview: its radio would otherwise stay unreachable)
+  if (!MD_MODES.some((mode) => mode === mdState.mode)) frame.radios.preview.tabIndex = 0;
+  frame.app.dataset.mode = mdState.mode;
+  const es = mdx.editState;
+  const offer = es && es.code === 'fidelity' && es.canEditAnyway && mdState.mode === 'wysiwyg' ? es.canEditAnyway : null;
+  frame.anyway.hidden = !offer;
+  frame.anyway.title = offer ? offer.details.join('\n') : '';
+  mdShowStatus();
+}
+
+/** The status line: a fresh message first, else what the current mode needs to say. */
+function mdShowStatus() {
+  const frame = mdFrame;
+  if (!frame) return;
+  let text = mdx.flash;
+  if (!text && mdState.mode === 'wysiwyg') {
+    const availability = mdWysiwygAvailability();
+    if (availability.state === 'readonly') text = mdReadonlyText(availability.reason);
+    else if (mdw.failure) text = mdw.failure;
+    else if (!mdw.ready) text = 'Loading the WYSIWYG editor…';
+  }
+  if (frame.status.textContent !== text) frame.status.textContent = text;
+}
+
+/** The title the host gave for a read-only WYSIWYG (the reason is long; the details are in the button's tooltip). */
+function mdReadonlyText(/** @type {string} */ reason) {
+  const offer = mdx.editState && mdx.editState.canEditAnyway;
+  return offer ? `Read-only: ${offer.title}` : reason;
+}
+
+/**
+ * A message in the status line for a few seconds (live region: read by screen readers).
+ * @param {string} text
+ */
+function mdFlash(text) {
+  mdx.flash = text;
+  window.clearTimeout(mdx.flashTimer);
+  mdx.flashTimer = window.setTimeout(() => {
+    mdx.flash = '';
+    mdShowStatus();
+  }, MD_STATUS_MS);
+  mdShowStatus();
+}
+
+/** Toolbar choice (click, Enter, Space or arrow key on a radio). @param {MdMode} mode */
+function mdChooseMode(mode) {
+  if (mode === 'wysiwyg') {
+    const availability = mdWysiwygAvailability();
+    if (availability.state === 'disabled') {
+      mdFlash(availability.reason);
+      return;
+    }
+  }
+  if (mode === mdState.mode) return;
+  setStateKey(MD_STATE_MODE_KEY, mode);
+  void mdSwitchMode(mode);
+}
+
+let mdSwitching = Promise.resolve();
+
+/**
+ * Switches the panel to `mode`: pending WYSIWYG typing is sent first; the host answers `setMode` with a rendering that
+ * fits the mode (html for Preview / Split, blocks for WYSIWYG).
+ * @param {MdMode} mode
+ */
+function mdSwitchMode(mode) {
+  mdSwitching = mdSwitching.then(async () => {
+    const previous = mdState.mode;
+    if (previous === mode || !mdFrame) return;
+    if (previous === 'wysiwyg') await mdwLeave();
+    mdState.mode = mode;
+    if (mdState.view) mdState.view.dataset.mode = mode;
+    post({ type: 'setMode', mode });
+    mdFrameRefresh();
+    if (mode === 'wysiwyg') mdwEnter();
+    else {
+      mdwShow(false);
+      mdTocCurrentSoon();
+    }
+  });
+  return mdSwitching.catch((err) => logError('Could not switch the Markdown mode', err));
+}
+
+/**
+ * The panel could not stay in its mode (WYSIWYG load failed, self-check, the host says it is off): back to Preview.
+ * @param {string} reason shown in the status line
+ */
+function mdFallbackToPreview(reason) {
+  log('info', `Markdown: back to Preview (${reason})`);
+  if (mdState.mode === 'wysiwyg') {
+    mdState.mode = 'preview';
+    if (mdState.view) mdState.view.dataset.mode = 'preview';
+    mdwShow(false);
+    post({ type: 'setMode', mode: 'preview' });
+  }
+  mdFrameRefresh();
+  mdFlash(reason);
+}
+
+/** Radio keys: Left / Up and Right / Down move (and choose, unless the mode is off), Home / End jump. @param {KeyboardEvent} e */
+function mdOnModeKeyDown(e) {
+  if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || e.isComposing || !mdFrame) return;
+  const current = MD_MODES.find((mode) => mdFrame && mdFrame.radios[mode] === e.target);
+  if (!current) return;
+  let index = MD_MODES.indexOf(current);
+  switch (e.key) {
+    case 'ArrowLeft':
+    case 'ArrowUp':
+      index = (index + MD_MODES.length - 1) % MD_MODES.length;
+      break;
+    case 'ArrowRight':
+    case 'ArrowDown':
+      index = (index + 1) % MD_MODES.length;
+      break;
+    case 'Home':
+      index = 0;
+      break;
+    case 'End':
+      index = MD_MODES.length - 1;
+      break;
+    case ' ':
+    case 'Enter':
+      e.preventDefault();
+      mdChooseMode(current);
+      return;
+    default:
+      return;
+  }
+  e.preventDefault();
+  const next = MD_MODES[index];
+  const button = mdFrame.radios[next];
+  // Roving tabindex: the focused radio is the one Tab returns to; an unusable one is focused but not chosen.
+  for (const mode of MD_MODES) mdFrame.radios[mode].tabIndex = mode === next ? 0 : -1;
+  button.focus();
+  mdChooseMode(next);
+}
+
+/**
+ * `editState` message: the document became (or stopped being) editable, the save check finished, "Edit anyway" was accepted.
+ * @param {EditStateMessage} msg
+ */
+function mdOnEditState(msg) {
+  if (currentKind() !== 'markdown' || !mdFrame || !msg.state || typeof msg.state !== 'object') return;
+  mdx.editState = msg.state;
+  mdFrameRefresh();
+  mdwOnEditStateChange();
+}
+
+/**
+ * `markdownUpdate` hook (called after mdAcceptMessage): updates that belong to the WYSIWYG editor, or that tell a WYSIWYG
+ * panel the host fell back to Preview, are handled here. Returns true when the preview must not be patched.
+ * @param {MdMessage} msg
+ * @returns {boolean}
+ */
+function mdFrameOnUpdate(msg) {
+  mdFrameRefresh();
+  mdTocRebuild();
+  const fromWysiwygHost = Array.isArray(msg.blocks);
+  if (mdState.mode === 'wysiwyg') {
+    if (fromWysiwygHost) {
+      mdwOnUpdate(msg);
+      return true;
+    }
+    if (mdWysiwygAvailability().state !== 'disabled') return true; // a Preview update sent before the host got `setMode`
+    mdFallbackToPreview(mdWysiwygAvailability().reason);
+    return false;
+  }
+  if (fromWysiwygHost) return true; // a WYSIWYG update that crossed our switch back to Preview: the host will send the html
+  mdSplitOnUpdate();
+  return false;
+}
+
+/** `.md-view` and `.md-wysiwyg` swap: only one of them is shown. @param {boolean} on */
+function mdwShow(on) {
+  const frame = mdFrame;
+  if (!frame) return;
+  frame.wysiwyg.hidden = !on;
+  if (mdState.view) mdState.view.hidden = on;
+}
+
+/** Disposal of the frame (new init, error page). */
+function mdFrameDispose() {
+  window.clearTimeout(mdx.flashTimer);
+  mdx.flash = '';
+  mdFrame = null;
+  mdTocDispose();
+  mdSplitDispose();
+  mdwDispose();
+}
+
+// ----- MARKDOWN: TOC -----
+// (contract §9.4) The table of contents is a tree built from `toc` like the PDF outline: entries nest by level (a skipped
+// level nests under the last open entry), collapse state is keyed `slug@line` and saved with `open` in the webview state
+// (`markdownToc`), the tree is rebuilt on every update keeping the collapse state and the focus, a click or Enter scrolls
+// (Preview: the heading; Split: also the source editor; WYSIWYG: the heading's block), the heading in view is marked.
+
+const MD_STATE_TOC_KEY = 'markdownToc';
+const MD_TOC_MAX_DEPTH = 8;
+/** A heading this close below the top of the view (the scroll padding) is the one in view. */
+const MD_TOC_TOP_SLACK = 24;
+/**
+ * @typedef {{ entry: MdTocEntry, key: string, children: MdTocNode[] }} MdTocNode
+ * @typedef {{ open: boolean, collapsed: Set<string> }} MdTocState
+ */
+/** @type {MdTocState} */
+const mdTocState = { open: false, collapsed: new Set() };
+const mdToc = {
+  /** Key of the entry the roving tabindex is on. */
+  active: '',
+  /** Key of the entry of the heading in view. */
+  current: '',
+  /** @type {Map<string, HTMLElement>} */
+  items: new Map(),
+  /** @type {MdTocNode[]} */
+  tree: [],
+  raf: 0,
+};
+
+function mdTocInit() {
+  try {
+    const saved = /** @type {{ open?: unknown, collapsed?: unknown } | null | undefined} */ (getStateKey(MD_STATE_TOC_KEY));
+    mdTocState.open = saved?.open === true;
+    mdTocState.collapsed = new Set(Array.isArray(saved?.collapsed) ? saved.collapsed.filter((/** @type {unknown} */ k) => typeof k === 'string') : []);
+  } catch {
+    mdTocState.open = false;
+    mdTocState.collapsed = new Set();
+  }
+  mdToc.active = '';
+  mdToc.current = '';
+  mdTocRebuild();
+  mdTocShow(mdTocState.open, false);
+  // The heading in view follows the scroll of the preview (and of the editor, see mdwOnScroll).
+  const view = mdState.view;
+  if (view) {
+    view.addEventListener('scroll', mdTocCurrentSoon, { passive: true });
+    onDispose(() => view.removeEventListener('scroll', mdTocCurrentSoon));
+  }
+}
+
+function mdTocDispose() {
+  cancelAnimationFrame(mdToc.raf);
+  mdToc.items.clear();
+  mdToc.tree = [];
+}
+
+function mdTocSave() {
+  setStateKey(MD_STATE_TOC_KEY, { open: mdTocState.open, collapsed: [...mdTocState.collapsed] });
+}
+
+/** @param {MdTocEntry[]} toc @returns {MdTocNode[]} */
+function mdTocTree(toc) {
+  /** @type {MdTocNode[]} */
+  const roots = [];
+  /** @type {MdTocNode[]} */
+  const stack = [];
+  for (const entry of toc) {
+    /** @type {MdTocNode} */
+    const node = { entry, key: `${entry.slug}@${entry.line}`, children: [] };
+    while (stack.length && stack[stack.length - 1].entry.level >= entry.level) stack.pop();
+    (stack.length ? stack[stack.length - 1].children : roots).push(node);
+    stack.push(node);
+  }
+  return roots;
+}
+
+/** @param {boolean} open @param {boolean} [save] */
+function mdTocShow(open, save = true) {
+  const frame = mdFrame;
+  if (!frame) return;
+  mdTocState.open = open;
+  frame.toc.hidden = !open;
+  frame.tocBtn.setAttribute('aria-pressed', String(open));
+  if (save) mdTocSave();
+  if (open) mdTocCurrentSoon();
+}
+
+function mdTocToggle() {
+  const frame = mdFrame;
+  if (!frame) return;
+  const open = Boolean(frame.toc.hidden);
+  mdTocShow(open);
+  if (open) mdTocFocusActive();
+}
+
+function mdTocFocusActive() {
+  const item = mdToc.items.get(mdToc.active) ?? mdToc.items.values().next().value;
+  if (item) item.focus({ preventScroll: true });
+}
+
+/** Rebuilds the tree from mdState.toc, keeping collapse state, focus and the heading in view. */
+function mdTocRebuild() {
+  const frame = mdFrame;
+  if (!frame) return;
+  const focused = document.activeElement instanceof HTMLElement && frame.toc.contains(document.activeElement) ? document.activeElement.dataset.key : undefined;
+  const tree = mdTocTree(mdState.toc);
+  // A collapsed entry whose line moved (an edit above it) is the one with the same slug.
+  const keys = new Set();
+  /** @type {Map<string, string>} */
+  const bySlug = new Map();
+  /** @param {MdTocNode[]} nodes */
+  const walk = (nodes) => {
+    for (const node of nodes) {
+      keys.add(node.key);
+      bySlug.set(node.entry.slug, node.key);
+      walk(node.children);
+    }
+  };
+  walk(tree);
+  let changed = false;
+  for (const key of [...mdTocState.collapsed]) {
+    if (keys.has(key)) continue;
+    mdTocState.collapsed.delete(key);
+    const moved = bySlug.get(key.slice(0, key.lastIndexOf('@')));
+    if (moved) mdTocState.collapsed.add(moved);
+    changed = true;
+  }
+  if (changed) mdTocSave();
+  mdToc.tree = tree;
+  mdToc.items.clear();
+  if (!keys.has(mdToc.active)) mdToc.active = tree.length ? tree[0].key : '';
+  frame.toc.replaceChildren(
+    tree.length
+      ? mdTocBuildList(tree, 1)
+      : h('p', { class: 'md-toc-empty' }, 'This document has no headings.'),
+  );
+  if (focused && mdToc.items.has(focused)) mdToc.items.get(focused)?.focus({ preventScroll: true });
+  mdTocMarkCurrent();
+}
+
+/**
+ * @param {MdTocNode[]} nodes
+ * @param {number} level 1-based depth
+ * @returns {HTMLElement}
+ */
+function mdTocBuildList(nodes, level) {
+  const list = h('ul', { class: 'md-toc-list', role: level === 1 ? 'tree' : 'group', 'aria-label': level === 1 ? 'Table of contents' : null });
+  if (level === 1) list.addEventListener('keydown', mdTocOnKeyDown);
+  for (const node of nodes) {
+    const children = node.children.length && level < MD_TOC_MAX_DEPTH ? node.children : [];
+    const expanded = !mdTocState.collapsed.has(node.key);
+    const row = h(
+      'div',
+      {
+        class: 'md-toc-row',
+        role: 'treeitem',
+        tabindex: node.key === mdToc.active ? '0' : '-1',
+        'aria-level': String(level),
+        'aria-expanded': children.length ? String(expanded) : null,
+        'aria-selected': 'false',
+        dataset: { key: node.key, line: String(node.entry.line) },
+        title: node.entry.text,
+      },
+      h('span', { class: 'md-toc-toggle', 'aria-hidden': 'true' }, children.length ? icon(ICONS.chevronRight) : null),
+      h('span', { class: 'md-toc-text' }, node.entry.text || 'Untitled'),
+    );
+    row.addEventListener('click', (e) => {
+      const toggle = e.target instanceof Element ? e.target.closest('.md-toc-toggle') : null;
+      mdToc.active = node.key;
+      if (toggle && children.length) mdTocSetExpanded(node, row, !(row.getAttribute('aria-expanded') === 'true'));
+      else mdTocGo(node.entry, row);
+      mdTocRovingTo(row);
+    });
+    mdToc.items.set(node.key, row);
+    const li = h('li', { class: 'md-toc-item', role: 'none' }, row);
+    if (children.length) {
+      const sub = mdTocBuildList(children, level + 1);
+      sub.hidden = !expanded;
+      li.append(sub);
+    }
+    list.append(li);
+  }
+  return list;
+}
+
+/** @param {HTMLElement} row */
+function mdTocRovingTo(row) {
+  for (const item of mdToc.items.values()) item.tabIndex = item === row ? 0 : -1;
+  mdToc.active = row.dataset.key ?? mdToc.active;
+}
+
+/**
+ * @param {MdTocNode} node
+ * @param {HTMLElement} row
+ * @param {boolean} expanded
+ */
+function mdTocSetExpanded(node, row, expanded) {
+  row.setAttribute('aria-expanded', String(expanded));
+  const sub = row.parentElement?.querySelector(':scope > ul');
+  if (sub instanceof HTMLElement) sub.hidden = !expanded;
+  if (expanded) mdTocState.collapsed.delete(node.key);
+  else mdTocState.collapsed.add(node.key);
+  mdTocSave();
+}
+
+/**
+ * Tree keys like a VS Code tree: Up / Down previous / next entry shown, Right expands (or goes to the first child), Left
+ * collapses (or goes to the parent), Home / End first / last entry shown, Enter / Space go to the heading.
+ * @param {KeyboardEvent} e
+ */
+function mdTocOnKeyDown(e) {
+  if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || e.isComposing) return;
+  const row = e.target instanceof HTMLElement ? e.target.closest('.md-toc-row') : null;
+  if (!(row instanceof HTMLElement)) return;
+  const shown = [...mdToc.items.values()].filter((item) => item.getClientRects().length > 0);
+  const i = shown.indexOf(row);
+  const node = mdTocFind(row.dataset.key ?? '');
+  const expanded = row.getAttribute('aria-expanded');
+  /** @type {HTMLElement | null | undefined} */
+  let next = null;
+  switch (e.key) {
+    case 'ArrowDown':
+      next = shown[i + 1];
+      break;
+    case 'ArrowUp':
+      next = i > 0 ? shown[i - 1] : null;
+      break;
+    case 'Home':
+      next = shown[0];
+      break;
+    case 'End':
+      next = shown[shown.length - 1];
+      break;
+    case 'ArrowRight':
+      if (node && expanded === 'false') mdTocSetExpanded(node, row, true);
+      else if (expanded === 'true') next = /** @type {HTMLElement | null} */ (row.parentElement?.querySelector(':scope > ul > .md-toc-item > .md-toc-row') ?? null);
+      break;
+    case 'ArrowLeft':
+      if (node && expanded === 'true') mdTocSetExpanded(node, row, false);
+      else next = /** @type {HTMLElement | null} */ (row.parentElement?.parentElement?.closest('.md-toc-item')?.querySelector(':scope > .md-toc-row') ?? null);
+      break;
+    case 'Enter':
+    case ' ':
+      if (node) mdTocGo(node.entry, row);
+      e.preventDefault();
+      return;
+    case 'Escape':
+      // Like a side drawer: closes the panel (the state is saved) and gives the focus back to the button that opened it.
+      mdTocShow(false);
+      mdFrame?.tocBtn.focus();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    default:
+      return;
+  }
+  e.preventDefault();
+  e.stopPropagation();
+  if (next) {
+    mdTocRovingTo(next);
+    next.focus();
+  }
+}
+
+/** @param {string} key @param {MdTocNode[]} [nodes] @returns {MdTocNode | undefined} */
+function mdTocFind(key, nodes = mdToc.tree) {
+  for (const node of nodes) {
+    if (node.key === key) return node;
+    const inner = mdTocFind(key, node.children);
+    if (inner) return inner;
+  }
+  return undefined;
+}
+
+/**
+ * Scrolls to a heading: Preview / Split the heading of the article (Split also tells the source editor), WYSIWYG its block.
+ * The keyboard focus stays in the tree (the jump of an in-page link would move it to the heading).
+ * @param {MdTocEntry} entry
+ * @param {HTMLElement} [row] the entry's row
+ */
+function mdTocGo(entry, row) {
+  if (mdState.mode === 'wysiwyg') {
+    mdwScrollToLine(entry.line);
+    return;
+  }
+  const article = mdState.article;
+  if (!article) return;
+  mdScrollToFragment(article, encodeURIComponent(entry.slug), mdState.toc, mdState.scroll);
+  if (row && document.activeElement !== row) row.focus({ preventScroll: true });
+  if (mdState.mode === 'split') post({ type: 'previewScrolled', line: entry.line });
+}
+
+function mdTocCurrentSoon() {
+  if (mdToc.raf || !mdFrame || mdFrame.toc.hidden) return;
+  mdToc.raf = requestAnimationFrame(() => {
+    mdToc.raf = 0;
+    mdTocMarkCurrent();
+  });
+}
+
+/** Marks the entry of the last heading above the top of the view (`aria-current="location"`). */
+function mdTocMarkCurrent() {
+  const frame = mdFrame;
+  if (!frame || frame.toc.hidden || !mdState.toc.length) return;
+  const line = mdState.mode === 'wysiwyg' ? mdwLineAtTop() : mdLineAtTop(MD_TOC_TOP_SLACK);
+  let current = mdState.toc[0];
+  for (const entry of mdState.toc) {
+    if (entry.line <= line) current = entry;
+    else break;
+  }
+  const key = `${current.slug}@${current.line}`;
+  if (key === mdToc.current && mdToc.items.get(key)?.getAttribute('aria-current')) return;
+  mdToc.current = key;
+  for (const [k, item] of mdToc.items) {
+    if (k === key) {
+      item.setAttribute('aria-current', 'location');
+      item.setAttribute('aria-selected', 'true');
+    } else {
+      item.removeAttribute('aria-current');
+      item.setAttribute('aria-selected', 'false');
+    }
+  }
+}
+
+// ----- MARKDOWN: SPLIT (scroll sync) -----
+// (contract §9.2) In Split the host shows the Markdown source in VS Code's own text editor beside the preview and keeps
+// the two in step. Editor -> preview: `revealLine {line}` (fractional); preview -> editor: `previewScrolled {line}`. The
+// position of a source line is found with a binary search over the elements that carry `data-source-line` (only the
+// ones that go forward: footnotes and alerts jump back), interpolated inside a block by its height. A scroll we caused
+// ourselves is not sent back (`programmatic`, 150 ms).
+
+const MD_SYNC_ECHO_MS = 150;
+const MD_SYNC_SEND_MS = 40;
+/** A reveal keeps its line at the top for at most this long while a large document settles (see mdSplitScrollTo). */
+const MD_SYNC_PIN_MS = 600;
+const mdSync = {
+  /** performance.now() until which scroll events are our own. */
+  programmaticUntil: 0,
+  /** Number of the newest reveal (a refinement of an older one stops). */
+  reveal: 0,
+  /** @type {{ line: number, el: HTMLElement }[] | null} */
+  list: null,
+  /** @type {MutationObserver | null} */
+  observer: null,
+  timer: 0,
+  lastSent: -1,
+};
+
+function mdSplitInit() {
+  const view = mdState.view;
+  const article = mdState.article;
+  if (!view || !article) return;
+  view.addEventListener('scroll', mdSplitOnScroll, { passive: true });
+  mdSync.observer = new MutationObserver(() => (mdSync.list = null));
+  mdSync.observer.observe(article, { childList: true });
+  mdSync.list = null;
+  mdSync.lastSent = -1;
+  onDispose(() => view.removeEventListener('scroll', mdSplitOnScroll));
+}
+
+function mdSplitDispose() {
+  mdSync.observer?.disconnect();
+  mdSync.observer = null;
+  mdSync.list = null;
+  mdSync.reveal++;
+  window.clearTimeout(mdSync.timer);
+  mdSync.timer = 0;
+}
+
+/** A markdownUpdate may have patched the article: the element list is made again when needed. */
+function mdSplitOnUpdate() {
+  mdSync.list = null;
+}
+
+/** The elements of the article with a source line, in document order, only those whose line does not go back. */
+function mdSyncList() {
+  if (mdSync.list) return mdSync.list;
+  /** @type {{ line: number, el: HTMLElement }[]} */
+  const list = [];
+  const article = mdState.article;
+  if (article) {
+    let last = -1;
+    for (const el of article.querySelectorAll('[data-source-line]')) {
+      const line = Number(el.getAttribute('data-source-line'));
+      if (!Number.isInteger(line) || line < last || !(el instanceof HTMLElement)) continue;
+      // the first element of a line only: a block and its first child share the line
+      if (line === last && list.length) continue;
+      list.push({ line, el });
+      last = line;
+    }
+  }
+  mdSync.list = list;
+  return list;
+}
+
+/** Top of `el` in the scroller's content coordinates. @param {HTMLElement} view @param {Element} el */
+function mdElementTop(view, el) {
+  return el.getBoundingClientRect().top - view.getBoundingClientRect().top + view.scrollTop;
+}
+
+/**
+ * The source line (fractional) at the top of the preview (`slack` px below the very top: the table of contents counts a
+ * heading that a jump left a little below the top, because of the scroll padding, as the one in view).
+ * @param {number} [slack]
+ * @returns {number}
+ */
+function mdLineAtTop(slack = 0) {
+  const view = mdState.view;
+  if (!view) return 0;
+  const list = mdSyncList();
+  if (!list.length) return 0;
+  const y = view.scrollTop + 1 + slack;
+  let lo = 0;
+  let hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (mdElementTop(view, list[mid].el) <= y) lo = mid + 1;
+    else hi = mid;
+  }
+  const i = lo - 1;
+  if (i < 0) return 0;
+  const top = mdElementTop(view, list[i].el);
+  const next = list[i + 1];
+  if (!next) return list[i].line;
+  const span = mdElementTop(view, next.el) - top;
+  const fraction = span > 0 ? clamp((y - top) / span, 0, 1) : 0;
+  return list[i].line + fraction * (next.line - list[i].line);
+}
+
+/**
+ * `revealLine` (the source editor scrolled): scrolls the preview to the source line (fractional).
+ * @param {number} line
+ */
+function mdSplitReveal(line) {
+  const view = mdState.view;
+  if (currentKind() !== 'markdown' || mdState.mode !== 'split' || !view || !mdState.article || !Number.isFinite(line)) return;
+  if (mdState.deferred) {
+    mdFinishDeferredBlocks(); // the target may be in a block not built yet
+    mdSync.list = null; // (the observer that clears it only runs after this call)
+  }
+  if (!mdSyncList().length) return;
+  mdState.scroll.anchor = null; // an explicit jump replaces any held position
+  mdState.scroll.top = null;
+  mdSplitScrollTo(line);
+}
+
+/**
+ * The scroll position (px) of a source line (fractional): binary search over the elements, interpolated by height.
+ * @param {HTMLElement} view
+ * @param {number} line
+ */
+function mdYOfLine(view, line) {
+  const list = mdSyncList();
+  let lo = 0;
+  let hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (list[mid].line <= line) lo = mid + 1;
+    else hi = mid;
+  }
+  const i = lo - 1;
+  if (i < 0) return 0;
+  const top = mdElementTop(view, list[i].el);
+  const next = list[i + 1];
+  if (!next) return top + Math.min((line - list[i].line) * 20, list[i].el.getBoundingClientRect().height);
+  const span = mdElementTop(view, next.el) - top;
+  const lines = next.line - list[i].line;
+  return top + (lines > 0 ? ((line - list[i].line) / lines) * span : 0);
+}
+
+/**
+ * Scrolls the preview to a source line. In a very large document the blocks away from the viewport only have an estimated
+ * height (`content-visibility: auto`); the ones around the target get their real height over the next frames and the
+ * target moves. So the line is kept at the top until the layout is stable (3 frames with the same height, at most
+ * MD_SYNC_PIN_MS). A newer reveal, a scroll that is not ours or a mode change ends it.
+ * @param {number} line
+ */
+function mdSplitScrollTo(line) {
+  const view = mdState.view;
+  if (!view) return;
+  const token = ++mdSync.reveal;
+  const started = performance.now();
+  let placed = 0;
+  let height = -1;
+  let stable = 0;
+  /** Where the line should be now (the browser cannot scroll past the end). */
+  const wanted = () => Math.max(0, Math.min(Math.round(mdYOfLine(view, line)), view.scrollHeight - view.clientHeight));
+  const place = () => {
+    mdSync.programmaticUntil = performance.now() + MD_SYNC_ECHO_MS;
+    mdSync.lastSent = line;
+    view.scrollTop = wanted();
+    placed = view.scrollTop; // what the browser made of it
+  };
+  place();
+  const step = () => {
+    if (mdSync.reveal !== token || mdState.mode !== 'split' || mdState.view !== view || performance.now() - started > MD_SYNC_PIN_MS) return;
+    if (Math.abs(view.scrollTop - placed) > 1) return; // someone else scrolled: do not fight it
+    stable = view.scrollHeight === height ? stable + 1 : 0;
+    height = view.scrollHeight;
+    if (Math.abs(wanted() - view.scrollTop) > 1) {
+      place();
+      stable = 0;
+    }
+    if (stable < 3) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+/** The preview scrolled (by the user): tell the host which source line is at the top, unless we caused it. */
+function mdSplitOnScroll() {
+  if (mdState.mode !== 'split' || performance.now() < mdSync.programmaticUntil) return;
+  mdSync.reveal++; // the user scrolls: a reveal that is still correcting its position stops
+  if (mdSync.timer) return;
+  mdSync.timer = window.setTimeout(() => {
+    mdSync.timer = 0;
+    if (mdState.mode !== 'split' || performance.now() < mdSync.programmaticUntil) return;
+    const line = mdLineAtTop();
+    if (Math.abs(line - mdSync.lastSent) < 0.25) return;
+    mdSync.lastSent = line;
+    post({ type: 'previewScrolled', line });
+  }, MD_SYNC_SEND_MS);
+}
+
+// ----- MARKDOWN: WYSIWYG ENGINE -----
+// (v0.2.0, P6; contract §9.3; port of the s2-markdown spike's engine.js) The block engine that makes WYSIWYG editing
+// minimal: the host sends the exact source and its top-level blocks (markdown-it token.map, `markdownBlocks`); this code
+// builds the editor document block by block with Milkdown's own parser, remembers which source range each node came
+// from, and later turns the changed region(s) into `MdTextEdit`s (UTF-16 offsets of the document text, each with the text
+// it replaces). Blocks that Milkdown cannot round-trip exactly (`serialize(parse(text)) !== text`) and the host's `fixed`
+// kinds (front matter, HTML, footnotes, math, alerts, indented code, "depends on context") are shown as protected raw
+// text (`fs_raw`), never parsed or re-serialized. The functions are pure: the Milkdown modules are passed in (`mw`, see
+// mdwLoad); nothing here touches the DOM or the host.
+
+/**
+ * @typedef {object} MdwItem  one block of the source and the editor nodes made from it
+ * @property {number} start  UTF-16 offset in `source`
+ * @property {number} end
+ * @property {string} kind
+ * @property {any} opts  serializer options read from the block's own text (bullet, fence, ...)
+ * @property {any[]} nodes  ProseMirror nodes (an untouched node keeps its identity)
+ * @property {boolean} raw  shown as protected raw text
+ * @property {string} [why]  why it is raw
+ * @typedef {{ source: string, eol: string, items: MdwItem[], loadedDoc?: any, stats?: { blocks: number, editable: number, raw: number, fails: { kind: string, text: string, out: string }[] } }} MdwModel
+ */
+
+/** @param {string} s */
+const mdwNl = (s) => s.replace(/\r\n?/g, '\n');
+/** @param {number} c UTF-16 unit */
+const mdwIsLow = (c) => c >= 0xdc00 && c <= 0xdfff;
+
+/**
+ * The editor's own node types: `fs_raw` (a protected block: exact Markdown text, edited as plain text) and the plugins
+ * that guard the editor: no undo / redo of its own (the document's undo is VS Code's), no uploads, pasted HTML sanitized,
+ * pasted files refused, relative images shown through the resource base (display only, the file keeps the written path).
+ * @param {MdwModules} mw
+ * @param {{ onChange: () => void, onRefuse: (text: string) => void, resolveImage: (src: string) => string }} hooks
+ * @returns {any[]} plugins for `editor.use`
+ */
+function mdwPlugins(mw, hooks) {
+  const { $node, $prose } = mw.utils;
+  const { Plugin } = mw.proseState;
+  const fsRaw = $node('fs_raw', () => ({
+    content: 'text*',
+    group: 'block',
+    code: true,
+    marks: '',
+    defining: true,
+    isolating: true,
+    attrs: { kind: { default: '' } },
+    parseDOM: [{ tag: 'pre.fs-raw', preserveWhitespace: 'full' }],
+    toDOM: (/** @type {any} */ node) => ['pre', { class: 'fs-raw', 'data-kind': node.attrs.kind, spellcheck: 'false' }, ['code', 0]],
+    parseMarkdown: { match: () => false, runner: () => {} },
+    toMarkdown: {
+      match: (/** @type {any} */ n) => n.type.name === 'fs_raw',
+      runner: (/** @type {any} */ state, /** @type {any} */ node) => {
+        state.addNode('html', undefined, node.textContent);
+      },
+    },
+  }));
+  const guard = $prose(
+    () =>
+      new Plugin({
+        props: {
+          // Pasted HTML goes through DOMPurify (scripts, styles, event handlers, forms are dropped).
+          transformPastedHTML: (/** @type {string} */ html) => sanitize(html),
+          handlePaste: (/** @type {any} */ _view, /** @type {ClipboardEvent} */ event) => {
+            if (event.clipboardData && event.clipboardData.files && event.clipboardData.files.length > 0) {
+              hooks.onRefuse('Pasting files is not supported here; add the image as a Markdown link.');
+              return true;
+            }
+            return false;
+          },
+          handleDrop: (/** @type {any} */ _view, /** @type {DragEvent} */ event) => {
+            if (event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files.length > 0) {
+              hooks.onRefuse('Dropping files is not supported here; add the image as a Markdown link.');
+              return true;
+            }
+            return false;
+          },
+          // A relative image path is shown through the document's resource base. Only the displayed `src` changes: the node (and
+          // so the Markdown) keeps the path as written. The picture is made with its final `src`: no request for the raw path.
+          nodeViews: {
+            image: (/** @type {any} */ node) => {
+              const img = document.createElement('img');
+              /** @param {any} n */
+              const show = (n) => {
+                img.setAttribute('src', hooks.resolveImage(String(n.attrs.src ?? '')));
+                img.setAttribute('alt', String(n.attrs.alt ?? ''));
+                if (n.attrs.title) img.setAttribute('title', String(n.attrs.title));
+                else img.removeAttribute('title');
+              };
+              show(node);
+              return {
+                dom: img,
+                update: (/** @type {any} */ next) => {
+                  if (next.type !== node.type) return false;
+                  node = next;
+                  show(next);
+                  return true;
+                },
+                ignoreMutation: () => true,
+              };
+            },
+          },
+        },
+        view: () => ({
+          update: (/** @type {any} */ view, /** @type {any} */ prev) => {
+            if (!view.state.doc.eq(prev.doc)) hooks.onChange();
+          },
+        }),
+      }),
+  );
+  return [fsRaw, guard];
+}
+
+/**
+ * serialize(parse(text)) with the editor's own pipeline.
+ * @param {any} editor
+ * @param {MdwModules} mw
+ * @param {string} text
+ */
+function mdwRoundTrip(editor, mw, text) {
+  const { parserCtx, serializerCtx } = mw.core;
+  return editor.action((/** @type {any} */ ctx) => ctx.get(serializerCtx)(ctx.get(parserCtx)(text)));
+}
+
+/**
+ * Style options read from a block's own source, so a re-serialized block keeps the author's markers (bullet - * +, ordered
+ * . or ), thematic break, fence character, setext headings, compact tables). Emphasis / strong markers are kept per mark
+ * by Milkdown.
+ * @param {string} text
+ * @param {string} kind
+ * @returns {Record<string, any>}
+ */
+function mdwStyleOf(text, kind) {
+  /** @type {Record<string, any>} */
+  const o = {};
+  /** @type {RegExpExecArray | null} */
+  let m;
+  if (/list/.test(kind) && (m = /^[ \t>]*([-*+])[ \t]/m.exec(text))) o.bullet = m[1];
+  if (/list/.test(kind) && (m = /^[ \t>]*\d+([.)])[ \t]/m.exec(text))) o.bulletOrdered = m[1];
+  if (kind === 'hr' && (m = /^ {0,3}([-*_])/.exec(text))) {
+    o.rule = m[1];
+    o.ruleRepetition = text.split(m[1]).length - 1;
+    o.ruleSpaces = /[-*_][ \t]+[-*_]/.test(text);
+  }
+  if (kind === 'fence' && /^ {0,3}~/.test(text)) o.fence = '~';
+  if (kind === 'heading' && /\n *(=+|-+) *$/.test(text)) o.setext = true;
+  if (kind === 'table') {
+    // A hand-written compact table (rows of different length) is written back compact, an aligned one aligned.
+    const lens = text.split('\n').map((l) => l.length);
+    if (lens.some((l) => l !== lens[0])) o.gfm = { tablePipeAlign: false };
+  }
+  return o;
+}
+
+/** @type {WeakMap<object, Map<string, any>>} */
+const mdwSerializers = new WeakMap();
+
+/**
+ * The editor's serializer, or one with these stringify options. The attachers are found by object identity (the same
+ * `remark-stringify` / `remark-gfm` modules Milkdown uses); each gets a NEW options object, so the editor's own serializer
+ * is not changed.
+ * @param {MdwModules} mw
+ * @param {any} ctx
+ * @param {Record<string, any> | undefined} opts
+ */
+function mdwSerializerFor(mw, ctx, opts) {
+  const { serializerCtx, schemaCtx, remarkCtx } = mw.core;
+  if (!opts || !Object.keys(opts).length) return ctx.get(serializerCtx);
+  let cache = mdwSerializers.get(ctx);
+  if (!cache) mdwSerializers.set(ctx, (cache = new Map()));
+  const key = JSON.stringify(opts);
+  let serializer = cache.get(key);
+  if (!serializer) {
+    const base = ctx.get(remarkCtx);
+    const stringify = mw.remarkStringify.default;
+    const gfmPlugin = mw.remarkGfm.default;
+    if (!base.attachers.some((/** @type {any[]} */ [p]) => p === stringify)) throw new Error('remark-stringify instance mismatch');
+    // A copy of the processor with a NEW options object for the stringify step (unified's use() would merge into, and so
+    // change, the options object the editor's own serializer still uses).
+    const copy = base();
+    const i = copy.attachers.findIndex((/** @type {any[]} */ [p]) => p === stringify);
+    const { gfm, ...own } = opts;
+    copy.attachers[i] = [stringify, { ...(copy.attachers[i][1] || {}), ...own }];
+    if (gfm) {
+      const g = copy.attachers.findIndex((/** @type {any[]} */ [p]) => p === gfmPlugin);
+      if (g < 0) throw new Error('remark-gfm instance mismatch');
+      copy.attachers[g] = [gfmPlugin, { ...(copy.attachers[g][1] || {}), ...gfm }];
+    }
+    serializer = mw.transformer.SerializerState.create(ctx.get(schemaCtx), copy);
+    cache.set(key, serializer);
+  }
+  return serializer;
+}
+
+/**
+ * Whether the editor's serializer is built from the same remark modules this script imports (identity), the check the
+ * engine's style options rely on.
+ * @param {any} editor
+ * @param {MdwModules} mw
+ */
+function mdwCheckIdentity(editor, mw) {
+  return editor.action((/** @type {any} */ ctx) => {
+    const attachers = ctx.get(mw.core.remarkCtx).attachers;
+    const has = (/** @type {unknown} */ plugin) => attachers.some((/** @type {any[]} */ [p]) => p === plugin);
+    return has(mw.remarkStringify.default) && has(mw.remarkGfm.default);
+  });
+}
+
+/**
+ * A table's delimiter row is written back as the author wrote it when it means the same (column count + alignment).
+ * @param {string} out
+ * @param {string} old
+ */
+function mdwKeepTableDelimiters(out, old) {
+  const row = (/** @type {string} */ t) => t.split('\n')[1];
+  const cells = (/** @type {string} */ l) => l.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
+  const align = (/** @type {string} */ c) => (c.startsWith(':') ? 'l' : '') + (c.endsWith(':') ? 'r' : '');
+  const x = row(out);
+  const y = row(old);
+  if (x === undefined || y === undefined || x === y || !/^[\s|:-]+$/.test(x) || !/^[\s|:-]+$/.test(y)) return out;
+  const cx = cells(x);
+  const cy = cells(y);
+  if (cx.length !== cy.length || cx.some((c, i) => align(c) !== align(cy[i]))) return out;
+  const lines = out.split('\n');
+  lines[1] = y;
+  return lines.join('\n');
+}
+
+/**
+ * @param {MdwModules} mw
+ * @param {any} ctx
+ * @param {any[]} nodes
+ * @param {Record<string, any> | undefined} opts
+ */
+function mdwSerializeNodes(mw, ctx, nodes, opts) {
+  const doc = ctx.get(mw.core.schemaCtx).topNodeType.create(null, nodes);
+  return mdwSerializerFor(mw, ctx, opts)(doc).replace(/\n$/, '');
+}
+
+/**
+ * Builds the editor document block by block and makes it the editor's state. Each item keeps the exact source range of
+ * its block and the nodes made from it (load-time objects: an untouched node keeps its identity).
+ * @param {any} editor
+ * @param {MdwModules} mw
+ * @param {string} source exact document text
+ * @param {MdSourceBlock[]} blocks from the host
+ * @param {string} eol '\n' or '\r\n'
+ * @returns {MdwModel}
+ */
+function mdwLoadModel(editor, mw, source, blocks, eol) {
+  const { parserCtx, serializerCtx, editorViewCtx, schemaCtx } = mw.core;
+  return editor.action((/** @type {any} */ ctx) => {
+    const schema = ctx.get(schemaCtx);
+    const parse = ctx.get(parserCtx);
+    void serializerCtx;
+    /** @type {MdwItem[]} */
+    const items = [];
+    const stats = { blocks: blocks.length, editable: 0, raw: 0, fails: /** @type {{ kind: string, text: string, out: string }[]} */ ([]) };
+    for (const b of blocks) {
+      const text = mdwNl(source.slice(b.start, b.end));
+      /** @type {any[] | null} */
+      let nodes = null;
+      let why = b.fixed ? b.reason : undefined;
+      /** @type {Record<string, any> | undefined} */
+      let opts;
+      if (!b.fixed) {
+        try {
+          const d = parse(text);
+          opts = mdwStyleOf(text, b.kind);
+          const out = mdwKeepTableDelimiters(mdwSerializerFor(mw, ctx, opts)(d).replace(/\n$/, ''), text);
+          if (out === text && d.childCount > 0) {
+            nodes = [];
+            d.forEach((/** @type {any} */ n) => nodes?.push(n));
+          } else {
+            why = 'round trip';
+            if (stats.fails.length < 50) stats.fails.push({ kind: b.kind, text: text.slice(0, 200), out: out.slice(0, 200) });
+          }
+        } catch (err) {
+          why = `parse error ${mdErrorMessage(err)}`;
+        }
+      }
+      if (nodes) stats.editable++;
+      else {
+        stats.raw++;
+        nodes = [schema.nodes.fs_raw.create({ kind: b.kind }, text ? schema.text(text) : null)];
+      }
+      items.push({ start: b.start, end: b.end, kind: b.kind, opts, nodes, raw: why !== undefined, ...(why === undefined ? {} : { why }) });
+    }
+    const all = items.flatMap((i) => i.nodes);
+    if (!all.length) all.push(schema.nodes.paragraph.create());
+    const view = ctx.get(editorViewCtx);
+    // The whole document is replaced by one transaction (not a new EditorState): the plugin views of the editor (cursor,
+    // tooltips, ...) stay, so the focus and the toolbar are not lost on a reload. The nodes keep their identity.
+    mdw.loading = true;
+    try {
+      view.dispatch(view.state.tr.replaceWith(0, view.state.doc.content.size, all).setMeta('addToHistory', false));
+    } finally {
+      mdw.loading = false;
+    }
+    return { source, eol, items, stats, loadedDoc: view.state.doc };
+  });
+}
+
+/**
+ * Longest increasing subsequence of pairs [oldIndex, newIndex] sorted by newIndex.
+ * @param {number[][]} pairs
+ * @returns {number[][]}
+ */
+function mdwLisPairs(pairs) {
+  /** @type {number[]} */
+  const tails = [];
+  /** @type {number[]} */
+  const prev = new Array(pairs.length);
+  for (let i = 0; i < pairs.length; i++) {
+    let lo = 0;
+    let hi = tails.length;
+    while (lo < hi) {
+      const m = (lo + hi) >> 1;
+      if (pairs[tails[m]][0] < pairs[i][0]) lo = m + 1;
+      else hi = m;
+    }
+    prev[i] = lo > 0 ? tails[lo - 1] : -1;
+    tails[lo] = i;
+  }
+  /** @type {number[][]} */
+  const out = [];
+  for (let i = tails.length ? tails[tails.length - 1] : -1; i >= 0; i = prev[i]) out.push(pairs[i]);
+  return out.reverse();
+}
+
+/**
+ * Text edits that turn model.source into the Markdown of the current editor document. Untouched blocks (same node
+ * objects, same order) are never serialized; each changed region is serialized and trimmed to its common prefix / suffix.
+ * `next` is the model after the edits (committed when the host accepts them).
+ * @param {any} editor
+ * @param {MdwModules} mw
+ * @param {MdwModel} model
+ * @returns {{ edits: MdTextEdit[], next: MdwModel }}
+ */
+function mdwComputeEdits(editor, mw, model) {
+  return editor.action((/** @type {any} */ ctx) => {
+    const doc = ctx.get(mw.core.editorViewCtx).state.doc;
+    /** @type {any[]} */
+    const cur = [];
+    doc.forEach((/** @type {any} */ n) => cur.push(n));
+    /** @type {{ node: any, ii: number }[]} */
+    const flat = [];
+    model.items.forEach((it, ii) => it.nodes.forEach((n) => flat.push({ node: n, ii })));
+    const where = new Map(cur.map((n, i) => [n, i]));
+    /** @type {number[][]} */
+    const pairs = [];
+    /** @type {Set<number>} */
+    const usedNew = new Set();
+    /** @type {number[]} */
+    const unmatchedOld = [];
+    flat.forEach((f, oi) => {
+      const ni = where.get(f.node);
+      if (ni !== undefined && !usedNew.has(ni)) {
+        pairs.push([oi, ni]);
+        usedNew.add(ni);
+      } else unmatchedOld.push(oi);
+    });
+    // Second chance: plugins (e.g. the heading-id sync) replace nodes without changing their Markdown. Match the rest by
+    // a structural key without the derived `id` attribute.
+    if (unmatchedOld.length) {
+      const keyOf = (/** @type {any} */ n) => JSON.stringify(n.toJSON(), (k, v) => (k === 'id' ? undefined : v));
+      /** @type {Map<string, number[]>} */
+      const freeNew = new Map();
+      cur.forEach((n, ni) => {
+        if (usedNew.has(ni)) return;
+        const k = keyOf(n);
+        const list = freeNew.get(k);
+        if (list) list.push(ni);
+        else freeNew.set(k, [ni]);
+      });
+      for (const oi of unmatchedOld) {
+        const list = freeNew.get(keyOf(flat[oi].node));
+        if (list && list.length) {
+          const ni = /** @type {number} */ (list.shift());
+          pairs.push([oi, ni]);
+        }
+      }
+    }
+    pairs.sort((a, b) => a[1] - b[1]);
+    const kept = mdwLisPairs(pairs);
+    const keptOld = new Set(kept.map((p) => p[0]));
+    const intact = model.items.map(() => true);
+    flat.forEach((f, oi) => {
+      if (!keptOld.has(oi)) intact[f.ii] = false;
+    });
+    // An intact item must also map to consecutive new nodes.
+    const newIndexOfOld = new Map(kept.map((p) => /** @type {[number, number]} */ ([p[0], p[1]])));
+    /** @type {{ ii: number, from: number, to: number }[]} */
+    const anchors = [];
+    let oi = 0;
+    model.items.forEach((it, ii) => {
+      const first = oi;
+      oi += it.nodes.length;
+      if (!intact[ii]) return;
+      const from = /** @type {number} */ (newIndexOfOld.get(first));
+      const to = /** @type {number} */ (newIndexOfOld.get(oi - 1)) + 1;
+      if (to - from !== it.nodes.length || (anchors.length && from < anchors[anchors.length - 1].to)) return;
+      anchors.push({ ii, from, to });
+    });
+    const eol = model.eol;
+    const src = model.source;
+    const sep = eol + eol;
+    /** @type {MdTextEdit[]} */
+    const edits = [];
+    /** @type {MdwItem[]} */
+    const next = [];
+    let delta = 0;
+    /** @type {{ ii: number, from: number, to: number } | null} */
+    let prev = null;
+    /** @type {Record<string, any> | undefined} */
+    let emitOpts;
+    /**
+     * @param {number} start
+     * @param {number} end
+     * @param {string} ins
+     * @param {any[] | null} newNodes
+     * @param {number} [itemOffsetInIns]
+     * @param {number} [itemLen]
+     */
+    const emit = (start, end, ins, newNodes, itemOffsetInIns = 0, itemLen = 0) => {
+      const oldText = src.slice(start, end);
+      if (newNodes) {
+        next.push({
+          start: start + delta + itemOffsetInIns,
+          end: start + delta + itemOffsetInIns + itemLen,
+          kind: newNodes.length === 1 ? newNodes[0].type.name : 'mixed',
+          opts: emitOpts,
+          nodes: newNodes,
+          raw: false,
+        });
+      }
+      if (oldText !== ins) {
+        let p = 0;
+        const max = Math.min(oldText.length, ins.length);
+        while (p < max && oldText.charCodeAt(p) === ins.charCodeAt(p)) p++;
+        // Never split a surrogate pair or a CRLF.
+        while (p > 0 && (mdwIsLow(oldText.charCodeAt(p)) || (oldText.charCodeAt(p) === 10 && oldText.charCodeAt(p - 1) === 13))) p--;
+        let s = 0;
+        while (s < max - p && oldText.charCodeAt(oldText.length - 1 - s) === ins.charCodeAt(ins.length - 1 - s)) s++;
+        while (s > 0 && (mdwIsLow(oldText.charCodeAt(oldText.length - s)) || (oldText.charCodeAt(oldText.length - s) === 10 && oldText.charCodeAt(oldText.length - s - 1) === 13))) s--;
+        edits.push({ start: start + p, end: end - s, oldText: oldText.slice(p, oldText.length - s), text: ins.slice(p, ins.length - s) });
+      }
+      delta += ins.length - oldText.length;
+    };
+    for (const a of [...anchors, null]) {
+      const oldFrom = prev ? prev.ii + 1 : 0;
+      const oldTo = a ? a.ii : model.items.length;
+      const newFrom = prev ? prev.to : 0;
+      const newTo = a ? a.from : cur.length;
+      if (oldTo > oldFrom || newTo > newFrom) {
+        let nodes = cur.slice(newFrom, newTo);
+        // A lone empty paragraph at the very end (a ProseMirror artefact) is not text.
+        if (!a && nodes.length && nodes[nodes.length - 1].type.name === 'paragraph' && nodes[nodes.length - 1].content.size === 0) nodes = nodes.slice(0, -1);
+        // A re-serialized region keeps the style of the block it replaces (or of the block before it).
+        emitOpts = oldTo > oldFrom ? model.items[oldFrom].opts : prev ? model.items[prev.ii].opts : undefined;
+        let text = nodes.length ? mdwSerializeNodes(mw, ctx, nodes, emitOpts) : '';
+        if (oldTo - oldFrom === 1 && nodes.length === 1 && nodes[0].type.name === 'table') {
+          text = mdwKeepTableDelimiters(text, src.slice(model.items[oldFrom].start, model.items[oldFrom].end).replace(/\r\n?/g, '\n'));
+        }
+        text = text.replace(/\n/g, eol);
+        if (oldTo > oldFrom) {
+          let start = model.items[oldFrom].start;
+          let end = model.items[oldTo - 1].end;
+          if (!nodes.length) {
+            if (prev) start = model.items[prev.ii].end;
+            else if (a) end = model.items[a.ii].start;
+            emit(start, end, '', null);
+          } else {
+            // Never let a changed block merge with a neighbour that follows / precedes it without a blank line.
+            const lazy = (/** @type {MdwItem | undefined} */ it) => !!it && /^(paragraph|blockquote|bullet_list|ordered_list|gap)$/.test(it.kind || '');
+            const blank = /\r?\n[ \t]*\r?\n/;
+            const head = prev && !blank.test(src.slice(model.items[prev.ii].end, start)) && (nodes[0].type.name === 'paragraph' || lazy(model.items[prev.ii])) ? eol : '';
+            const tail = a && !blank.test(src.slice(end, model.items[a.ii].start)) && nodes[nodes.length - 1].type.name === 'paragraph' ? eol : '';
+            emit(start, end, head + text + tail, nodes, head.length, text.length);
+          }
+        } else if (nodes.length) {
+          if (prev) {
+            const at = model.items[prev.ii].end;
+            // A blank line on BOTH sides, so the new block never merges with its neighbours.
+            const after = a ? src.slice(at, model.items[a.ii].start) : '';
+            const needTail = a && !/\r?\n[ \t]*\r?\n/.test(after);
+            emit(at, at, sep + text + (needTail ? eol : ''), nodes, sep.length, text.length);
+          } else if (a) {
+            const at = model.items[a.ii].start;
+            emit(at, at, text + sep, nodes, 0, text.length);
+          } else emit(0, src.length, text, nodes, 0, text.length);
+        }
+      }
+      if (a) {
+        const it = model.items[a.ii];
+        next.push({ ...it, nodes: cur.slice(a.from, a.to), start: it.start + delta, end: it.end + delta });
+      }
+      prev = a;
+    }
+    const source = mdwApplyEdits(src, edits);
+    next.sort((x, y) => x.start - y.start);
+    return { edits, next: { source, eol, items: next } };
+  });
+}
+
+/**
+ * @param {string} source
+ * @param {MdTextEdit[]} edits
+ */
+function mdwApplyEdits(source, edits) {
+  let out = source;
+  for (const e of [...edits].sort((a, b) => b.start - a.start)) {
+    if (out.slice(e.start, e.end) !== e.oldText) throw new Error(`oldText mismatch at ${e.start}`);
+    out = out.slice(0, e.start) + e.text + out.slice(e.end);
+  }
+  return out;
+}
+
+/**
+ * Offset of the start of 0-based source `line` (a line break is \n, \r\n or a lone \r).
+ * @param {string} source
+ * @param {number} line
+ */
+function mdwOffsetOfLine(source, line) {
+  let offset = 0;
+  for (let l = 0; l < line && offset < source.length; l++) {
+    const lf = source.indexOf('\n', offset);
+    const cr = source.indexOf('\r', offset);
+    let end = lf < 0 ? cr : cr < 0 ? lf : Math.min(lf, cr);
+    if (end < 0) return source.length;
+    end += source.charCodeAt(end) === 13 && source.charCodeAt(end + 1) === 10 ? 2 : 1;
+    offset = end;
+  }
+  return offset;
+}
+
+/**
+ * 0-based source line of an offset.
+ * @param {string} source
+ * @param {number} offset
+ */
+function mdwLineOfOffset(source, offset) {
+  let line = 0;
+  const end = Math.min(offset, source.length);
+  for (let i = 0; i < end; i++) {
+    const c = source.charCodeAt(i);
+    if (c === 13) {
+      if (source.charCodeAt(i + 1) === 10) i++;
+      line++;
+    } else if (c === 10) line++;
+  }
+  return line;
+}
+
+// ----- MARKDOWN: WYSIWYG EDITOR -----
+// The WYSIWYG editor is Milkdown Crepe 7.22.3 with the minimal feature set only (list item, link tooltip, toolbar,
+// table, cursor, block edit, placeholder): no CodeMirror, LaTeX, image block, top bar or AI (D-037). Everything is
+// loaded lazily (dist/chunks/), only when WYSIWYG opens. `remark-stringify` / `remark-gfm` come from the same module
+// graph as Milkdown, so the editor can find their serializer attachers by object identity (contract §9.3).
+
+/**
+ * @typedef {object} MdwModules
+ * @property {typeof import('@milkdown/crepe/builder')} builder
+ * @property {typeof import('@milkdown/crepe/feature/list-item')} listItem
+ * @property {typeof import('@milkdown/crepe/feature/link-tooltip')} linkTooltip
+ * @property {typeof import('@milkdown/crepe/feature/toolbar')} toolbar
+ * @property {typeof import('@milkdown/crepe/feature/table')} table
+ * @property {typeof import('@milkdown/crepe/feature/cursor')} cursor
+ * @property {typeof import('@milkdown/crepe/feature/block-edit')} blockEdit
+ * @property {typeof import('@milkdown/crepe/feature/placeholder')} placeholder
+ * @property {typeof import('@milkdown/kit/core')} core
+ * @property {typeof import('@milkdown/kit/transformer')} transformer
+ * @property {typeof import('@milkdown/kit/utils')} utils
+ * @property {typeof import('@milkdown/kit/prose/state')} proseState
+ * @property {typeof import('@milkdown/kit/plugin/history')} history
+ * @property {typeof import('@milkdown/kit/plugin/trailing')} trailing
+ * @property {typeof import('@milkdown/kit/plugin/upload')} upload
+ * @property {typeof import('remark-stringify')} remarkStringify
+ * @property {typeof import('remark-gfm')} remarkGfm
+ */
+
+/** @type {Promise<MdwModules> | null} */
+let mdwLoading = null;
+
+/**
+ * Loads the WYSIWYG editor modules (one lazy load per page; a failed load can be retried).
+ * @returns {Promise<MdwModules>}
+ */
+function mdwLoad() {
+  if (!mdwLoading) {
+    mdwLoading = Promise.all([
+      import('@milkdown/crepe/builder'),
+      import('@milkdown/crepe/feature/list-item'),
+      import('@milkdown/crepe/feature/link-tooltip'),
+      import('@milkdown/crepe/feature/toolbar'),
+      import('@milkdown/crepe/feature/table'),
+      import('@milkdown/crepe/feature/cursor'),
+      import('@milkdown/crepe/feature/block-edit'),
+      import('@milkdown/crepe/feature/placeholder'),
+      import('@milkdown/kit/core'),
+      import('@milkdown/kit/transformer'),
+      import('@milkdown/kit/utils'),
+      import('@milkdown/kit/prose/state'),
+      import('@milkdown/kit/plugin/history'),
+      import('@milkdown/kit/plugin/trailing'),
+      import('@milkdown/kit/plugin/upload'),
+      import('remark-stringify'),
+      import('remark-gfm'),
+    ]).then(
+      ([builder, listItem, linkTooltip, toolbar, table, cursor, blockEdit, placeholder, core, transformer, utils,
+        proseState, history, trailing, upload, remarkStringify, remarkGfm]) => ({
+        builder, listItem, linkTooltip, toolbar, table, cursor, blockEdit, placeholder, core, transformer, utils,
+        proseState, history, trailing, upload, remarkStringify, remarkGfm,
+      }),
+      (err) => {
+        mdwLoading = null; // allow a retry
+        throw err;
+      },
+    );
+  }
+  return mdwLoading;
+}
+
+// ----- WYSIWYG state and flow -----
+// (contract §9.3, §9.5) The editor is created on first use and kept while the view lives. Typing is flushed to the host
+// 400 ms after the last change (at once on Enter, blur, a mode switch, `pagehide`, `visibilitychange`, `flushRequest` and
+// the key commands; never during IME composition); one edit is in flight at a time and the next one is computed from the
+// editor again when it is answered. The editor never keeps an undo history: Ctrl/Cmd+Z, Ctrl+Y, Ctrl/Cmd+Shift+Z and
+// Ctrl/Cmd+S flush, then ask the host (`command`) to run VS Code's undo / redo / save after the queued edit.
+
+const MD_WYSIWYG_FLUSH_MS = 400;
+/** An edit the host does not answer within this time is given up (the editor is reloaded from the source). */
+const MD_WYSIWYG_ANSWER_MS = 15_000;
+const MD_WYSIWYG_LOAD_FAILED = 'The WYSIWYG editor could not be loaded.';
+const MD_WYSIWYG_CHANGED = 'WYSIWYG cannot open this file without changing it. Use Split.';
+const MD_WYSIWYG_FILE_CHANGED = 'The file changed; your last change was not applied.';
+const MD_WYSIWYG_IMAGE_REFUSED = 'Pasting files is not supported here; add the image as a Markdown link.';
+
+const mdw = {
+  /** @type {MdwModules | null} */
+  mw: null,
+  /** @type {any} */
+  editor: null,
+  /** @type {HTMLElement | null} */
+  holder: null,
+  /** @type {MdwModel | null} */
+  model: null,
+  /** The editor shows the current document and may be typed in (or is read-only on purpose). */
+  ready: false,
+  /** Why the editor could not open (shown in the status line). */
+  failure: '',
+  readonly: true,
+  /** The document version the model was made from / last accepted edit. */
+  version: 0,
+  nextEditId: 0,
+  /** @type {{ editId: number, next: MdwModel, timer: number } | null} */
+  inflight: null,
+  /** @type {(() => void)[]} */
+  waiters: [],
+  /** @type {MdMessage | null} */
+  deferred: null,
+  timer: 0,
+  composing: false,
+  flushSoon: false,
+  /** Bumped by every enter / leave: an async step of an older one stops. */
+  session: 0,
+  /** The document is being replaced by mdwLoadModel (not a change by the user). */
+  loading: false,
+};
+
+/**
+ * Starts the editor for the current mode (called when the mode becomes WYSIWYG and when the view is shown in it).
+ * Loads the lazy chunk, creates the editor once, builds the document from the host's blocks and runs the self-check.
+ */
+async function mdwEnter() {
+  const frame = mdFrame;
+  if (!frame) return;
+  const session = ++mdw.session;
+  mdw.failure = '';
+  mdw.ready = false;
+  mdShowStatus();
+  /** @type {MdwModules} */
+  let mw;
+  try {
+    mw = await mdwLoad();
+  } catch (err) {
+    logError('Could not load the WYSIWYG editor', err);
+    if (session === mdw.session) mdFallbackToPreview(MD_WYSIWYG_LOAD_FAILED);
+    return;
+  }
+  if (session !== mdw.session || mdState.mode !== 'wysiwyg' || mdFrame !== frame) return;
+  mdw.mw = mw;
+  // The blocks arrive with the host's answer to `setMode` (or with the init): until then the preview stays.
+  if (!mdx.blocks) return;
+  try {
+    if (!mdw.editor) await mdwCreate(mw, frame, session);
+    if (session !== mdw.session || mdState.mode !== 'wysiwyg') return;
+    const loaded = mdwLoadSource(mdState.source, mdx.blocks, mdx.eol);
+    if (!loaded) {
+      mdFallbackToPreview(MD_WYSIWYG_CHANGED);
+      return;
+    }
+    mdw.version = mdState.version;
+    mdw.ready = true;
+    mdwShow(true);
+    mdwApplyReadonly();
+    mdFrameRefresh();
+    mdTocCurrentSoon();
+  } catch (err) {
+    logError('Could not open the WYSIWYG editor', err);
+    mdw.failure = MD_WYSIWYG_LOAD_FAILED;
+    mdFallbackToPreview(MD_WYSIWYG_LOAD_FAILED);
+  }
+}
+
+/**
+ * Creates the Crepe editor (minimal feature set, no history / trailing / upload) in the frame's holder.
+ * @param {MdwModules} mw
+ * @param {MdFrame} frame
+ * @param {number} session
+ */
+async function mdwCreate(mw, frame, session) {
+  const { CrepeBuilder } = mw.builder;
+  const holder = h('div', { class: 'md-wysiwyg-editor' });
+  frame.wysiwyg.replaceChildren(holder);
+  const builder = new CrepeBuilder({ root: holder, defaultValue: '' });
+  builder
+    .addFeature(mw.listItem.listItem)
+    .addFeature(mw.linkTooltip.linkTooltip)
+    .addFeature(mw.toolbar.toolbar)
+    .addFeature(mw.table.table)
+    .addFeature(mw.cursor.cursor)
+    .addFeature(mw.blockEdit.blockEdit)
+    .addFeature(mw.placeholder.placeholder);
+  const editor = builder.editor;
+  for (const plugin of mdwPlugins(mw, {
+    onChange: mdwOnChange,
+    onRefuse: (text) => mdFlash(text),
+    resolveImage: mdwResolveImage,
+  })) {
+    editor.use(plugin);
+  }
+  // No undo history of its own and no trailing paragraph: the document's undo is VS Code's, and the file never gets a
+  // line the user did not type. Nothing is uploaded: a dropped or pasted file is refused (mdwPlugins).
+  await editor.remove(mw.history.history);
+  await editor.remove(mw.trailing.trailing);
+  editor.config((/** @type {any} */ ctx) =>
+    ctx.update(mw.upload.uploadConfig.key, (/** @type {any} */ p) => ({
+      ...p,
+      uploader: async () => {
+        mdFlash(MD_WYSIWYG_IMAGE_REFUSED);
+        return [];
+      },
+    })),
+  );
+  await builder.create();
+  if (session !== mdw.session || !mdFrame) {
+    void builder.destroy();
+    return;
+  }
+  if (!mdwCheckIdentity(editor, mw)) {
+    void builder.destroy();
+    throw new Error('the editor does not use the remark modules of this script');
+  }
+  mdw.editor = builder;
+  mdw.holder = holder;
+  // Test seam: a test page defines `globalThis.__fsTestHooks = {}` before this script runs; the editor then registers
+  // itself there (the webview tests drive ProseMirror transactions through it). Without it nothing is exposed.
+  const testHooks = /** @type {any} */ (globalThis).__fsTestHooks;
+  if (testHooks && typeof testHooks === 'object') {
+    testHooks.mdw = { mw, editor: builder.editor, state: mdw, computeEdits: () => mdwComputeEdits(builder.editor, mw, /** @type {MdwModel} */ (mdw.model)) };
+  }
+  // Keys, composition, links and focus: on the holder, in the capture phase where VS Code must not see the key.
+  listen(holder, 'keydown', mdwOnKeyDown, true);
+  listen(holder, 'keydown', mdwOnEscape, true);
+  listen(holder, 'beforeinput', mdwOnBeforeInput, true);
+  listen(holder, 'compositionstart', () => (mdw.composing = true), true);
+  listen(holder, 'compositionend', () => {
+    mdw.composing = false;
+    mdwSchedule();
+  }, true);
+  listen(holder, 'click', mdwOnClick, true);
+  listen(holder, 'auxclick', mdwOnClick, true);
+  listen(holder, 'focusout', () => void mdwFlush(), true);
+  listen(frame.wysiwyg, 'scroll', mdTocCurrentSoon, { passive: true });
+  listen(document, 'visibilitychange', () => {
+    if (document.visibilityState === 'hidden') void mdwFlush();
+  });
+  listen(window, 'pagehide', () => void mdwFlush());
+}
+
+/**
+ * Makes the editor show `source` (blocks from the host) and runs the load self-check: serializing the document right after
+ * the load must give no edit at all, else the file would change without a keystroke.
+ * @param {string} source
+ * @param {MdSourceBlock[]} blocks
+ * @param {string} eol
+ * @returns {boolean} false: the editor cannot show this file without changing it
+ */
+function mdwLoadSource(source, blocks, eol) {
+  const mw = mdw.mw;
+  const editor = mdw.editor?.editor;
+  if (!mw || !editor) return false;
+  const view = editor.action((/** @type {any} */ ctx) => ctx.get(mw.core.editorViewCtx));
+  const before = view.state.selection.from;
+  const model = mdwLoadModel(editor, mw, source, blocks, eol);
+  const { edits } = mdwComputeEdits(editor, mw, model);
+  if (edits.length) {
+    logError(`WYSIWYG self-check failed: ${edits.length} edit(s) right after the load: ${JSON.stringify(edits[0]).slice(0, 300)}`);
+    return false;
+  }
+  mdw.model = model;
+  const size = view.state.doc.content.size;
+  try {
+    const { TextSelection } = mw.proseState;
+    view.dispatch(view.state.tr.setSelection(TextSelection.near(view.state.doc.resolve(Math.min(before, size)))).setMeta('addToHistory', false));
+  } catch {
+    // the caret goes to the start: no harm
+  }
+  if (model.stats) log('info', `WYSIWYG: ${model.stats.editable} editable and ${model.stats.raw} protected blocks of ${model.stats.blocks}`);
+  return true;
+}
+
+/** @param {string} src the image path as written in the Markdown */
+function mdwResolveImage(src) {
+  if (!src || MD_SCHEME_RE.test(src) || src.startsWith('//') || src.startsWith('#') || !mdx.resourceBase) return src;
+  const path = src.split(/[?#]/)[0];
+  if (/^[a-z]:[\\/]/i.test(path) || path.startsWith('/') || path.startsWith('\\')) return src;
+  try {
+    return new URL(path, new URL(mdx.resourceBase, location.href)).toString();
+  } catch {
+    return src;
+  }
+}
+
+// ----- WYSIWYG: typing -> edits -----
+
+/** A change of the editor document (called by the editor plugin for every transaction that changed it). */
+function mdwOnChange() {
+  if (!mdw.ready || mdw.loading) return;
+  if (mdw.flushSoon) {
+    mdw.flushSoon = false;
+    void mdwFlush();
+    return;
+  }
+  mdwSchedule();
+}
+
+function mdwSchedule() {
+  window.clearTimeout(mdw.timer);
+  mdw.timer = window.setTimeout(() => void mdwFlush(), MD_WYSIWYG_FLUSH_MS);
+}
+
+/**
+ * Sends the pending typing (as one edit) and waits for the answer; repeats while more typing came in meanwhile (at most a
+ * few rounds). Resolves when nothing is pending, the editor is read-only, or the host refused.
+ */
+async function mdwFlush() {
+  window.clearTimeout(mdw.timer);
+  for (let round = 0; round < 20; round++) {
+    if (mdw.inflight) await new Promise((resolve) => mdw.waiters.push(() => resolve(undefined)));
+    if (!mdw.ready || mdw.readonly || mdw.composing) return;
+    if (!mdwSendPending()) return;
+  }
+}
+
+/** @returns {boolean} an edit was sent */
+function mdwSendPending() {
+  const mw = mdw.mw;
+  const editor = mdw.editor?.editor;
+  const model = mdw.model;
+  if (!mw || !editor || !model || mdw.inflight) return false;
+  let result;
+  try {
+    result = mdwComputeEdits(editor, mw, model);
+  } catch (err) {
+    logError('WYSIWYG could not compute the change', err);
+    mdw.readonly = true;
+    mdFlash('FileStudio could not save your last change. The editor was reloaded from the file.');
+    mdwReloadFromSource();
+    return false;
+  }
+  if (!result.edits.length) return false;
+  const editId = ++mdw.nextEditId;
+  const timer = window.setTimeout(() => {
+    if (mdw.inflight?.editId !== editId) return;
+    logError(`WYSIWYG edit ${editId} was not answered by the host`);
+    mdwEditDone(false, 'The host did not answer; the editor was reloaded from the file.');
+  }, MD_WYSIWYG_ANSWER_MS);
+  mdw.inflight = { editId, next: result.next, timer };
+  post({ type: 'edit', editId, baseVersion: mdw.version, intent: { kind: 'mdText', edits: result.edits } });
+  return true;
+}
+
+/**
+ * The host's answer to an `edit` of this view.
+ * @param {EditResultMessage} msg
+ */
+function mdwOnEditResult(msg) {
+  if (currentKind() !== 'markdown') return;
+  const inflight = mdw.inflight;
+  if (!inflight || inflight.editId !== msg.editId) return;
+  if (msg.accepted) {
+    mdw.model = inflight.next;
+    mdw.version = msg.version;
+    mdwEditDone(true);
+  } else {
+    log('info', `WYSIWYG edit refused (${msg.code}): ${msg.reason}`);
+    mdwEditDone(false, msg.reason);
+  }
+}
+
+/**
+ * @param {boolean} accepted
+ * @param {string} [reason]
+ */
+function mdwEditDone(accepted, reason) {
+  const inflight = mdw.inflight;
+  if (inflight) window.clearTimeout(inflight.timer);
+  mdw.inflight = null;
+  const waiters = mdw.waiters.splice(0);
+  if (!accepted) {
+    // What the editor shows is not in the file: show the file again (the host sends a fresh rendering for the reasons
+    // that need one; this reload covers the others).
+    if (reason) mdFlash(reason);
+    mdw.deferred = null;
+    mdwReloadFromSource();
+  } else if (mdw.deferred) {
+    const msg = mdw.deferred;
+    mdw.deferred = null;
+    mdwOnUpdate(msg);
+  }
+  for (const resolve of waiters) resolve();
+}
+
+/** Rebuilds the editor from the latest source and blocks the host sent (they are the file as it is now). */
+function mdwReloadFromSource() {
+  if (!mdw.ready || !mdx.blocks) return;
+  const ok = mdwLoadSource(mdState.source, mdx.blocks, mdx.eol);
+  mdw.version = mdState.version;
+  if (!ok) mdFallbackToPreview(MD_WYSIWYG_CHANGED);
+}
+
+/**
+ * `markdownUpdate` of a panel in WYSIWYG mode (blocks, no html): the document changed. Our own accepted edit has the same
+ * text as the model: nothing to do. Anything else (another panel, undo, the file changed on disk) reloads the editor;
+ * typing that was not sent yet is dropped with a message.
+ * @param {MdMessage} msg
+ */
+function mdwOnUpdate(msg) {
+  if (mdw.inflight) {
+    mdw.deferred = msg; // after the answer to our edit
+    return;
+  }
+  if (!mdw.ready) {
+    if (mdState.mode === 'wysiwyg') void mdwEnter(); // the blocks have just arrived
+    return;
+  }
+  const model = mdw.model;
+  if (model && model.source === mdState.source) {
+    mdw.version = mdState.version;
+    mdwApplyReadonly();
+    return;
+  }
+  const mw = mdw.mw;
+  const editor = mdw.editor?.editor;
+  let typed = false;
+  try {
+    typed = !!(mw && editor && model && mdwComputeEdits(editor, mw, model).edits.length);
+  } catch {
+    typed = true;
+  }
+  if (typed) mdFlash(MD_WYSIWYG_FILE_CHANGED);
+  window.clearTimeout(mdw.timer);
+  mdwReloadFromSource();
+  mdwApplyReadonly();
+}
+
+/** The edit state changed (settings, read-only, the save check finished): read-only or editable, or back to Preview. */
+function mdwOnEditStateChange() {
+  if (mdState.mode !== 'wysiwyg') return;
+  const availability = mdWysiwygAvailability();
+  if (availability.state === 'disabled') {
+    void mdwFlush().then(() => mdFallbackToPreview(availability.reason));
+    return;
+  }
+  mdwApplyReadonly();
+}
+
+/** The editor is typed in only while the host allows it (`kinds` has `mdText`). */
+function mdwApplyReadonly() {
+  const mw = mdw.mw;
+  const holder = mdw.holder;
+  if (!mw || !holder || !mdw.editor) return;
+  const readonly = mdWysiwygAvailability().state !== 'ok';
+  mdw.readonly = readonly;
+  try {
+    const view = mdw.editor.editor.action((/** @type {any} */ ctx) => ctx.get(mw.core.editorViewCtx));
+    view.setProps({ editable: () => !readonly });
+  } catch (err) {
+    logError('Could not change the read-only state of the editor', err);
+  }
+  holder.classList.toggle('md-wysiwyg-readonly', readonly);
+  holder.querySelector('.ProseMirror')?.setAttribute('aria-readonly', String(readonly));
+  mdShowStatus();
+}
+
+/** The toolbar leaves WYSIWYG: pending typing is sent first. */
+async function mdwLeave() {
+  mdw.session++;
+  await mdwFlush();
+  mdw.ready = false;
+  mdwShow(false);
+}
+
+function mdwDispose() {
+  mdw.session++;
+  window.clearTimeout(mdw.timer);
+  if (mdw.inflight) window.clearTimeout(mdw.inflight.timer);
+  mdw.inflight = null;
+  for (const resolve of mdw.waiters.splice(0)) resolve();
+  mdw.deferred = null;
+  mdw.ready = false;
+  mdw.model = null;
+  mdw.failure = '';
+  const builder = mdw.editor;
+  mdw.editor = null;
+  mdw.holder = null;
+  if (builder) {
+    try {
+      void builder.destroy();
+    } catch (err) {
+      logError('Could not destroy the WYSIWYG editor', err);
+    }
+  }
+}
+
+// ----- WYSIWYG: keys, links, flush requests -----
+
+/** @param {KeyboardEvent} e */
+function mdwOnKeyDown(e) {
+  if (e.isComposing) return;
+  const mod = e.ctrlKey || e.metaKey;
+  if (!mod || e.altKey) {
+    if (e.key === 'Enter') mdw.flushSoon = true;
+    return;
+  }
+  const key = e.key.toLowerCase();
+  /** @type {'undo' | 'redo' | 'save' | null} */
+  let id = null;
+  if (key === 'z') id = e.shiftKey ? 'redo' : 'undo';
+  else if (key === 'y' && !e.shiftKey) id = 'redo';
+  else if (key === 's' && !e.shiftKey) id = 'save';
+  if (!id) return;
+  // The editor has no undo history: the key is VS Code's. Flush first, then the host runs it behind the queued edit.
+  e.preventDefault();
+  e.stopPropagation();
+  const command = id;
+  void mdwFlush().then(() => post({ type: 'command', id: command }));
+}
+
+/**
+ * Escape in the text is a way out of the editor: the focus goes to the button of the chosen mode (Tab comes back to the
+ * text). Only for a key pressed in the text itself and not yet used: the block menu takes its Escape in a listener on
+ * `window` (capture phase, before this one) and marks it as handled, and the boxes of the editor (link, toolbar) are not
+ * inside `.ProseMirror`. This runs in the capture phase because ProseMirror marks every Escape as handled itself, so
+ * after it nothing can tell a used key from an unused one.
+ * @param {KeyboardEvent} e
+ */
+function mdwOnEscape(e) {
+  if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  if (!(e.target instanceof Element) || !e.target.closest('.ProseMirror')) return;
+  const button = mdFrame?.radios[mdState.mode] ?? mdFrame?.radios.wysiwyg;
+  if (!button) return;
+  e.preventDefault();
+  e.stopPropagation();
+  button.focus();
+}
+
+/** The browser's own Undo / Redo (context menu, Edit menu) is the same as the keys. @param {InputEvent} e */
+function mdwOnBeforeInput(e) {
+  if (e.inputType !== 'historyUndo' && e.inputType !== 'historyRedo') return;
+  e.preventDefault();
+  e.stopPropagation();
+  const id = e.inputType === 'historyUndo' ? 'undo' : 'redo';
+  void mdwFlush().then(() => post({ type: 'command', id }));
+}
+
+/**
+ * A plain click in the editor only places the caret (a link is not followed); Ctrl / Cmd + click follows it through the
+ * link policy of the host. Never lets the webview navigate. @param {MouseEvent} e
+ */
+function mdwOnClick(e) {
+  const link = e.target instanceof Element ? e.target.closest('a[href]') : null;
+  if (!link) return;
+  e.preventDefault();
+  if (!(e.ctrlKey || e.metaKey) || (e.type === 'auxclick' && e.button !== 1)) return;
+  e.stopPropagation();
+  const href = (link.getAttribute('href') ?? '').trim();
+  if (!href) return;
+  if (href.startsWith('#')) {
+    let id = href.slice(1);
+    try {
+      id = decodeURIComponent(id);
+    } catch {
+      // use the raw text
+    }
+    const entry = mdState.toc.find((t) => t.slug === id) ?? mdState.toc.find((t) => t.slug.toLowerCase() === id.toLowerCase());
+    if (entry) mdwScrollToLine(entry.line);
+    return;
+  }
+  post({ type: 'openLink', href });
+}
+
+/**
+ * The host asks for the pending typing (Save All, auto save): send it, then say so.
+ * @param {number} id
+ */
+function mdwOnFlushRequest(id) {
+  if (currentKind() !== 'markdown') return;
+  const answer = () => post({ type: 'flushed', id });
+  if (mdState.mode !== 'wysiwyg' || !mdw.ready) {
+    answer();
+    return;
+  }
+  void mdwFlush().then(answer, answer);
+}
+
+// ----- WYSIWYG: position (TOC, scroll) -----
+
+/** Top-level node positions of the editor document and their DOM nodes (for the TOC and the scroll position). */
+function mdwBlockDom() {
+  const mw = mdw.mw;
+  const builder = mdw.editor;
+  if (!mw || !builder) return [];
+  const view = builder.editor.action((/** @type {any} */ ctx) => ctx.get(mw.core.editorViewCtx));
+  /** @type {{ pos: number, dom: HTMLElement | null }[]} */
+  const out = [];
+  view.state.doc.forEach((/** @type {any} */ node, /** @type {number} */ offset) => {
+    const dom = view.nodeDOM(offset);
+    out.push({ pos: offset, dom: dom instanceof HTMLElement ? dom : null });
+    void node;
+  });
+  return out;
+}
+
+/** The source item (and its first DOM node) that holds source line `line`. @param {number} line */
+function mdwItemDom(line) {
+  const model = mdw.model;
+  if (!model) return null;
+  const offset = mdwOffsetOfLine(model.source, line);
+  const blocks = mdwBlockDom();
+  let index = 0;
+  let found = null;
+  for (const item of model.items) {
+    const dom = blocks[index]?.dom ?? null;
+    if (dom && item.start <= offset) found = dom;
+    if (item.start > offset) break;
+    index += item.nodes.length;
+  }
+  return found;
+}
+
+/** Scrolls the editor to the block of a source line (a heading of the table of contents). @param {number} line */
+function mdwScrollToLine(line) {
+  const dom = mdwItemDom(line);
+  const frame = mdFrame;
+  if (!dom || !frame) return;
+  frame.wysiwyg.scrollTop += dom.getBoundingClientRect().top - frame.wysiwyg.getBoundingClientRect().top;
+  mdTocCurrentSoon();
+}
+
+/** The source line of the block at the top of the editor (for the highlighted TOC entry). */
+function mdwLineAtTop() {
+  const model = mdw.model;
+  const frame = mdFrame;
+  if (!model || !frame) return 0;
+  const blocks = mdwBlockDom();
+  const top = frame.wysiwyg.getBoundingClientRect().top;
+  let lo = 0;
+  let hi = blocks.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const dom = blocks[mid].dom;
+    if (dom && dom.getBoundingClientRect().bottom <= top + 1 + MD_TOC_TOP_SLACK) lo = mid + 1;
+    else hi = mid;
+  }
+  const nodeIndex = Math.min(lo, blocks.length - 1);
+  let index = 0;
+  for (const item of model.items) {
+    if (nodeIndex < index + item.nodes.length) return mdwLineOfOffset(model.source, item.start);
+    index += item.nodes.length;
+  }
+  return 0;
 }
 
 // ===== DOCX =====

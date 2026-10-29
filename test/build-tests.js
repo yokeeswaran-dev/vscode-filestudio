@@ -64,12 +64,39 @@ const exportSession = {
   },
 };
 
+// Counts the Markdown parses (in memory; src/ is not changed): every `MarkdownIt.prototype.parse` call pushes the length of
+// its source to `globalThis.__fsMdParses`. Tests that guard the cost of a rendering (a document is parsed once, not
+// three times) clear the array, run the code, and count the entries that are as long as the whole document.
+const countMarkdownParses = {
+  name: 'count-markdown-parses',
+  setup(build) {
+    build.onLoad({ filter: /[\\/]renderers[\\/]markdown\.ts$/ }, async (args) => {
+      const src = await fs.promises.readFile(args.path, 'utf8');
+      const hook =
+        '\n;(() => {\n' +
+        '  const g = globalThis as unknown as { __fsMdParses?: number[] };\n' +
+        '  g.__fsMdParses ??= [];\n' +
+        '  const proto = (MarkdownIt as unknown as { prototype: { parse: (s: string, e: unknown) => unknown; __fsCounted?: boolean } }).prototype;\n' +
+        '  if (proto.__fsCounted) return;\n' +
+        '  proto.__fsCounted = true;\n' +
+        '  const original = proto.parse;\n' +
+        '  proto.parse = function (this: unknown, s: string, e: unknown) {\n' +
+        '    g.__fsMdParses!.push(String(s).length);\n' +
+        '    return original.call(this, s, e);\n' +
+        '  };\n' +
+        '})();\n';
+      return { contents: src + hook, loader: 'ts' };
+    });
+  },
+};
+
 const common = { absWorkingDir: ROOT, outdir: OUT, bundle: true, platform: 'node', format: 'cjs', target: 'node18', logLevel: 'warning' };
 
 Promise.all([
   esbuild.build({
     ...common,
     entryPoints: Object.fromEntries(RENDERERS.map((name) => [name, path.join(ROOT, 'src', 'renderers', `${name}.ts`)])),
+    plugins: [countMarkdownParses],
   }),
   esbuild.build({
     ...common,
@@ -90,6 +117,6 @@ Promise.all([
       loader: 'ts',
     },
     external: ['vscode'],
-    plugins: [exportSession],
+    plugins: [exportSession, countMarkdownParses],
   }),
 ]).catch(() => process.exit(1));

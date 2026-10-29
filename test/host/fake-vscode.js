@@ -123,9 +123,15 @@ class Position {
   }
 }
 class Range {
-  constructor(startLine, startCharacter, endLine, endCharacter) {
-    this.start = new Position(startLine, startCharacter);
-    this.end = new Position(endLine, endCharacter);
+  /** Like VS Code: (startLine, startCharacter, endLine, endCharacter) or (start: Position, end: Position). */
+  constructor(a, b, c, d) {
+    if (typeof a === 'number') {
+      this.start = new Position(a, b);
+      this.end = new Position(c, d);
+    } else {
+      this.start = a;
+      this.end = b;
+    }
   }
 }
 class WorkspaceEdit {
@@ -155,6 +161,7 @@ const FileType = { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 };
 // enums the F code uses.
 const ExtensionMode = { Production: 1, Development: 2, Test: 3 };
 const EndOfLine = { LF: 1, CRLF: 2 };
+const TextEditorRevealType = { Default: 0, InCenter: 1, InCenterIfOutsideViewport: 2, AtTop: 3 };
 const ViewColumn = { Active: -1, Beside: -2, One: 1, Two: 2, Three: 3 };
 class TabInputText {
   constructor(uri) {
@@ -275,11 +282,40 @@ function createFileSystemWatcher(pattern, ignoreCreate = false, ignoreChange = f
 // ===== TEXT DOCUMENTS =====
 
 const onDidChangeTextDocument = new EventEmitter();
+const onWillSaveTextDocument = new EventEmitter();
 class FakeTextDocument {
   constructor(uri, text) {
     this.uri = uri;
     this.text = text;
     this.version = 1;
+    /** Like TextDocument: false until an edit is made; tests set it (a reload from disk leaves it false). */
+    this.isDirty = false;
+    this.eol = text.includes('\r\n') ? EndOfLine.CRLF : EndOfLine.LF;
+    this.encoding = 'utf8';
+  }
+  /** Position of an offset (\n, \r\n and \r each count as one line break, like VS Code). */
+  positionAt(offset) {
+    let line = 0;
+    let lineStart = 0;
+    for (let i = 0; i < offset && i < this.text.length; i++) {
+      const ch = this.text[i];
+      if (ch === '\r' && this.text[i + 1] === '\n') continue;
+      if (ch === '\n' || ch === '\r') {
+        line++;
+        lineStart = i + 1;
+      }
+    }
+    return new Position(line, offset - lineStart);
+  }
+  async save() {
+    record('save', this.uri.fsPath);
+    // VS Code's save participants first (Save All / auto save ask the editors to flush).
+    const waits = [];
+    onWillSaveTextDocument.fire({ document: this, reason: 1, waitUntil: (p) => waits.push(Promise.resolve(p)) });
+    await Promise.all(waits);
+    fs.writeFileSync(this.uri.fsPath, this.text);
+    this.isDirty = false;
+    return true;
   }
   getText() {
     return this.text;
@@ -297,9 +333,10 @@ class FakeTextDocument {
     return offset + position.character;
   }
   /** Replaces the text (an edit, or another program changing the file) and fires onDidChangeTextDocument. */
-  setText(text) {
+  setText(text, dirty = true) {
     this.text = text;
     this.version++;
+    this.isDirty = dirty;
     onDidChangeTextDocument.fire({ document: this, contentChanges: [{ text }], reason: undefined });
   }
 }
@@ -415,6 +452,17 @@ const registrations = { providers: [], commands: new Map() };
 const quickPick = { answer: (items) => items[0] };
 const workspaceFolders = [];
 
+const onDidChangeVisibleRanges = new EventEmitter();
+/** A fake TextEditor: records revealRange calls. */
+function makeEditor(document) {
+  return {
+    document,
+    visibleRanges: [new Range(0, 0, 10, 0)],
+    revealRange(range, type) {
+      record('revealRange', range.start.line, type);
+    },
+  };
+}
 const window = {
   createOutputChannel: (name, options) => createLogChannel(name, options),
   showInformationMessage: async (message) => record('info', message),
@@ -430,6 +478,19 @@ const window = {
   },
   tabGroups,
   activeTextEditor: undefined,
+  /** TextEditors VS Code shows: { document, visibleRanges, revealRange(range, type) }. */
+  visibleTextEditors: [],
+  onDidChangeTextEditorVisibleRanges: onDidChangeVisibleRanges.event,
+  async showTextDocument(document, options) {
+    record('showTextDocument', document.uri.fsPath, options?.viewColumn, options?.preserveFocus, options?.preview);
+    const editor = makeEditor(document);
+    window.visibleTextEditors.push(editor);
+    return editor;
+  },
+  setStatusBarMessage(text) {
+    record('statusBar', text);
+    return { dispose() {} };
+  },
 };
 
 const workspace = {
@@ -438,6 +499,14 @@ const workspace = {
   getConfiguration,
   onDidChangeConfiguration: onDidChangeConfiguration.event,
   onDidChangeTextDocument: onDidChangeTextDocument.event,
+  onWillSaveTextDocument: onWillSaveTextDocument.event,
+  /** VS Code's text codec (utf8 only here). */
+  async encode(text) {
+    return new Uint8Array(Buffer.from(text, 'utf8'));
+  },
+  async decode(bytes) {
+    return Buffer.from(bytes).toString('utf8');
+  },
   get textDocuments() {
     return [...textDocuments.values()];
   },
@@ -452,7 +521,7 @@ const workspace = {
       const text = document.getText();
       const from = document.offsetAt(e.range.start);
       const to = document.offsetAt(e.range.end);
-      document.setText(text.slice(0, from) + e.text + text.slice(to));
+      document.setText(text.slice(0, from) + e.text + text.slice(to), true);
     }
     return true;
   },
@@ -487,6 +556,7 @@ function reset() {
   registrations.providers.length = 0;
   registrations.commands.clear();
   quickPick.answer = (items) => items[0];
+  window.visibleTextEditors.length = 0;
 }
 
 module.exports = {
@@ -501,6 +571,7 @@ module.exports = {
   FileSystemError,
   FileType,
   ViewColumn,
+  TextEditorRevealType,
   TabInputText,
   TabInputTextDiff,
   TabInputCustom,
@@ -522,6 +593,18 @@ module.exports = {
     workspaceFolders,
     quickPick,
     FakeTextDocument,
+    makeEditor,
+    /** Fires onWillSaveTextDocument like a save does; resolves when every waitUntil promise has settled. */
+    async fireWillSave(document) {
+      const waits = [];
+      onWillSaveTextDocument.fire({ document, reason: 1, waitUntil: (p) => waits.push(Promise.resolve(p)) });
+      await Promise.all(waits);
+    },
+    /** Fires onDidChangeTextEditorVisibleRanges: the editor now shows lines startLine.. */
+    fireVisibleRanges: (textEditor, startLine) => {
+      textEditor.visibleRanges = [new Range(startLine, 0, startLine + 10, 0)];
+      onDidChangeVisibleRanges.fire({ textEditor, visibleRanges: textEditor.visibleRanges });
+    },
     createPanel,
     addTab,
     reset,

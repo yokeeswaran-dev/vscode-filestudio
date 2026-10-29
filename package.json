@@ -261,12 +261,12 @@
           ],
           "enumDescriptions": [
             "Rendered preview.",
-            "Planned for 0.2.0. For now the same as preview.",
-            "Planned for 0.2.0 (editing). For now the same as preview."
+            "Preview with VS Code's text editor beside it; scrolling is synced.",
+            "Edit the rendered document directly (WYSIWYG). Only changed blocks are written back."
           ],
           "default": "preview",
           "scope": "resource",
-          "description": "Mode used when a Markdown file is opened with FileStudio. Only preview is available in this release; split and wysiwyg arrive in 0.2.0."
+          "description": "Mode used when a Markdown file is opened with FileStudio. The toolbar can switch the mode of each open view."
         },
         "fileStudio.xlsx.backupOnSave": {
           "type": "boolean",
@@ -290,7 +290,8 @@
     "test:webview": "npm run build && node test/build-tests.js && cd test/webview && node --test --test-concurrency=1 --test-reporter=spec \"*.webview.test.js\""
   },
   "dependencies": {
-    "@borgar/fx": "5.1.3",
+    "@milkdown/crepe": "7.22.3",
+    "@milkdown/kit": "7.22.3",
     "dompurify": "^3.4.16",
     "echarts": "^6.1.0",
     "exceljs": "^4.4.0",
@@ -305,7 +306,10 @@
     "papaparse": "^5.7.0",
     "pdfjs-dist": "^6.4.299",
     "pptxtojson": "^2.2.0",
-    "ssf": "^0.11.2"
+    "remark-gfm": "4.0.1",
+    "remark-stringify": "11.0.0",
+    "ssf": "^0.11.2",
+    "@borgar/fx": "5.1.3"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",

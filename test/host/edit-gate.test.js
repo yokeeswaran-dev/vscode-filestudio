@@ -277,7 +277,7 @@ test('kill switch: a task toggle is refused (with the reason) when Markdown edit
   T.config.set('fileStudio.markdown.editing', true);
   T.fireConfigChange(['fileStudio.markdown.editing']);
   const enabled = await waitFor(() => lastOf(panel, 'markdownUpdate'), 3000, 'markdownUpdate');
-  assert.deepEqual([enabled.readOnly, enabled.editState], [false, { editable: true, kinds: [] }]);
+  assert.deepEqual([enabled.readOnly, enabled.editState], [false, { editable: true, kinds: ['mdText'] }]); // P6: WYSIWYG edits are allowed
   const applied = await toggle(panel, 0, true, 1);
   assert.equal(applied.applied, true);
   assert.equal(document.getText(), '- [x] a\n- [ ] b\n');
@@ -324,7 +324,7 @@ test('test API: post() delivers a webview message and returns what was posted ba
   const { uri, document, panel } = openMarkdown(unique('api.md'), '- [ ] a\n');
   t.after(() => panel.dispose());
   await waitFor(() => lastOf(panel, 'init'), 3000, 'init');
-  assert.deepEqual(api.state(uri.toString()), { version: 1, dirty: false, editState: { editable: true, kinds: [] } });
+  assert.deepEqual(api.state(uri.toString()), { version: 1, dirty: false, editState: { editable: true, kinds: ['mdText'] } }); // P6
   const posted = await api.post(uri.toString(), { type: 'toggleTask', line: 0, checked: true, version: 1 });
   assert.deepEqual(
     posted.filter((m) => m.type === 'toggleTaskResult'),

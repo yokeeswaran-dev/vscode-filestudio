@@ -293,9 +293,17 @@ test('a Markdown init carries editState (editable) and readOnly = !editable', as
   md.panel.send({ type: 'ready' });
   const init = await waitFor(() => lastOf(md.panel, 'init'), 3000, 'markdown init');
   assert.equal(init.readOnly, false);
-  assert.deepEqual(init.editState, { editable: true, kinds: [] });
-  // mdText is P6's: not available yet, answered with the document version.
-  md.panel.send(edit({ kind: 'mdText', edits: [{ start: 0, end: 0, oldText: '', text: 'x' }] }));
+  // P6 (D-072): the first state says "checking" (task boxes work, WYSIWYG edits wait for the save check) ...
+  assert.deepEqual(init.editState, { editable: true, kinds: [], code: 'fidelity', reason: 'Checking the file…' });
+  // ... and the state after the check allows mdText.
+  const done = await waitFor(
+    () => [...md.panel.posted].reverse().find((m) => m.editState && m.editState.reason !== 'Checking the file…')?.editState,
+    3000,
+    'the save check',
+  );
+  assert.deepEqual(done, { editable: true, kinds: ['mdText'] });
+  // A malformed mdText edit is refused as invalid, answered with the document version.
+  md.panel.send(edit({ kind: 'mdText', edits: [] }));
   const result = await waitFor(() => lastOf(md.panel, 'editResult'), 3000, 'editResult');
-  assert.deepEqual([result.code, result.version], ['blocked', 1]);
+  assert.deepEqual([result.accepted, result.code, result.version], [false, 'invalid', 1]);
 });
