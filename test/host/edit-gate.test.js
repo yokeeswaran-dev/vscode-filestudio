@@ -98,10 +98,10 @@ test('checkEditable order: kill switch, then read-only (with the reason), then t
   });
   T.config.set('files.readonlyExclude', { '**/*book.xlsx': true });
   assert.deepEqual(await host.checkEditable('xlsx', uri, {}), { ok: true });
-  // Document state, in order: poisoned, lossy, fidelity (pending first), hard block.
+  // Document state, in order: poisoned, hard block (before lossy: no dead Edit anyway), lossy, fidelity (pending first).
   const gate = (s) => host.checkEditable('xlsx', uri, s);
   assert.deepEqual(await gate({ poisoned: true, lossy: { accepted: false } }), { ok: false, code: 'internal', reason: EDIT_TEXT.poisoned });
-  assert.deepEqual(await gate({ lossy: { accepted: false }, block: 'x' }), { ok: false, code: 'lossy', reason: EDIT_TEXT.lossy });
+  assert.deepEqual(await gate({ lossy: { accepted: false }, block: 'x' }), { ok: false, code: 'blocked', reason: 'x' });
   assert.deepEqual(await gate({ lossy: { accepted: true } }), { ok: true });
   const pending = { pending: true, ok: false, accepted: false, blocked: 'never' };
   assert.deepEqual(await gate({ fidelity: pending }), { ok: false, code: 'fidelity', reason: EDIT_TEXT.fidelityPending });

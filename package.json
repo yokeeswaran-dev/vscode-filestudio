@@ -272,7 +272,7 @@
           "type": "boolean",
           "default": true,
           "scope": "resource",
-          "description": "Used from 0.2.0 (editing): write <name>.xlsx.bak (once) before the first save of a workbook. This release is view-only and never saves a workbook."
+          "description": "Before the first save of a workbook, copy the original file to <name>.xlsx.bak (once; an existing .bak is never overwritten). If the copy fails, FileStudio asks before saving."
         }
       }
     }
@@ -308,6 +308,7 @@
     "pptxtojson": "^2.2.0",
     "remark-gfm": "4.0.1",
     "remark-stringify": "11.0.0",
+    "saxes": "5.0.1",
     "ssf": "^0.11.2",
     "@borgar/fx": "5.1.3"
   },

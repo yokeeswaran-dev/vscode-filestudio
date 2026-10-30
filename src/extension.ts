@@ -26,7 +26,7 @@ import {
 export function activate(context: vscode.ExtensionContext): FileStudioTestApi | undefined {
   const webviewOptions = { retainContextWhenHidden: true };
   context.subscriptions.push(
-    vscode.window.registerCustomEditorProvider(VIEW_TYPES.sheet, new SheetEditorProvider(context.extensionUri), {
+    vscode.window.registerCustomEditorProvider(VIEW_TYPES.sheet, new SheetEditorProvider(context.extensionUri, context.globalStorageUri), {
       webviewOptions,
       supportsMultipleEditorsPerDocument: true,
     }),

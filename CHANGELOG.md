@@ -26,6 +26,16 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Undo, Redo and Save work in every mode, also with **Save All**.
 - A table of contents panel shows the headings of the document. Click a heading to jump to it.
 
+#### Excel (.xlsx)
+
+- Groundwork for editing (not visible yet): workbooks are now saved by changing only the cells that were edited,
+  so charts, pivot tables, comments and other content stay exactly as they are. A file is checked before it is
+  written and is never replaced half-written. The first save keeps a copy as `<name>.xlsx.bak` (setting
+  **FileStudio > Xlsx: Backup On Save**).
+- Known limitation: a workbook with more than about 100,000 cells (used rows x columns of all sheets) or a file
+  whose sheets, strings and styles unpack to more than 25 MB opens read-only, with a banner. You can view, scroll and copy, but not edit. Saving very large
+  files safely needs a new save method; it is planned for a later version.
+
 ## [0.1.2] - 2026-10-11
 
 ### Fixed

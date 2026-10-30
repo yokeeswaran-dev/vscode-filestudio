@@ -2837,6 +2837,8 @@ interface WorkbookExtras {
   fillIndex: Map<object, number>;
   /** ExcelJS' backslash-stripped format code -> original code. */
   strippedFormats: Map<string, string>;
+  /** The bytes passed to loadWorkbook (see loadedBytes). */
+  bytes?: Uint8Array;
 }
 
 const workbookExtras = new WeakMap<object, WorkbookExtras>();
@@ -2894,6 +2896,8 @@ export interface LoadOptions {
  * notes are kept when written without runs or on cells absent from <sheetData>,
  * threaded comments are read (readThreadedComments), and the _xHHHH_ escapes
  * of inline strings and formula results are decoded (patchCellParser).
+ * Numbers in unit formats with a literal 'm' stay numbers and <b val="0"/> is
+ * read as not bold (patchDisplayFixes); loadedBytes(workbook) is `data` itself.
  */
 export async function loadWorkbook(data: Uint8Array, options?: LoadOptions): Promise<ExcelJS.Workbook> {
   const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
@@ -2902,6 +2906,7 @@ export async function loadWorkbook(data: Uint8Array, options?: LoadOptions): Pro
   patchSheetNameCheck();
   patchCommentParser();
   patchCellParser();
+  patchDisplayFixes();
   const rawParts = readRawParts(buffer, options?.folder);
   const workbook = new ExcelJS.Workbook();
   const captured: CapturedLoad = { arraysParsedBefore: arrayFormulasParsed };
@@ -2924,7 +2929,7 @@ export async function loadWorkbook(data: Uint8Array, options?: LoadOptions): Pro
     // best effort only: the workbook itself loaded
   }
   const arrayFormulas = captured.arrays ? arrayFormulasById(captured.arrays, dynamicArrayCells) : undefined;
-  workbookExtras.set(workbook, { ...buildExtras(styles, captured.styles), externalBooks, arrayFormulas, threadedNotes });
+  workbookExtras.set(workbook, { ...buildExtras(styles, captured.styles), externalBooks, arrayFormulas, threadedNotes, bytes: data });
   return workbook;
 }
 
@@ -3681,6 +3686,135 @@ function decodeXmlEntities(text: string): string {
         return String.fromCodePoint(entity[1] === 'x' ? parseInt(entity.slice(2), 16) : parseInt(entity.slice(1), 10));
     }
   });
+}
+
+// ----- display fixes (D-055) -----
+// Two ExcelJS 4.4 misreads that matter once a cell can be edited (the editor starts from the shown value):
+//  - a number whose custom format has a literal 'm' ('#,##0.00\ \m', '0\ \k\m') became a JS Date: ExcelJS strips the
+//    backslashes (style/numfmt-xform.js) before utils.isDateFmt looks for date letters (sheet/cell-xform.js
+//    reconcile). The serial lost precision, and values past the year 275760 became '#VALUE!'.
+//  - <b val="0"/>, <i val="false"/>, <strike val="0"/> (any ST_OnOff "off" value) were read as set: BooleanXform
+//    (simple/boolean-xform.js) ignores the attribute.
+// The parsers are wrapped once, for good, like the other load patches.
+
+/** ExcelJS' parser of <b>, <i>, <strike> ... (an internal module; see patchDisplayFixes). */
+interface XBooleanParser {
+  tag?: string;
+  attr?: string;
+  model?: unknown;
+  parseOpen(node: { name: string; attributes?: Record<string, string | undefined> }): unknown;
+}
+const BooleanXform = require('exceljs/lib/xlsx/xform/simple/boolean-xform') as { prototype: XBooleanParser } | undefined;
+/** ExcelJS' parser of one <numFmt> (an internal module; see patchDisplayFixes). */
+interface XNumFmtParser {
+  model?: { id?: number; formatCode?: string };
+  parseOpen(node: { name: string; attributes?: Record<string, string | undefined> }): boolean;
+}
+const NumFmtXform = require('exceljs/lib/xlsx/xform/style/numfmt-xform') as { prototype: XNumFmtParser } | undefined;
+
+/** The cell model and options ExcelJS' CellXform#reconcile works on (sheet/cell-xform.js). */
+interface XReconcileCell {
+  type?: number;
+  value?: unknown;
+  result?: unknown;
+  styleId?: number;
+}
+interface XStylesForReconcile {
+  model?: { styles?: ({ numFmtId?: number } | undefined)[]; numFmts?: ({ id?: number } | undefined)[] };
+}
+type XReconcile = (this: unknown, model: XReconcileCell, options: { styles?: XStylesForReconcile } | undefined) => void;
+
+/** ST_OnOff "off" values (the attribute is case-sensitive in the schema; read leniently). */
+const ON_OFF_FALSE_RE = /^(?:0|false|off)$/i;
+/** Each parsed <numFmt> model -> its formatCode as written in the file (escapes intact). */
+const rawFormatCodes = new WeakMap<object, string>();
+/** Per StylesXform of a load: cellXfs index -> "keep the number" (its format is not a date format for FileStudio). */
+const numberStyles = new WeakMap<object, { formatter: NumberFormatter; keep: Map<number, boolean> }>();
+let displayFixesPatched = false;
+
+/**
+ * Wraps BooleanXform#parseOpen (an "off" val gives false, which FontXform then leaves unset), NumFmtXform#parseOpen
+ * (records the file's format code) and CellXform#reconcile (a number or formula result keeps its numeric value when
+ * ExcelJS would turn it into a Date but FileStudio's own formatter does not show that format as a date; the display
+ * then formats the exact number, see StyleConverter numFmt and NumberFormatter.isDate).
+ */
+function patchDisplayFixes(): void {
+  if (displayFixesPatched) return;
+  displayFixesPatched = true;
+  const bool = BooleanXform?.prototype;
+  const boolOpen = bool?.parseOpen;
+  if (bool && typeof boolOpen === 'function') {
+    bool.parseOpen = function parseOpenOnOff(this: XBooleanParser, node): unknown {
+      const handled = boolOpen.call(this, node);
+      if (node.name === this.tag && ON_OFF_FALSE_RE.test(node.attributes?.[this.attr ?? 'val'] ?? '')) this.model = false;
+      return handled;
+    };
+  }
+  const numFmt = NumFmtXform?.prototype;
+  const numFmtOpen = numFmt?.parseOpen;
+  if (numFmt && typeof numFmtOpen === 'function') {
+    numFmt.parseOpen = function parseOpenKeepingCode(this: XNumFmtParser, node): boolean {
+      const handled = numFmtOpen.call(this, node);
+      const code = node.attributes?.formatCode;
+      if (handled && this.model && typeof this.model === 'object' && typeof code === 'string') rawFormatCodes.set(this.model, code);
+      return handled;
+    };
+  }
+  const cell = CellXform?.prototype as unknown as { reconcile?: XReconcile } | undefined;
+  const reconcile = cell?.reconcile;
+  if (cell && typeof reconcile === 'function') {
+    cell.reconcile = function reconcileKeepingNumbers(this: unknown, model, options): void {
+      const type = model?.type;
+      const value = model?.value;
+      const result = model?.result;
+      const keep =
+        ((type === VT.Number && typeof value === 'number') || (type === VT.Formula && typeof result === 'number')) &&
+        typeof model.styleId === 'number' &&
+        styleKeepsNumber(options?.styles, model.styleId);
+      reconcile.call(this, model, options);
+      if (!keep) return;
+      if (type === VT.Number) {
+        model.type = VT.Number;
+        model.value = value;
+      } else {
+        model.result = result;
+      }
+    };
+  }
+}
+
+/** Whether cells with this cellXfs index keep their number: the xf's custom format is not a date for FileStudio. */
+function styleKeepsNumber(styles: XStylesForReconcile | undefined, styleId: number): boolean {
+  if (!styles || typeof styles !== 'object') return false;
+  let cache = numberStyles.get(styles);
+  if (!cache) {
+    cache = { formatter: new NumberFormatter(false), keep: new Map() };
+    numberStyles.set(styles, cache);
+  }
+  let keep = cache.keep.get(styleId);
+  if (keep === undefined) {
+    keep = false;
+    const id = styles.model?.styles?.[styleId]?.numFmtId;
+    const list = styles.model?.numFmts;
+    if (typeof id === 'number' && Array.isArray(list)) {
+      // the last <numFmt> with this id wins, as in StylesXform's index
+      let code: string | undefined;
+      for (const entry of list) {
+        if (entry && entry.id === id) code = rawFormatCodes.get(entry) ?? code;
+      }
+      if (code !== undefined) keep = !cache.formatter.isDate(code);
+    }
+    cache.keep.set(styleId, keep);
+  }
+  return keep;
+}
+
+/**
+ * The bytes a workbook was loaded from: the very object passed to loadWorkbook (never a copy, never changed), so the
+ * host keeps exactly what the display model shows as the base of every save (contract §4.1 `base`, D-006).
+ */
+export function loadedBytes(workbook: ExcelJS.Workbook): Uint8Array | undefined {
+  return workbookExtras.get(workbook)?.bytes;
 }
 
 // ===== GRID SOURCE =====
@@ -5650,13 +5784,21 @@ const LOSSY = {
   sparklines: 'Sparklines',
   x14Cf: 'Extended conditional formats (x14)',
   controls: 'Form controls / ActiveX',
+  // lossy v2 (D-012): kept byte for byte by the surgical save, but their results go stale when cells change
+  oleObjects: 'Embedded objects (OLE)',
+  dataTables: 'What-if data tables',
+  queryTables: 'Query tables / data connections',
+  dataModel: 'Data model (Power Pivot)',
+  richValues: 'Pictures in cells / linked data types',
 } as const;
 
 const LOSSY_ORDER: string[] = Object.values(LOSSY);
 
 /**
- * Features ExcelJS cannot round-trip (they would be lost or degraded on save).
- * Reads the raw zip: part names first, then drawings and (streamed) sheet XML.
+ * Content FileStudio does not show and cannot update (lossy v2, contract §4.7, D-012): a workbook with any of it
+ * opens read-only until the user accepts "Edit anyway". Nothing of it is removed on save (the surgical save copies
+ * every part it does not edit byte for byte), but charts, pivots, links, data tables ... keep stale results.
+ * Reads the raw zip: part names first, then drawings and (streamed) sheet XML. Returns the labels in a fixed order.
  */
 export async function detectLossyFeatures(data: Uint8Array): Promise<string[]> {
   try {
@@ -5684,6 +5826,11 @@ async function scanLossyFeatures(data: Uint8Array): Promise<string[]> {
     found.add(LOSSY.threadedComments);
   }
   if (has(/^xl\/(ctrlProps|activeX)\//i)) found.add(LOSSY.controls);
+  if (has(/^xl\/embeddings\//i)) found.add(LOSSY.oleObjects);
+  if (has(/^xl\/(queryTables\/|connections\.xml$)/i)) found.add(LOSSY.queryTables);
+  if (has(/^xl\/model\//i)) found.add(LOSSY.dataModel);
+  if (has(/^xl\/richData\//i)) found.add(LOSSY.richValues);
+  const sheetFlags = [LOSSY.sparklines, LOSSY.x14Cf, LOSSY.controls, LOSSY.oleObjects, LOSSY.dataTables, LOSSY.richValues];
 
   for (const name of names) {
     const path = name.replace(/^\//, '');
@@ -5698,7 +5845,11 @@ async function scanLossyFeatures(data: Uint8Array): Promise<string[]> {
           }
         }
         if (/<(?:\w+:)?controls[\s>]/.test(text)) found.add(LOSSY.controls);
-        return found.has(LOSSY.sparklines) && found.has(LOSSY.x14Cf) && found.has(LOSSY.controls);
+        if (/<(?:\w+:)?oleObjects[\s>]/.test(text)) found.add(LOSSY.oleObjects);
+        if (text.includes('dataTable') && /<(?:\w+:)?f\s[^>]*?\bt\s*=\s*["']dataTable["']/.test(text)) found.add(LOSSY.dataTables);
+        // vm = value metadata: a picture in a cell or a linked data type (rich value)
+        if (text.includes('vm=') && /<(?:\w+:)?c\s[^>]*?\bvm\s*=/.test(text)) found.add(LOSSY.richValues);
+        return sheetFlags.every((label) => found.has(label));
       });
     }
   }
@@ -5762,4 +5913,2631 @@ function scanZipEntry(file: JSZip.JSZipObject, inspect: (text: string) => boolea
       })
       .resume();
   });
+}
+
+// ----- lossy v2 texts -----
+
+/** What happens to each kind of lossy content when cells change (the "Edit anyway" details, contract §4.7). */
+const LOSSY_GROUPS: { labels: readonly string[]; effect: string }[] = [
+  { labels: [LOSSY.charts, LOSSY.sparklines], effect: 'show the old numbers until the file is opened in Excel' },
+  { labels: [LOSSY.pivots, LOSSY.slicers], effect: 'show the old numbers until you refresh them in Excel' },
+  { labels: [LOSSY.externalLinks], effect: 'linked values stay as they were last saved until Excel updates the links' },
+  { labels: [LOSSY.dataTables, LOSSY.queryTables, LOSSY.dataModel], effect: 'results stay old until Excel recalculates or refreshes them' },
+  { labels: [LOSSY.richValues], effect: 'kept as they are; the cells that hold them cannot be changed in FileStudio' },
+];
+
+/** Banner of a workbook with lossy content (undefined: none). Replaces the 0.1.x "does not display" text. */
+export function lossyBannerText(features: readonly string[]): string | undefined {
+  if (features.length === 0) return undefined;
+  return `Nothing in this file will be removed. FileStudio does not show these objects and cannot update them: ${features.join(', ')}.`;
+}
+
+/**
+ * The "Edit anyway" question for a workbook with lossy content (EditState.canEditAnyway; the host shows `title` as a
+ * modal with `details` as its detail text): what goes stale, per kind of content, and what stays blocked (§4.7, §5.5).
+ */
+export function lossyEditAnyway(features: readonly string[]): { title: string; details: string[] } {
+  const details: string[] = [];
+  const grouped = new Set<string>();
+  for (const group of LOSSY_GROUPS) {
+    const present = group.labels.filter((label) => features.includes(label));
+    for (const label of present) grouped.add(label);
+    if (present.length) details.push(`${present.join(', ')}: ${group.effect}.`);
+  }
+  const rest = features.filter((label) => !grouped.has(label));
+  if (rest.length) details.push(`${rest.join(', ')}: kept as they are; FileStudio does not update them.`);
+  details.push('Inserting or deleting rows and columns, sorting and sheet changes stay blocked for this file.');
+  details.push('Nothing in this file will be removed.');
+  return { title: 'This workbook has content that FileStudio cannot update. Edit it anyway?', details };
+}
+
+/**
+ * Size limit for editing xlsx (0.2.0, user decision 2026-10-30). A save in the real extension host stays inside its
+ * budget (save < 5 s, longest block < 250 ms) up to about 150,000 cells (measured: 150,000 cells 0.6 s / 157 ms;
+ * 200,000: 0.7 s / 217-228 ms; 250,000: 1.0 s / 284 ms; 500,000: block 785 ms). The limit is set lower, to 100,000 cells or
+ * 25 MB of unpacked XML in the parts a save rewrites (worksheets, shared strings, styles; see xlsxEditCostBytes), for margin
+ * (see p1-save/decisions.md). Pictures and other parts a save copies raw do not count, and a small zip that unpacks to
+ * hundreds of MB of text does. Above the limit the workbook is hard read-only; the lazy / streaming save is a 0.2.1 item.
+ */
+export const XLSX_EDIT_LIMITS = { cells: 100_000, bytes: 25 * 1024 * 1024 } as const;
+
+/** Unpacked size of the parts a save rewrites (worksheets, shared strings, styles). A zip that cannot be read counts as its own size. */
+export function xlsxEditCostBytes(base: Uint8Array): number {
+  try {
+    let n = 0;
+    for (const e of parseZip(base).entries) if (/^xl\/(worksheets\/|sharedStrings|styles)/i.test(e.name)) n += e.usize;
+    return n;
+  } catch {
+    return base.length;
+  }
+}
+
+export const XLSX_TOO_LARGE_TEXT =
+  'This file is too large to edit safely in this version. You can view, scroll and copy, but not edit. Editing large files comes in a later version. It is open read-only.';
+
+/** Reason text when the workbook is over XLSX_EDIT_LIMITS, or undefined. `cells` = sum of used rows x columns of all sheets. */
+export function xlsxTooLargeReason(meta: WorkbookMeta, bytes: number): string | undefined {
+  let cells = 0;
+  for (const sheet of meta.sheets) cells += sheet.rowCount * sheet.colCount;
+  if (cells <= XLSX_EDIT_LIMITS.cells && bytes <= XLSX_EDIT_LIMITS.bytes) return undefined;
+  return XLSX_TOO_LARGE_TEXT;
+}
+
+/** Text for a workbook the save path cannot patch (`reason` from checkPatchable); there is no "Edit anyway". */
+export function hardReadOnlyText(reason: string): string {
+  if (reason === XLSX_TOO_LARGE_TEXT) return reason;
+  return `FileStudio cannot edit this file safely: ${reason}. It is open read-only.`;
+}
+
+// ===== XLSX PACKAGE =====
+//
+// Surgical xlsx save, zip layer (P1, D-006; contract §2.3, §4.2). The bytes a document loaded stay the base of every
+// save: parseZip reads the central directory, readEntry unpacks one part (size and CRC checked), and writeZip writes a
+// new package in which every unchanged entry is a raw copy of its original bytes (local header, data, data
+// descriptor; same order, same zip comment) and only rewritten parts are deflated again (zlib runs on the libuv
+// thread pool; CRCs of big buffers are computed in 8 MB slices with yields). Anything that could not be written back
+// byte-exactly (ZIP64, encryption, compression other than store/deflate, duplicate names, damage) is a ZipError:
+// such a file is hard read-only (§4.7). The imports below belong to the save sections only.
+
+import * as zlib from 'zlib';
+import { SaxesParser } from 'saxes';
+
+const ZIP_LOCAL_SIG = 0x04034b50;
+const ZIP_CENTRAL_SIG = 0x02014b50;
+const ZIP_END_SIG = 0x06054b50;
+const ZIP64_LOCATOR_SIG = 0x07064b50;
+/** Parts larger than this are deflated with level 1 (about 10x faster; the size Excel writes), others with level 6. */
+const ZIP_FAST_DEFLATE_BYTES = 4 << 20;
+/** CRCs of big buffers are computed in slices of this size, with a yield to the event loop between slices. */
+const ZIP_CRC_SLICE = 8 << 20;
+/** DOS date 1980-01-01 for parts a save adds (deterministic output). */
+const ZIP_DOS_DATE_1980 = 0x21;
+
+/** Called at every cooperative yield of the save code; it may throw to cancel (for example a cancelled backup). */
+export type SaveYieldHook = () => void;
+
+/** The package cannot be written back byte-exactly (→ hard read-only). The message is a short reason in plain English. */
+/** A part that declares more than this unpacked is refused (a small file must not allocate gigabytes). */
+const ZIP_MAX_PART_BYTES = 512 * 1024 * 1024;
+
+export class ZipError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ZipError';
+  }
+}
+
+/** One entry of the central directory. Offsets point into ZipPackage.buf. */
+export interface ZipEntry {
+  /** Part name (UTF-8 when flag bit 11 is set, else read as Latin-1; used for lookups only). */
+  name: string;
+  /** The name bytes as stored (a rewritten entry keeps them, so non-UTF-8 names stay byte-exact). */
+  nameBytes: Buffer;
+  flags: number;
+  method: number;
+  crc: number;
+  csize: number;
+  usize: number;
+  /** Offset of the local header. */
+  lho: number;
+  /** Offset of the compressed data. */
+  dataStart: number;
+  /** End of the entry's raw span: the next local header or the central directory (data descriptor included). */
+  spanEnd: number;
+  /** The whole central-directory record (46 bytes + name + extra field + comment). */
+  rec: Buffer;
+}
+
+export interface ZipPackage {
+  buf: Buffer;
+  /** Central-directory order. */
+  entries: ZipEntry[];
+  /** Local-header (file) order. */
+  byOffset: ZipEntry[];
+  cdOffset: number;
+  /** Bytes before the first local header (normally none). */
+  prefixEnd: number;
+  comment: Buffer;
+  /** Entry by part name, ignoring case (OPC part names are case-insensitive). */
+  get(name: string): ZipEntry | undefined;
+}
+
+/** A Node Buffer view of the same bytes (no copy). */
+function asNodeBuffer(data: Uint8Array): Buffer {
+  return Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+}
+
+/** Short text of any thrown value (for messages and logs). */
+function saveErrorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+const saveTick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+/** Lets the event loop run once, then calls the hook (which may throw to cancel). */
+async function saveYield(onYield?: SaveYieldHook): Promise<void> {
+  await saveTick();
+  onYield?.();
+}
+
+/** Longest stretch of save work between two yields (the budget is a 250 ms block at most, contract §4.8). */
+const SAVE_SLICE_MS = 30;
+
+/**
+ * A step counter for long loops: `step()` returns a promise to await when the loop should yield — every `every`
+ * steps, or earlier when SAVE_SLICE_MS passed since the last yield (the clock is read every 64 steps) — else undefined.
+ */
+function saveSlicer(onYield: SaveYieldHook | undefined, every: number): () => Promise<void> | undefined {
+  let n = 0;
+  let last = performance.now();
+  const pause = async (): Promise<void> => {
+    await saveYield(onYield);
+    last = performance.now();
+  };
+  return (): Promise<void> | undefined => {
+    n++;
+    if (n % every === 0) return pause();
+    if ((n & 63) === 0 && performance.now() - last >= SAVE_SLICE_MS) return pause();
+    return undefined;
+  };
+}
+
+let crcTable: Int32Array | undefined;
+
+/**
+ * CRC-32 of `data`, continuing from `prev`. Uses zlib.crc32 when the runtime has it (Node ≥ 20.15 / 22.2), else a
+ * table (o.table forces the table, for tests).
+ */
+export function crc32(data: Uint8Array, prev = 0, o?: { table?: boolean }): number {
+  if (!o?.table && typeof zlib.crc32 === 'function') {
+    return zlib.crc32(data, prev) >>> 0;
+  }
+  if (!crcTable) {
+    crcTable = new Int32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      crcTable[n] = c;
+    }
+  }
+  let c = ~prev;
+  for (let i = 0; i < data.length; i++) c = crcTable[(c ^ data[i]) & 0xff] ^ (c >>> 8);
+  return ~c >>> 0;
+}
+
+/** crc32 over a big buffer in 8 MB slices, yielding to the event loop between slices. */
+async function crc32Cooperative(data: Uint8Array, prev: number, onYield?: SaveYieldHook): Promise<number> {
+  if (data.length <= ZIP_CRC_SLICE) {
+    return crc32(data, prev);
+  }
+  for (let i = 0; i < data.length; i += ZIP_CRC_SLICE) {
+    prev = crc32(data.subarray(i, Math.min(data.length, i + ZIP_CRC_SLICE)), prev);
+    await saveYield(onYield);
+  }
+  return prev;
+}
+
+/**
+ * Reads the central directory of an xlsx package. Throws ZipError for everything a save could not copy back
+ * byte-exactly: ZIP64, multi-part zips, encrypted entries, compression other than store (0) / deflate (8),
+ * duplicate part names (ignoring case), local headers that do not match the directory, overlapping entries.
+ */
+export function parseZip(data: Uint8Array): ZipPackage {
+  const buf = asNodeBuffer(data);
+  if (buf.length < 22) {
+    throw new ZipError('it is not a zip package');
+  }
+  let eocd = -1;
+  for (let i = buf.length - 22, min = Math.max(0, buf.length - 22 - 0xffff); i >= min; i--) {
+    if (buf.readUInt32LE(i) === ZIP_END_SIG && i + 22 + buf.readUInt16LE(i + 20) === buf.length) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd < 0) {
+    throw new ZipError('it is not a zip package (no end record)');
+  }
+  if (eocd >= 20 && buf.readUInt32LE(eocd - 20) === ZIP64_LOCATOR_SIG) {
+    throw new ZipError('it is a ZIP64 package');
+  }
+  const disk = buf.readUInt16LE(eocd + 4);
+  const cdDisk = buf.readUInt16LE(eocd + 6);
+  const onDisk = buf.readUInt16LE(eocd + 8);
+  const total = buf.readUInt16LE(eocd + 10);
+  const cdSize = buf.readUInt32LE(eocd + 12);
+  const cdOffset = buf.readUInt32LE(eocd + 16);
+  if (total === 0xffff || onDisk === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) {
+    throw new ZipError('it is a ZIP64 package');
+  }
+  if (disk !== 0 || cdDisk !== 0 || onDisk !== total) {
+    throw new ZipError('it is a multi-part zip package');
+  }
+  const cdEnd = cdOffset + cdSize;
+  if (cdEnd > eocd) {
+    throw new ZipError('its zip directory is damaged');
+  }
+  const entries: ZipEntry[] = [];
+  const byName = new Map<string, ZipEntry>();
+  let p = cdOffset;
+  for (let i = 0; i < total; i++) {
+    if (p + 46 > cdEnd || buf.readUInt32LE(p) !== ZIP_CENTRAL_SIG) {
+      throw new ZipError('its zip directory is damaged');
+    }
+    const flags = buf.readUInt16LE(p + 8);
+    const method = buf.readUInt16LE(p + 10);
+    const crc = buf.readUInt32LE(p + 16);
+    const csize = buf.readUInt32LE(p + 20);
+    const usize = buf.readUInt32LE(p + 24);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    const lho = buf.readUInt32LE(p + 42);
+    const recEnd = p + 46 + nameLen + extraLen + commentLen;
+    if (recEnd > cdEnd) {
+      throw new ZipError('its zip directory is damaged');
+    }
+    const nameBytes = buf.subarray(p + 46, p + 46 + nameLen);
+    const name = nameBytes.toString(flags & 0x800 ? 'utf8' : 'latin1');
+    if (usize > ZIP_MAX_PART_BYTES && usize !== 0xffffffff) {
+      throw new ZipError(`the part ${name} is too large to read safely (${Math.round(usize / 1048576)} MB unpacked)`);
+    }
+    if (flags & 0x41) {
+      throw new ZipError(`the part ${name} is encrypted`);
+    }
+    if (csize === 0xffffffff || usize === 0xffffffff || lho === 0xffffffff) {
+      throw new ZipError('it is a ZIP64 package');
+    }
+    if (method !== 0 && method !== 8) {
+      throw new ZipError(`the part ${name} uses zip compression method ${method}`);
+    }
+    const key = name.toLowerCase();
+    if (byName.has(key)) {
+      throw new ZipError(`the part ${name} is in the package twice`);
+    }
+    if (lho + 30 > cdOffset || buf.readUInt32LE(lho) !== ZIP_LOCAL_SIG) {
+      throw new ZipError(`the zip header of ${name} is damaged`);
+    }
+    const localNameLen = buf.readUInt16LE(lho + 26);
+    const localExtraLen = buf.readUInt16LE(lho + 28);
+    if (localNameLen !== nameLen || buf.compare(nameBytes, 0, nameLen, lho + 30, lho + 30 + nameLen) !== 0) {
+      throw new ZipError(`the zip header of ${name} does not match the zip directory`);
+    }
+    const entry: ZipEntry = {
+      name, nameBytes, flags, method, crc, csize, usize, lho,
+      dataStart: lho + 30 + localNameLen + localExtraLen,
+      spanEnd: cdOffset,
+      rec: buf.subarray(p, recEnd),
+    };
+    entries.push(entry);
+    byName.set(key, entry);
+    p = recEnd;
+  }
+  const byOffset = entries.slice().sort((a, b) => a.lho - b.lho);
+  for (let i = 0; i < byOffset.length; i++) {
+    const entry = byOffset[i];
+    entry.spanEnd = i + 1 < byOffset.length ? byOffset[i + 1].lho : cdOffset;
+    if (entry.dataStart + entry.csize > entry.spanEnd) {
+      throw new ZipError(`the part ${entry.name} overlaps the next part`);
+    }
+  }
+  return {
+    buf,
+    entries,
+    byOffset,
+    cdOffset,
+    prefixEnd: byOffset.length ? byOffset[0].lho : cdOffset,
+    comment: buf.subarray(eocd + 22),
+    get: (name: string) => byName.get(name.toLowerCase()),
+  };
+}
+
+/**
+ * Inflates one entry (thread pool) straight into a buffer of its declared size, computing the CRC per output chunk:
+ * no big copy on the JS thread (a 200 MB sheet part would block it for a long time with a single concat).
+ */
+function inflateEntry(raw: Uint8Array, entry: ZipEntry): Promise<{ data: Buffer; crc: number }> {
+  return new Promise((resolve, reject) => {
+    // Unpacked into one buffer of the size the central directory gives (no 2x peak and no big Buffer.concat on the
+    // event loop, as zlib.inflateRaw would do); more or fewer bytes than that size → ZipError.
+    let out: Buffer;
+    try {
+      out = Buffer.allocUnsafe(entry.usize);
+    } catch {
+      reject(new ZipError(`the part ${entry.name} is too big`));
+      return;
+    }
+    const inflate = zlib.createInflateRaw({ chunkSize: 1 << 16 });
+    let filled = 0;
+    let crc = 0;
+    let done = false;
+    const fail = (message: string): void => {
+      if (done) return;
+      done = true;
+      inflate.destroy();
+      reject(new ZipError(`the part ${entry.name} ${message}`));
+    };
+    inflate.on('data', (chunk: Buffer) => {
+      if (done) return;
+      if (filled + chunk.length > out.length) {
+        fail('has the wrong size');
+        return;
+      }
+      chunk.copy(out, filled);
+      filled += chunk.length;
+      crc = crc32(chunk, crc);
+    });
+    inflate.on('error', (err: Error) => fail(`cannot be unpacked (${err.message})`));
+    inflate.on('end', () => {
+      if (done) return;
+      if (filled !== out.length) {
+        fail('has the wrong size');
+        return;
+      }
+      done = true;
+      resolve({ data: out, crc });
+    });
+    const SLICE = 1 << 20;
+    let pos = 0;
+    const pump = (): void => {
+      while (pos < raw.length && !done) {
+        const slice = raw.subarray(pos, Math.min(raw.length, pos + SLICE));
+        pos += slice.length;
+        if (!inflate.write(slice)) {
+          inflate.once('drain', pump);
+          return;
+        }
+      }
+      if (!done) inflate.end();
+    };
+    pump();
+  });
+}
+
+/**
+ * The unpacked bytes of one entry (inflate runs on the thread pool); size and CRC are checked (ZipError on a
+ * mismatch). A stored entry is returned as a view of the package bytes: callers never modify what they read.
+ */
+export async function readEntry(zip: ZipPackage, entry: ZipEntry, onYield?: SaveYieldHook): Promise<Buffer> {
+  const raw = zip.buf.subarray(entry.dataStart, entry.dataStart + entry.csize);
+  let out: Buffer;
+  let crc: number;
+  if (entry.method === 0) {
+    out = raw;
+    if (out.length !== entry.usize) {
+      throw new ZipError(`the part ${entry.name} has the wrong size`);
+    }
+    crc = await crc32Cooperative(out, 0, onYield);
+  } else {
+    ({ data: out, crc } = await inflateEntry(raw, entry));
+    if (out.length > ZIP_CRC_SLICE) await saveYield(onYield);
+  }
+  if (crc !== entry.crc) {
+    throw new ZipError(`the part ${entry.name} is damaged (CRC)`);
+  }
+  return out;
+}
+
+/** Deflates a list of buffers as one part (streaming, thread pool). Level 6 up to 4 MB, level 1 above. */
+function deflateParts(parts: readonly Uint8Array[], onYield?: SaveYieldHook): Promise<{ data: Buffer; crc: number; usize: number }> {
+  const usize = parts.reduce((n, part) => n + part.length, 0);
+  const level = usize > ZIP_FAST_DEFLATE_BYTES ? 1 : 6;
+  return new Promise((resolve, reject) => {
+    const deflate = zlib.createDeflateRaw({ level, memLevel: 8 });
+    const chunks: Buffer[] = [];
+    let crc = 0;
+    deflate.on('data', (chunk: Buffer) => chunks.push(chunk));
+    deflate.on('error', reject);
+    deflate.on('end', () => resolve({ data: Buffer.concat(chunks), crc, usize }));
+    (async () => {
+      for (const part of parts) {
+        crc = await crc32Cooperative(part, crc, onYield);
+        if (!deflate.write(part)) {
+          await new Promise<void>((done) => deflate.once('drain', () => done()));
+        }
+      }
+      deflate.end();
+    })().catch((err: unknown) => {
+      deflate.destroy();
+      reject(err);
+    });
+  });
+}
+
+export interface ZipWriteResult {
+  bytes: Buffer;
+  /** Rewritten and added part names. */
+  changed: string[];
+  removed: string[];
+  /** Entries copied as raw bytes. */
+  identical: number;
+}
+
+/**
+ * Writes a new package from `zip`. `changes`: part name → new content (a list of buffers, concatenated) or null
+ * (remove the part). `o.added`: new parts, appended at the end. Every other entry is copied byte for byte (its local
+ * header, data and data descriptor), in the original order; the central directory keeps its order and the zip
+ * comment is kept. A rewritten entry keeps its name bytes, time, attributes and comment; it loses its data
+ * descriptor and extra field (sizes and CRC are in the headers).
+ */
+export async function writeZip(
+  zip: ZipPackage,
+  changes: ReadonlyMap<string, readonly Uint8Array[] | null>,
+  o?: { added?: readonly { name: string; parts: readonly Uint8Array[] }[]; onYield?: SaveYieldHook },
+): Promise<ZipWriteResult> {
+  const out: Buffer[] = [];
+  let offset = 0;
+  const push = (chunk: Buffer): void => {
+    out.push(chunk);
+    offset += chunk.length;
+  };
+  const changeOf = new Map<ZipEntry, readonly Uint8Array[] | null>();
+  for (const [name, parts] of changes) {
+    const entry = zip.get(name);
+    if (!entry) throw new Error(`writeZip: the package has no part ${name}`);
+    changeOf.set(entry, parts);
+  }
+  const writeNew = async (nameBytes: Buffer, parts: readonly Uint8Array[], base: ZipEntry | undefined): Promise<Buffer> => {
+    const { data, crc, usize } = await deflateParts(parts, o?.onYield);
+    const utf8 = base ? base.flags & 0x800 : /[^\x00-\x7f]/.test(nameBytes.toString('latin1')) ? 0x800 : 0;
+    const flags = utf8 | (base ? base.flags & 0x0006 : 0); // keep the deflate-option bits; no data descriptor
+    const local = Buffer.alloc(30 + nameBytes.length);
+    local.writeUInt32LE(ZIP_LOCAL_SIG, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(flags, 6);
+    local.writeUInt16LE(8, 8);
+    local.writeUInt16LE(base ? base.rec.readUInt16LE(12) : 0, 10);
+    local.writeUInt16LE(base ? base.rec.readUInt16LE(14) : ZIP_DOS_DATE_1980, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(usize, 22);
+    local.writeUInt16LE(nameBytes.length, 26);
+    local.writeUInt16LE(0, 28);
+    nameBytes.copy(local, 30);
+    const lho = offset;
+    push(local);
+    push(data);
+    const comment = base ? base.rec.subarray(46 + base.rec.readUInt16LE(28) + base.rec.readUInt16LE(30)) : Buffer.alloc(0);
+    const rec = Buffer.alloc(46 + nameBytes.length + comment.length);
+    rec.writeUInt32LE(ZIP_CENTRAL_SIG, 0);
+    rec.writeUInt16LE(base ? base.rec.readUInt16LE(4) : 20, 4); // version made by
+    rec.writeUInt16LE(20, 6);
+    local.copy(rec, 8, 6, 28); // flags, method, time, date, crc, sizes, name length
+    rec.writeUInt16LE(0, 30);
+    rec.writeUInt16LE(comment.length, 32);
+    rec.writeUInt16LE(0, 34);
+    rec.writeUInt16LE(base ? base.rec.readUInt16LE(36) : 0, 36);
+    rec.writeUInt32LE(base ? base.rec.readUInt32LE(38) : 0, 38);
+    rec.writeUInt32LE(lho, 42);
+    nameBytes.copy(rec, 46);
+    comment.copy(rec, 46 + nameBytes.length);
+    return rec;
+  };
+  const changed: string[] = [];
+  const removed: string[] = [];
+  let identical = 0;
+  if (zip.prefixEnd > 0) push(zip.buf.subarray(0, zip.prefixEnd));
+  const central = new Map<ZipEntry, Buffer>();
+  for (const entry of zip.byOffset) {
+    const parts = changeOf.get(entry);
+    if (parts === null) {
+      removed.push(entry.name);
+    } else if (parts) {
+      central.set(entry, await writeNew(entry.nameBytes, parts, entry));
+      changed.push(entry.name);
+    } else {
+      const lho = offset;
+      push(zip.buf.subarray(entry.lho, entry.spanEnd));
+      const rec = Buffer.from(entry.rec);
+      rec.writeUInt32LE(lho, 42);
+      central.set(entry, rec);
+      identical++;
+    }
+    if (offset > 0xffffffff) throw new ZipError('the saved package would need ZIP64');
+  }
+  const addedRecs: Buffer[] = [];
+  const addedNames = new Set<string>();
+  for (const add of o?.added ?? []) {
+    const key = add.name.toLowerCase();
+    if (zip.get(add.name) || addedNames.has(key)) throw new Error(`writeZip: the part ${add.name} exists already`);
+    addedNames.add(key);
+    addedRecs.push(await writeNew(Buffer.from(add.name, 'utf8'), add.parts, undefined));
+    changed.push(add.name);
+  }
+  const count = central.size + addedRecs.length;
+  const cdStart = offset;
+  for (const entry of zip.entries) {
+    const rec = central.get(entry);
+    if (rec) push(rec);
+  }
+  for (const rec of addedRecs) push(rec);
+  const cdSize = offset - cdStart;
+  if (count >= 0xffff || offset > 0xffffffff) {
+    throw new ZipError('the saved package would need ZIP64');
+  }
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(ZIP_END_SIG, 0);
+  end.writeUInt16LE(count, 8);
+  end.writeUInt16LE(count, 10);
+  end.writeUInt32LE(cdSize, 12);
+  end.writeUInt32LE(cdStart, 16);
+  end.writeUInt16LE(zip.comment.length, 20);
+  push(end);
+  push(zip.comment);
+  return { bytes: Buffer.concat(out, offset), changed, removed, identical };
+}
+
+// ===== XLSX PATCH =====
+//
+// Byte-level patchers for the parts an edit touches (P1, D-006; rules in contract §4.3). Every byte outside the edited
+// elements stays as it was: sheet XML is walked as a Buffer (an ASCII tag search is safe on UTF-8) and only the
+// patched rows are decoded and re-emitted; sharedStrings and styles.xml are append-only (existing items never
+// change); workbook.xml only gets calcPr fullCalcOnLoad="1"; calcChain is dropped with its relationship and content
+// type. Whatever a patcher cannot do safely throws PatchError: the save fails and nothing is written.
+
+/** A patcher refuses a change (unsafe or not supported). The save fails and nothing is written. */
+export class PatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PatchError';
+  }
+}
+
+// ----- xml helpers -----
+
+/** One attribute as written in the file: the value is still XML-escaped. */
+interface XmlAttr {
+  value: string;
+  quote: '"' | "'";
+}
+
+/** A child element: local name, its start tag and its whole text. */
+interface XmlChild {
+  local: string;
+  open: string;
+  xml: string;
+}
+
+interface XmlElement {
+  qname: string;
+  attrs: Map<string, XmlAttr>;
+  children: XmlChild[];
+}
+
+const XML_ATTR_RE = /([A-Za-z_][\w:.-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+const XML_ENTITY_RE = /&(?:(lt|gt|amp|quot|apos)|#(\d+)|#x([0-9A-Fa-f]+));/g;
+const XML_NAMED_ENTITIES: Record<string, string> = { lt: '<', gt: '>', amp: '&', quot: '"', apos: "'" };
+/** Characters XML 1.0 does not allow (C0 controls except tab, LF, CR; U+FFFE; U+FFFF) and lone surrogates. */
+const XML_INVALID_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+const LONE_SURROGATE_RE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+const UTF8_STRICT = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+function regexEscape(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Attributes of a start tag (`<name a="1" b='2'>`), in file order. */
+function parseXmlAttrs(tag: string): Map<string, XmlAttr> {
+  const attrs = new Map<string, XmlAttr>();
+  const nameEnd = tag.search(/[\s/>]/);
+  for (const m of tag.slice(nameEnd < 0 ? tag.length : nameEnd).matchAll(XML_ATTR_RE)) {
+    attrs.set(m[1], m[2] !== undefined ? { value: m[2], quote: '"' } : { value: m[3] ?? '', quote: "'" });
+  }
+  return attrs;
+}
+
+/** Index of the ">" that ends the start tag at the beginning of `xml` (a ">" inside a quoted attribute value is skipped). */
+function startTagEnd(xml: string): number {
+  let quote = '';
+  for (let i = 0; i < xml.length; i++) {
+    const ch = xml[i];
+    if (quote) {
+      if (ch === quote) quote = '';
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === '>') {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function emitXmlAttrs(attrs: ReadonlyMap<string, XmlAttr>): string {
+  let out = '';
+  for (const [name, attr] of attrs) out += ` ${name}=${attr.quote}${attr.value}${attr.quote}`;
+  return out;
+}
+
+/** Sets an attribute (`value` already escaped); an existing attribute keeps its place and quote style. */
+function setXmlAttr(attrs: Map<string, XmlAttr>, name: string, value: string): void {
+  const quote = attrs.get(name)?.quote ?? '"';
+  attrs.set(name, { value: quote === "'" ? value.replace(/'/g, '&apos;') : value, quote });
+}
+
+function xmlAttrText(attrs: ReadonlyMap<string, XmlAttr>, name: string): string | undefined {
+  const attr = attrs.get(name);
+  return attr === undefined ? undefined : xmlUnescape(attr.value);
+}
+
+function xmlUnescape(text: string): string {
+  if (!text.includes('&')) return text;
+  return text.replace(XML_ENTITY_RE, (match: string, named?: string, dec?: string, hex?: string): string => {
+    if (named) return XML_NAMED_ENTITIES[named];
+    const code = dec !== undefined ? parseInt(dec, 10) : parseInt(hex ?? '', 16);
+    try {
+      return String.fromCodePoint(code);
+    } catch {
+      return match;
+    }
+  });
+}
+
+/** Text content: `& < >`, and CR as a character reference (a raw CR would be read back as LF). */
+function xmlEscapeText(text: string): string {
+  return text.replace(/[&<>\r]/g, (ch) => (ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '>' ? '&gt;' : '&#13;'));
+}
+
+/** Attribute value in double quotes (tab, LF, CR as character references: attribute values are normalised). */
+function xmlEscapeAttr(text: string): string {
+  return text.replace(/[&<>"\t\n\r]/g, (ch) =>
+    ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '>' ? '&gt;' : ch === '"' ? '&quot;' : `&#${ch.charCodeAt(0)};`);
+}
+
+/**
+ * Cell text as an OOXML ST_Xstring, XML-escaped: a literal `_xHHHH_` is protected as `_x005F_xHHHH_`, control
+ * characters (all C0 except tab and LF, so CR too) and U+FFFE / U+FFFF become `_xHHHH_` (upper-case hex, as Excel
+ * writes and as decodeXstring reads them back). A lone surrogate is refused (it cannot be stored).
+ */
+function escapeXstring(text: string, where: string): string {
+  if (LONE_SURROGATE_RE.test(text)) {
+    throw new PatchError(`${where}: the text contains an invalid character`);
+  }
+  const escaped = text
+    .replace(/_(?=x[0-9A-Fa-f]{4}_)/g, '_x005F_') // lookahead: '_x005F_x0041_' must not lose its shared underscore
+    .replace(/[\x00-\x08\x0b-\x1f\ufffe\uffff]/g, (ch) => `_x${ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}_`);
+  return xmlEscapeText(escaped);
+}
+
+/** xml:space="preserve" is needed for leading/trailing white space, tabs and line breaks. */
+function needsSpacePreserve(text: string): boolean {
+  return /^\s|\s$|[\n\t]/.test(text);
+}
+
+function isXmlNameEnd(code: number): boolean {
+  return code === 0x20 || code === 0x3e || code === 0x2f || code === 0x09 || code === 0x0a || code === 0x0d;
+}
+
+/** Root element prefix ('' or 'x:') of a part. */
+function xmlRootPrefix(head: string, local: string, where: string): string {
+  const m = new RegExp(`<([A-Za-z_][\\w.-]*:)?${local}[\\s>/]`).exec(head);
+  if (!m) throw new PatchError(`${where} has no <${local}> element`);
+  return m[1] ?? '';
+}
+
+/** Throws when a part is not UTF-8 (UTF-16 byte order mark or another declared encoding). */
+function assertUtf8Head(data: Uint8Array, where: string): void {
+  if (data.length >= 2 && ((data[0] === 0xff && data[1] === 0xfe) || (data[0] === 0xfe && data[1] === 0xff))) {
+    throw new PatchError(`${where} is not UTF-8`);
+  }
+  const head = asNodeBuffer(data).toString('latin1', 0, Math.min(data.length, 256));
+  const decl = /^(?:\xef\xbb\xbf)?<\?xml[^>]*\bencoding\s*=\s*["']([^"']+)["']/.exec(head);
+  if (decl && !/^utf-?8$/i.test(decl[1])) {
+    throw new PatchError(`${where} is not UTF-8 (${decl[1]})`);
+  }
+}
+
+/** A whole small part as text (strict UTF-8; a byte order mark is kept so it is written back). */
+function partText(data: Uint8Array, where: string): string {
+  assertUtf8Head(data, where);
+  try {
+    return UTF8_STRICT.decode(data);
+  } catch {
+    throw new PatchError(`${where} is not valid UTF-8`);
+  }
+}
+
+/** The child elements of an element body. Text between children must be white space. */
+function splitXmlChildren(inner: string, where: string): XmlChild[] {
+  const out: XmlChild[] = [];
+  let p = 0;
+  while (p < inner.length) {
+    const lt = inner.indexOf('<', p);
+    if (lt < 0 || inner.slice(p, lt).trim()) {
+      if (inner.slice(p, lt < 0 ? inner.length : lt).trim()) throw new PatchError(`${where} has unexpected text`);
+      if (lt < 0) break;
+    }
+    const gt = inner.indexOf('>', lt);
+    const name = /^<([A-Za-z_][\w.-]*:)?([A-Za-z_][\w.-]*)/.exec(inner.slice(lt, gt + 1));
+    if (gt < 0 || !name) throw new PatchError(`${where} is damaged`);
+    let end = gt + 1;
+    if (inner[gt - 1] !== '/') {
+      const close = `</${name[1] ?? ''}${name[2]}>`;
+      const at = inner.indexOf(close, gt);
+      if (at < 0) throw new PatchError(`${where} is damaged`);
+      end = at + close.length;
+    }
+    out.push({ local: name[2], open: inner.slice(lt, gt + 1), xml: inner.slice(lt, end) });
+    p = end;
+  }
+  return out;
+}
+
+function parseXmlElement(xml: string, where: string): XmlElement {
+  const gt = xml.indexOf('>');
+  const open = xml.slice(0, gt + 1);
+  const qname = /^<([^\s/>]+)/.exec(open)?.[1];
+  if (gt < 0 || !qname) throw new PatchError(`${where} is damaged`);
+  const inner = xml[gt - 1] === '/' ? '' : xml.slice(gt + 1, xml.lastIndexOf('</'));
+  return { qname, attrs: parseXmlAttrs(open), children: splitXmlChildren(inner, where) };
+}
+
+function buildXmlElement(el: XmlElement): string {
+  const body = el.children.map((child) => child.xml).join('');
+  return body ? `<${el.qname}${emitXmlAttrs(el.attrs)}>${body}</${el.qname}>` : `<${el.qname}${emitXmlAttrs(el.attrs)}/>`;
+}
+
+/** Replaces (or removes, xml = null) the child `local`; a new child goes to its place in the schema order. */
+function setXmlChild(el: XmlElement, local: string, xml: string | null, order: readonly string[]): void {
+  const at = el.children.findIndex((child) => child.local === local);
+  el.children = el.children.filter((child) => child.local !== local);
+  if (xml === null) return;
+  const child: XmlChild = { local, open: xml, xml };
+  if (at >= 0) {
+    el.children.splice(Math.min(at, el.children.length), 0, child);
+    return;
+  }
+  const rank = order.indexOf(local);
+  const before = el.children.findIndex((other) => order.indexOf(other.local) > rank);
+  el.children.splice(before < 0 ? el.children.length : before, 0, child);
+}
+
+/**
+ * Calls `found` for every occurrence of `needle` in buf[from, to), searching 8 MB windows with a yield between them
+ * (one Buffer.indexOf over a 200 MB part would block the event loop too long).
+ */
+async function forEachOccurrence(buf: Buffer, needle: Buffer, from: number, to: number, onYield: SaveYieldHook | undefined, found: (at: number) => void): Promise<void> {
+  const WINDOW = 8 << 20;
+  for (let pos = from; pos < to; pos += WINDOW) {
+    const window = buf.subarray(pos, Math.min(to, pos + WINDOW + needle.length - 1));
+    for (let i = window.indexOf(needle); i >= 0 && i < WINDOW; i = window.indexOf(needle, i + 1)) found(pos + i);
+    if (to - from > WINDOW) await saveYield(onYield);
+  }
+}
+
+// ----- package map -----
+
+interface XlsxRel {
+  id: string;
+  type: string;
+  target: string;
+  external: boolean;
+}
+
+interface XlsxSheetRef {
+  name: string;
+  /** The <sheet sheetId> attribute (SheetId = 's' + sheetId). */
+  sheetId: number;
+  /** Zip entry name of the sheet part (undefined when the relationship or the part is missing). */
+  part?: string;
+  /** Relationship type (…/worksheet, …/chartsheet, …). */
+  type: string;
+}
+
+interface XlsxPackage {
+  zip: ZipPackage;
+  wbPath: string;
+  wbXml: string;
+  wbRelsPath: string;
+  wbRelsXml: string;
+  ctXml: string;
+  sheets: XlsxSheetRef[];
+  sstPath?: string;
+  stylesPath?: string;
+  /** calcChain parts: the workbook relationship target and any part with the calcChain content type. */
+  calcChainPaths: string[];
+  /** Strict Open XML (purl.oclc.org namespaces): not patchable. */
+  strict: boolean;
+}
+
+const CALC_CHAIN_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml';
+
+function relsPartOf(part: string): string {
+  const i = part.lastIndexOf('/');
+  return `${part.slice(0, i + 1)}_rels/${part.slice(i + 1)}.rels`;
+}
+
+/** Zip entry name of a relationship target (relative to `fromPart`, or absolute). */
+function resolvePartTarget(fromPart: string, target: string): string {
+  const joined = target.startsWith('/') ? target.slice(1) : fromPart.slice(0, fromPart.lastIndexOf('/') + 1) + target;
+  const out: string[] = [];
+  for (const seg of joined.split('/')) {
+    if (seg === '..') out.pop();
+    else if (seg !== '.' && seg !== '') out.push(seg);
+  }
+  return out.join('/');
+}
+
+/** The exact entry name for a part name (case-insensitive; percent-encoded names tried decoded too). */
+function entryNameOf(zip: ZipPackage, name: string): string | undefined {
+  const entry = zip.get(name);
+  if (entry) return entry.name;
+  try {
+    return zip.get(decodeURIComponent(name))?.name;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseRels(text: string): XlsxRel[] {
+  const rels: XlsxRel[] = [];
+  for (const m of text.matchAll(/<(?:[\w.-]+:)?Relationship\b[^>]*>/g)) {
+    const attrs = parseXmlAttrs(m[0]);
+    rels.push({
+      id: xmlAttrText(attrs, 'Id') ?? '',
+      type: xmlAttrText(attrs, 'Type') ?? '',
+      target: xmlAttrText(attrs, 'Target') ?? '',
+      external: xmlAttrText(attrs, 'TargetMode') === 'External',
+    });
+  }
+  return rels;
+}
+
+async function readPartText(zip: ZipPackage, name: string, onYield?: SaveYieldHook): Promise<string | undefined> {
+  const entry = zip.get(name);
+  return entry ? partText(await readEntry(zip, entry, onYield), name) : undefined;
+}
+
+/** Reads the package map: workbook, its relationships, sheets (sheetId → part), sharedStrings, styles, calcChain. */
+async function openXlsxPackage(zip: ZipPackage, onYield?: SaveYieldHook): Promise<XlsxPackage> {
+  const rootRels = await readPartText(zip, '_rels/.rels', onYield);
+  if (rootRels === undefined) throw new PatchError('it has no package relationships (_rels/.rels)');
+  const office = parseRels(rootRels).find((rel) => !rel.external && /\/officeDocument$/.test(rel.type));
+  const wbPath = office && entryNameOf(zip, resolvePartTarget('', office.target));
+  const wbXml = wbPath && (await readPartText(zip, wbPath, onYield));
+  if (!wbPath || !wbXml) throw new PatchError('it has no workbook part');
+  const wbRelsPath = entryNameOf(zip, relsPartOf(wbPath));
+  const wbRelsXml = wbRelsPath && (await readPartText(zip, wbRelsPath, onYield));
+  if (!wbRelsPath || !wbRelsXml) throw new PatchError('it has no workbook relationships');
+  const ctXml = await readPartText(zip, '[Content_Types].xml', onYield);
+  if (ctXml === undefined) throw new PatchError('it has no content types part');
+  const P = xmlRootPrefix(wbXml, 'workbook', wbPath);
+  const rootTag = new RegExp(`<${regexEscape(P)}workbook\\b[^>]*>`).exec(wbXml)?.[0] ?? '';
+  const rels = parseRels(wbRelsXml).filter((rel) => !rel.external);
+  const sheets: XlsxSheetRef[] = [];
+  for (const m of wbXml.matchAll(new RegExp(`<${regexEscape(P)}sheet\\b[^>]*>`, 'g'))) {
+    const attrs = parseXmlAttrs(m[0]);
+    const ridName = [...attrs.keys()].find((key) => /(^|:)id$/.test(key));
+    const rid = ridName ? xmlAttrText(attrs, ridName) : undefined;
+    const rel = rid !== undefined ? rels.find((x) => x.id === rid) : undefined;
+    sheets.push({
+      name: xmlAttrText(attrs, 'name') ?? '',
+      sheetId: Number(xmlAttrText(attrs, 'sheetId')),
+      part: rel ? entryNameOf(zip, resolvePartTarget(wbPath, rel.target)) : undefined,
+      type: rel?.type ?? '',
+    });
+  }
+  const relPart = (suffix: string): string | undefined => {
+    const rel = rels.find((x) => x.type.endsWith(suffix));
+    return rel ? entryNameOf(zip, resolvePartTarget(wbPath, rel.target)) : undefined;
+  };
+  const calcChainPaths = new Set<string>();
+  const chainRel = relPart('/calcChain');
+  if (chainRel) calcChainPaths.add(chainRel);
+  for (const m of ctXml.matchAll(/<(?:[\w.-]+:)?Override\b[^>]*>/g)) {
+    const attrs = parseXmlAttrs(m[0]);
+    const name = xmlAttrText(attrs, 'PartName');
+    const entry = name && xmlAttrText(attrs, 'ContentType') === CALC_CHAIN_CONTENT_TYPE ? entryNameOf(zip, resolvePartTarget('', name)) : undefined;
+    if (entry) calcChainPaths.add(entry);
+  }
+  return {
+    zip, wbPath, wbXml, wbRelsPath, wbRelsXml, ctXml, sheets,
+    sstPath: relPart('/sharedStrings'),
+    stylesPath: relPart('/styles'),
+    calcChainPaths: [...calcChainPaths],
+    strict: /purl\.oclc\.org\/ooxml\/spreadsheetml\/main/.test(rootTag),
+  };
+}
+
+// ----- sheet cells -----
+
+/** Where <sheetData> is in a sheet part, plus the tag bytes used to walk it. */
+interface SheetXmlLayout {
+  P: string;
+  where: string;
+  sdOpen: number;
+  sdOpenEnd: number;
+  sdSelfClosing: boolean;
+  /** Offset of </sheetData> (= sdOpenEnd when self-closing). */
+  sdClose: number;
+  rowTag: Buffer;
+  rowEndTag: Buffer;
+}
+
+interface RowSpan {
+  start: number;
+  /** Offset just after the start tag. */
+  openEnd: number;
+  end: number;
+  /** 0-based row index. */
+  r: number;
+  selfClosing: boolean;
+  /** The start tag (ASCII). */
+  tag: string;
+}
+
+interface CellSpan {
+  c: number;
+  start: number;
+  end: number;
+}
+
+const ROW_NUMBER_RE = /\sr\s*=\s*["'](\d+)["']/;
+const CELL_REF_ATTR_RE = /\sr\s*=\s*["']([A-Za-z]{1,3})(\d{1,7})["']/;
+
+/** Offset of the next start tag `tag` (bytes of `<P:name`) in buf[from, end), or -1. */
+function findStartTag(buf: Buffer, tag: Buffer, from: number, end: number): number {
+  for (let pos = from; ;) {
+    const window = buf.subarray(pos, end);
+    const i = window.indexOf(tag);
+    if (i < 0 || pos + i + tag.length >= end) return -1;
+    if (isXmlNameEnd(buf[pos + i + tag.length])) return pos + i;
+    pos += i + tag.length;
+  }
+}
+
+/** Offset of the first `needle` in buf[from, end), or -1; big ranges are searched in 8 MB windows with a yield between. */
+async function indexOfCooperative(buf: Buffer, needle: Buffer, from: number, onYield?: SaveYieldHook): Promise<number> {
+  const WINDOW = 8 << 20;
+  for (let pos = from; pos < buf.length; pos += WINDOW) {
+    const i = buf.subarray(pos, Math.min(buf.length, pos + WINDOW + needle.length - 1)).indexOf(needle);
+    if (i >= 0) return pos + i;
+    if (buf.length - from > WINDOW) await saveYield(onYield);
+  }
+  return -1;
+}
+
+/**
+ * Where <sheetData> is in a sheet part. The search for </sheetData> runs in windows with yields (one indexOf over a
+ * 200 MB part blocks the event loop for 100-200 ms).
+ */
+async function sheetLayout(buf: Buffer, where: string, onYield?: SaveYieldHook): Promise<SheetXmlLayout> {
+  assertUtf8Head(buf, where);
+  const P = xmlRootPrefix(buf.toString('latin1', 0, Math.min(buf.length, 16384)), 'worksheet', where);
+  const sdOpen = findStartTag(buf, Buffer.from(`<${P}sheetData`), 0, buf.length);
+  if (sdOpen < 0) throw new PatchError(`${where} has no cell data (<sheetData>)`);
+  const gt = buf.indexOf(0x3e, sdOpen);
+  if (gt < 0) throw new PatchError(`${where} is damaged`);
+  const sdSelfClosing = buf[gt - 1] === 0x2f;
+  const sdClose = sdSelfClosing ? gt + 1 : await indexOfCooperative(buf, Buffer.from(`</${P}sheetData>`), gt, onYield);
+  if (sdClose < 0) throw new PatchError(`${where} is damaged (no </sheetData>)`);
+  return { P, where, sdOpen, sdOpenEnd: gt + 1, sdSelfClosing, sdClose, rowTag: Buffer.from(`<${P}row`), rowEndTag: Buffer.from(`</${P}row>`) };
+}
+
+/** The row starting at `rs`. Rows without a row number are refused (§4.7: hard read-only). */
+function readRowAt(buf: Buffer, L: SheetXmlLayout, rs: number): RowSpan {
+  const gt = buf.indexOf(0x3e, rs);
+  if (gt < 0 || gt >= L.sdClose) throw new PatchError(`${L.where} is damaged`);
+  const selfClosing = buf[gt - 1] === 0x2f;
+  let end = gt + 1;
+  if (!selfClosing) {
+    const close = buf.indexOf(L.rowEndTag, gt);
+    if (close < 0 || close >= L.sdClose) throw new PatchError(`${L.where} is damaged (a row is not closed)`);
+    end = close + L.rowEndTag.length;
+  }
+  const tag = buf.toString('latin1', rs, gt + 1);
+  const m = ROW_NUMBER_RE.exec(tag);
+  if (!m) throw new PatchError(`${L.where} has rows without a row number`);
+  const r = parseInt(m[1], 10) - 1;
+  if (!(r >= 0 && r < MAX_ROWS)) throw new PatchError(`${L.where} has an invalid row number (${m[1]})`);
+  return { start: rs, openEnd: gt + 1, end, r, selfClosing, tag };
+}
+
+/** The cells of a row body (text between the row tags): column, offsets. Checks order and row numbers. */
+function parseRowCells(body: string, P: string, r: number, where: string): CellSpan[] {
+  const cells: CellSpan[] = [];
+  const cTag = `<${P}c`;
+  const cEnd = `</${P}c>`;
+  let p = 0;
+  let prevC = -1;
+  for (;;) {
+    const i = body.indexOf(cTag, p);
+    if (i < 0) break;
+    if (!isXmlNameEnd(body.charCodeAt(i + cTag.length))) {
+      p = i + cTag.length;
+      continue;
+    }
+    const gt = body.indexOf('>', i);
+    if (gt < 0) throw new PatchError(`${where} is damaged (row ${r + 1})`);
+    let end = gt + 1;
+    if (body[gt - 1] !== '/') {
+      const close = body.indexOf(cEnd, gt);
+      if (close < 0) throw new PatchError(`${where} is damaged (row ${r + 1})`);
+      end = close + cEnd.length;
+    }
+    const ref = CELL_REF_ATTR_RE.exec(body.slice(i, gt + 1));
+    let c = prevC + 1;
+    if (ref) {
+      c = colToIndex(ref[1]);
+      if (parseInt(ref[2], 10) - 1 !== r) throw new PatchError(`${where} has cell ${ref[1]}${ref[2]} inside row ${r + 1}`);
+      if (c < 0 || c >= MAX_COLS) throw new PatchError(`${where} has an invalid cell reference (${ref[1]}${ref[2]})`);
+    }
+    if (c <= prevC || c >= MAX_COLS) throw new PatchError(`${where} has cells out of order in row ${r + 1}`);
+    prevC = c;
+    cells.push({ c, start: i, end });
+    p = end;
+  }
+  return cells;
+}
+
+/** Style index of each column from <cols> (0 = none). */
+function columnStyles(buf: Buffer, L: SheetXmlLayout): (c: number) => number {
+  const head = buf.toString('latin1', 0, L.sdOpen);
+  const cols: { min: number; max: number; style: number }[] = [];
+  for (const m of head.matchAll(new RegExp(`<${regexEscape(L.P)}col\\b[^>]*>`, 'g'))) {
+    const attrs = parseXmlAttrs(m[0]);
+    const style = Number(xmlAttrText(attrs, 'style') ?? 0);
+    if (style > 0) cols.push({ min: Number(xmlAttrText(attrs, 'min')), max: Number(xmlAttrText(attrs, 'max')), style });
+  }
+  return (c: number): number => cols.find((col) => c + 1 >= col.min && c + 1 <= col.max)?.style ?? 0;
+}
+
+function decodeRowText(buf: Buffer, row: RowSpan, where: string): string {
+  try {
+    return UTF8_STRICT.decode(buf.subarray(row.start, row.end));
+  } catch {
+    throw new PatchError(`${where} row ${row.r + 1} is not valid UTF-8`);
+  }
+}
+
+/**
+ * Builds the new XML of one cell from its old XML (undefined = no cell yet) and the cell's style inherited from its
+ * row or column (used for a new cell). null = the cell is removed.
+ */
+type CellPatchFn = (oldXml: string | undefined, r: number, c: number, inheritS: number) => string | null;
+
+/**
+ * Patches the cells of one sheet part. `rows`: 0-based row → (0-based column → patch function). Returns the new
+ * part as slices (unchanged regions are views of `buf`, no copy). All rows are walked (yielding every `yieldEvery`
+ * rows or SAVE_SLICE_MS) so rows out of order anywhere in the part are refused.
+ */
+async function patchSheetCells(
+  buf: Buffer,
+  L: SheetXmlLayout,
+  rows: ReadonlyMap<number, ReadonlyMap<number, CellPatchFn>>,
+  o: { yieldEvery: number; onYield?: SaveYieldHook },
+): Promise<{ parts: Buffer[]; changed: boolean }> {
+  const P = L.P;
+  const colStyle = columnStyles(buf, L);
+  const wanted = [...rows.keys()].sort((a, b) => a - b);
+  const newCells = (r: number, inherit: (c: number) => number): string => {
+    const fns = rows.get(r);
+    if (!fns) return '';
+    let cells = '';
+    for (const c of [...fns.keys()].sort((a, b) => a - b)) cells += fns.get(c)?.(undefined, r, c, inherit(c)) ?? '';
+    return cells;
+  };
+  const newRow = (r: number): string => {
+    const cells = newCells(r, colStyle);
+    return cells ? `<${P}row r="${r + 1}">${cells}</${P}row>` : '';
+  };
+  if (L.sdSelfClosing) {
+    const rowsXml = wanted.map(newRow).join('');
+    if (!rowsXml) return { parts: [buf], changed: false };
+    return { parts: [buf.subarray(0, L.sdOpen), Buffer.from(`<${P}sheetData>${rowsXml}</${P}sheetData>`, 'utf8'), buf.subarray(L.sdOpenEnd)], changed: true };
+  }
+  const out: Buffer[] = [];
+  let changed = false;
+  let copyFrom = 0;
+  let pos = L.sdOpenEnd;
+  let prevR = -1;
+  let wi = 0;
+  const step = saveSlicer(o.onYield, o.yieldEvery);
+  const emitNew = (r: number, at: number): void => {
+    const xml = newRow(r);
+    if (!xml) return;
+    out.push(buf.subarray(copyFrom, at));
+    copyFrom = at;
+    out.push(Buffer.from(xml, 'utf8'));
+    changed = true;
+  };
+  for (;;) {
+    const rs = findStartTag(buf, L.rowTag, pos, L.sdClose);
+    if (rs < 0) break;
+    const row = readRowAt(buf, L, rs);
+    if (row.r <= prevR) throw new PatchError(`${L.where} has rows out of order (row ${row.r + 1})`);
+    prevR = row.r;
+    while (wi < wanted.length && wanted[wi] < row.r) emitNew(wanted[wi++], rs);
+    if (wi < wanted.length && wanted[wi] === row.r) {
+      const fns = rows.get(row.r);
+      const oldXml = decodeRowText(buf, row, L.where);
+      const newXml = fns ? patchRowXml(oldXml, row, fns, P, colStyle, L.where) : oldXml;
+      if (newXml !== oldXml) {
+        out.push(buf.subarray(copyFrom, rs));
+        out.push(Buffer.from(newXml, 'utf8'));
+        copyFrom = row.end;
+        changed = true;
+      }
+      wi++;
+    }
+    pos = row.end;
+    const pause = step();
+    if (pause) await pause;
+  }
+  while (wi < wanted.length) emitNew(wanted[wi++], L.sdClose);
+  if (!changed) return { parts: [buf], changed: false };
+  out.push(buf.subarray(copyFrom));
+  return { parts: out, changed };
+}
+
+/** Re-emits one row: unchanged cells keep their exact text; patched cells are replaced or inserted in column order. */
+function patchRowXml(rowXml: string, row: RowSpan, fns: ReadonlyMap<number, CellPatchFn>, P: string, colStyle: (c: number) => number, where: string): string {
+  const rowAttrs = parseXmlAttrs(row.tag);
+  const custom = xmlAttrText(rowAttrs, 'customFormat');
+  const rowStyle = custom === '1' || custom === 'true' ? Number(xmlAttrText(rowAttrs, 's') ?? 0) : undefined;
+  const inherit = (c: number): number => rowStyle ?? colStyle(c);
+  const pending = [...fns.keys()].sort((a, b) => a - b);
+  const run = (c: number, oldXml: string | undefined): string => fns.get(c)?.(oldXml, row.r, c, inherit(c)) ?? '';
+  if (row.selfClosing) {
+    const cells = pending.map((c) => run(c, undefined)).join('');
+    return cells ? `${row.tag.slice(0, -2).replace(/\s+$/, '')}>${cells}</${P}row>` : rowXml;
+  }
+  const open = row.tag.length;
+  const close = rowXml.lastIndexOf(`</${P}row>`);
+  const body = rowXml.slice(open, close);
+  const cells = parseRowCells(body, P, row.r, where);
+  let res = rowXml.slice(0, open);
+  let from = 0;
+  let k = 0;
+  for (const cell of cells) {
+    while (k < pending.length && pending[k] < cell.c) {
+      res += body.slice(from, cell.start) + run(pending[k++], undefined);
+      from = cell.start;
+    }
+    if (k < pending.length && pending[k] === cell.c) {
+      res += body.slice(from, cell.start) + run(pending[k++], body.slice(cell.start, cell.end));
+      from = cell.end;
+    }
+  }
+  if (k < pending.length) {
+    const tail = Math.max(from, cells.length ? cells[cells.length - 1].end : 0);
+    res += body.slice(from, tail);
+    from = tail;
+    while (k < pending.length) res += run(pending[k++], undefined);
+  }
+  return res + body.slice(from) + rowXml.slice(close);
+}
+
+/** Multi-cell array or data-table formula ranges of a sheet part (their cells cannot be changed one by one). */
+async function findArrayRanges(buf: Buffer, L: SheetXmlLayout, onYield?: SaveYieldHook): Promise<{ range: Range; ref: string }[]> {
+  const out: { range: Range; ref: string }[] = [];
+  const fTag = new RegExp(`^<${regexEscape(L.P)}f[\\s/>]`);
+  for (const word of ['array', 'dataTable']) {
+    await forEachOccurrence(buf, Buffer.from(word), L.sdOpenEnd, L.sdClose, onYield, (at) => {
+      const lt = buf.lastIndexOf(0x3c, at);
+      const gt = buf.indexOf(0x3e, at);
+      if (lt < 0 || gt < 0 || gt - lt > 4096) return;
+      const tag = buf.toString('utf8', lt, gt + 1);
+      if (!fTag.test(tag)) return;
+      const attrs = parseXmlAttrs(tag);
+      const ref = xmlAttrText(attrs, 'ref');
+      if (xmlAttrText(attrs, 't') !== word || !ref) return;
+      const range = decodeRange(ref);
+      if (!range) throw new PatchError(`${L.where} has an array formula with an invalid range (${ref})`);
+      if (range.r0 !== range.r1 || range.c0 !== range.c1) out.push({ range, ref });
+    });
+  }
+  return out;
+}
+
+/** Cells of the shared formula `si`: the master (has `ref`) and its clones. */
+async function findSharedFormulaCells(buf: Buffer, L: SheetXmlLayout, si: string, onYield?: SaveYieldHook): Promise<{ r: number; c: number; master: boolean; formula: string }[]> {
+  const out: { r: number; c: number; master: boolean; formula: string }[] = [];
+  const fTag = new RegExp(`^<${regexEscape(L.P)}f[\\s/>]`);
+  const cTag = Buffer.from(`<${L.P}c`);
+  const seen = new Set<number>();
+  // The needle is the attribute NAME only: XML allows spaces around '=' (`si = "0"`), parseXmlAttrs reads the value.
+  for (const needle of ['si']) {
+    await forEachOccurrence(buf, Buffer.from(needle), L.sdOpenEnd, L.sdClose, onYield, (at) => {
+      const lt = buf.lastIndexOf(0x3c, at);
+      if (seen.has(lt)) return;
+      const gt = buf.indexOf(0x3e, at);
+      if (lt < 0 || gt < 0 || !isXmlNameEnd(buf[at - 1])) return;
+      const tag = buf.toString('utf8', lt, gt + 1);
+      if (!fTag.test(tag)) return;
+      const attrs = parseXmlAttrs(tag);
+      if (xmlAttrText(attrs, 't') !== 'shared' || xmlAttrText(attrs, 'si') !== si) return;
+      seen.add(lt);
+      let cs = buf.lastIndexOf(cTag, lt);
+      while (cs >= 0 && !isXmlNameEnd(buf[cs + cTag.length])) cs = buf.lastIndexOf(cTag, cs - 1);
+      const cellTag = cs >= 0 ? buf.toString('latin1', cs, buf.indexOf(0x3e, cs) + 1) : '';
+      const ref = CELL_REF_ATTR_RE.exec(cellTag);
+      if (!ref) throw new PatchError(`${L.where} has a shared formula in a cell without a reference`);
+      let formula = '';
+      if (buf[gt - 1] !== 0x2f) {
+        const close = buf.indexOf(`</${L.P}f>`, gt);
+        formula = xmlUnescape(buf.toString('utf8', gt + 1, close));
+      }
+      out.push({ r: parseInt(ref[2], 10) - 1, c: colToIndex(ref[1]), master: attrs.has('ref'), formula });
+    });
+  }
+  return out;
+}
+
+const VALUE_ERRORS = new Set(['#NULL!', '#DIV/0!', '#VALUE!', '#REF!', '#NAME?', '#NUM!', '#N/A', '#GETTING_DATA']);
+const CACHED_ERRORS = new Set([...VALUE_ERRORS, '#SPILL!', '#CALC!', '#FIELD!', '#BLOCKED!', '#CONNECT!', '#BUSY!', '#UNKNOWN!', '#EXTERNAL!', '#PYTHON!']);
+
+/** What the cell patchers of one sheet share: prefix, lazy sharedStrings / styles, array ranges, de-share bookkeeping. */
+interface CellPatchContext {
+  P: string;
+  where: string;
+  /** undefined = the file has no sharedStrings part: strings are written inline. */
+  sst(): SharedStringsPatch | undefined;
+  styles(): StylesPatch;
+  arrays: readonly { range: Range; ref: string }[];
+  /** Shared-formula masters whose content a patch replaced (checked against their clones after the walk). */
+  masters: { si: string; addr: string }[];
+}
+
+function numberText(value: number, where: string): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw new PatchError(`${where}: not a finite number`);
+  // Excel stores 0 for anything below its smallest normal number: refuse instead of changing the value silently.
+  if (value !== 0 && Math.abs(value) < 2.2250738585072014e-308) throw new PatchError(`${where}: the number is too small for Excel`);
+  return String(value);
+}
+
+/** Longest text of one Excel cell. */
+const XLSX_MAX_TEXT_CHARS = 32_767;
+
+/**
+ * Why Excel would remove or repair this formula (file syntax), or undefined. Checks only what is certain: the length
+ * limit, an unterminated quote and unbalanced parentheses (quotes and [brackets] are skipped).
+ */
+function formulaSyntaxProblem(formula: string): string | undefined {
+  if (formula.length > FX_MAX_FORMULA_CHARS) return `the formula is longer than ${FX_MAX_FORMULA_CHARS} characters, the limit of Excel`;
+  let depth = 0;
+  for (let i = 0; i < formula.length; i++) {
+    const ch = formula[i];
+    if (ch === '"' || ch === "'") {
+      let j = i + 1;
+      for (; j < formula.length; j++) {
+        if (formula[j] !== ch) continue;
+        if (formula[j + 1] === ch) j++; // a doubled quote is a quote character
+        else break;
+      }
+      if (j >= formula.length) return 'the formula has a quote that is not closed';
+      i = j;
+    } else if (ch === '[') {
+      let level = 1;
+      i++;
+      for (; i < formula.length && level > 0; i++) {
+        if (formula[i] === '[') level++;
+        else if (formula[i] === ']') level--;
+      }
+      i--;
+    } else if (ch === '(') {
+      depth++;
+    } else if (ch === ')' && --depth < 0) {
+      return 'the formula has a closing parenthesis without an opening one';
+    }
+  }
+  return depth > 0 ? 'the formula has an opening parenthesis that is not closed' : undefined;
+}
+
+/** <v> (and the t attribute) for a value, or for the cached result of a formula (`cached` = true). */
+function valueXml(value: FileValue, attrs: Map<string, XmlAttr>, ctx: CellPatchContext, where: string, cached: boolean): string {
+  const P = ctx.P;
+  switch (value.t) {
+    case 'n':
+      return `<${P}v>${numberText(value.v, where)}</${P}v>`;
+    case 'b':
+      if (typeof value.v !== 'boolean') throw new PatchError(`${where}: not a boolean`);
+      setXmlAttr(attrs, 't', 'b');
+      return `<${P}v>${value.v ? 1 : 0}</${P}v>`;
+    case 'e':
+      if (!(cached ? CACHED_ERRORS : VALUE_ERRORS).has(value.v)) throw new PatchError(`${where}: unknown error value ${String(value.v)}`);
+      setXmlAttr(attrs, 't', 'e');
+      return `<${P}v>${xmlEscapeText(value.v)}</${P}v>`;
+    case 's': {
+      if (typeof value.v !== 'string') throw new PatchError(`${where}: not a text`);
+      if (value.v.length > XLSX_MAX_TEXT_CHARS) throw new PatchError(`${where}: the text is longer than ${XLSX_MAX_TEXT_CHARS} characters, the limit of one Excel cell`);
+      if (cached) {
+        setXmlAttr(attrs, 't', 'str');
+        return `<${P}v>${escapeXstring(value.v, where)}</${P}v>`;
+      }
+      const sst = ctx.sst();
+      if (sst) {
+        setXmlAttr(attrs, 't', 's');
+        return `<${P}v>${sst.add(value.v, where)}</${P}v>`;
+      }
+      setXmlAttr(attrs, 't', 'inlineStr');
+      return `<${P}is><${P}t${needsSpacePreserve(value.v) ? ' xml:space="preserve"' : ''}>${escapeXstring(value.v, where)}</${P}t></${P}is>`;
+    }
+  }
+  throw new PatchError(`${where}: unknown value type`);
+}
+
+/**
+ * Applies one CellPatch to a cell (§4.3): value / clear keep `s`; a formula is written in file syntax with its
+ * cached <v>; a cached-only patch keeps the <f> element bytes; style deltas derive a new xf from the cell's xf (a
+ * new cell starts from its row/column style). Refused: content changes of a cell with `vm` (picture / linked data
+ * type) or inside a multi-cell array / data-table range. A shared-formula master is recorded for the de-share check.
+ */
+function applyCellPatch(oldXml: string | undefined, patch: CellPatch, r: number, c: number, inheritS: number, ctx: CellPatchContext): string | null {
+  const P = ctx.P;
+  const addr = indexToCol(c) + (r + 1);
+  const where = `${ctx.where}!${addr}`;
+  if (patch.value !== undefined && patch.formula !== undefined) throw new PatchError(`${where}: a value and a formula in one change`);
+  const content = patch.value !== undefined || patch.formula !== undefined;
+  let attrs = new Map<string, XmlAttr>();
+  let inner = '';
+  let children: XmlChild[] = [];
+  if (oldXml !== undefined) {
+    const gt = startTagEnd(oldXml);
+    attrs = parseXmlAttrs(oldXml.slice(0, gt + 1));
+    if (oldXml[gt - 1] !== '/') {
+      inner = oldXml.slice(gt + 1, oldXml.length - `</${P}c>`.length);
+      children = splitXmlChildren(inner, where);
+    }
+  }
+  setXmlAttr(attrs, 'r', addr);
+  const setStyle = (xf: number): void => {
+    if (xf === 0) attrs.delete('s');
+    else setXmlAttr(attrs, 's', String(xf));
+  };
+  if (patch.style?.length) {
+    const base = oldXml !== undefined ? Number(xmlAttrText(attrs, 's') ?? 0) : inheritS;
+    setStyle(ctx.styles().deriveXf(base, patch.style, where));
+  } else if (oldXml === undefined && inheritS > 0) {
+    setStyle(inheritS);
+  }
+  const formulaChild = children.find((child) => child.local === 'f');
+  const others = children.filter((child) => child.local !== 'f' && child.local !== 'v' && child.local !== 'is').map((child) => child.xml).join('');
+  let body: string;
+  if (content) {
+    if (attrs.has('vm')) throw new PatchError(`${where} holds a picture or linked data type. Edit it in Excel.`);
+    const array = ctx.arrays.find((a) => r >= a.range.r0 && r <= a.range.r1 && c >= a.range.c0 && c <= a.range.c1);
+    if (array) throw new PatchError(`${where} is part of an array formula (${array.ref}). Edit it in Excel.`);
+    if (formulaChild) {
+      const fAttrs = parseXmlAttrs(formulaChild.open);
+      if (xmlAttrText(fAttrs, 't') === 'shared' && fAttrs.has('ref')) ctx.masters.push({ si: xmlAttrText(fAttrs, 'si') ?? '', addr });
+    }
+    attrs.delete('t');
+    attrs.delete('cm');
+    attrs.delete('vm');
+    if (patch.formula !== undefined) {
+      const formula = patch.formula;
+      if (typeof formula !== 'string' || !formula || formula.startsWith('=') || XML_INVALID_CHAR_RE.test(formula)) {
+        throw new PatchError(`${where}: the formula must be in file syntax, without "=", and without control characters`);
+      }
+      const formulaProblem = formulaSyntaxProblem(formula);
+      if (formulaProblem) throw new PatchError(`${where}: ${formulaProblem}`);
+      body = `<${P}f>${xmlEscapeText(formula)}</${P}f>` + (patch.cached ? valueXml(patch.cached, attrs, ctx, where, true) : '');
+    } else {
+      body = patch.value ? valueXml(patch.value, attrs, ctx, where, false) : '';
+    }
+    body += others;
+  } else if (patch.cached !== undefined) {
+    if (!formulaChild) throw new PatchError(`${where} has no formula, so it cannot take a calculated value`);
+    attrs.delete('t');
+    body = formulaChild.xml + (patch.cached ? valueXml(patch.cached, attrs, ctx, where, true) : '') + others;
+  } else {
+    body = inner;
+  }
+  if (!body && !attrs.has('s') && inheritS === 0) return null; // an empty, unstyled cell is dropped
+  const tag = `<${P}c${emitXmlAttrs(attrs)}`;
+  return body ? `${tag}>${body}</${P}c>` : `${tag}/>`;
+}
+
+// ----- shared strings -----
+
+/** sharedStrings.xml, append-only: new strings get new indexes; count / uniqueCount are updated. */
+class SharedStringsPatch {
+  private readonly P: string;
+  private readonly baseCount: number;
+  private readonly added: string[] = [];
+  private readonly index = new Map<string, number>();
+
+  constructor(private readonly text: string, private readonly where: string) {
+    this.P = xmlRootPrefix(text, 'sst', where);
+    let n = 0;
+    const tag = `<${this.P}si`;
+    for (let p = text.indexOf(tag); p >= 0; p = text.indexOf(tag, p + tag.length)) {
+      if (isXmlNameEnd(text.charCodeAt(p + tag.length))) n++;
+    }
+    this.baseCount = n;
+  }
+
+  add(value: string, where: string): number {
+    const known = this.index.get(value);
+    if (known !== undefined) return known;
+    const P = this.P;
+    const i = this.baseCount + this.added.length;
+    this.added.push(`<${P}si><${P}t${needsSpacePreserve(value) ? ' xml:space="preserve"' : ''}>${escapeXstring(value, where)}</${P}t></${P}si>`);
+    this.index.set(value, i);
+    return i;
+  }
+
+  get changed(): boolean {
+    return this.added.length > 0;
+  }
+
+  toString(): string {
+    const P = this.P;
+    const m = new RegExp(`<${regexEscape(P)}sst\\b[^>]*>`).exec(this.text);
+    if (!m) throw new PatchError(`${this.where} is damaged`);
+    let open = m[0];
+    open = open.replace(/(\suniqueCount\s*=\s*)(["'])\d*\2/, (_, pre: string, q: string) => `${pre}${q}${this.baseCount + this.added.length}${q}`);
+    open = open.replace(/(\scount\s*=\s*)(["'])(\d*)\2/, (_, pre: string, q: string, n: string) => `${pre}${q}${Number(n) + this.added.length}${q}`);
+    const after = m.index + m[0].length;
+    if (open.endsWith('/>')) {
+      return this.text.slice(0, m.index) + open.slice(0, -2).replace(/\s+$/, '') + '>' + this.added.join('') + `</${P}sst>` + this.text.slice(after);
+    }
+    const close = this.text.lastIndexOf(`</${P}sst>`);
+    if (close < after) throw new PatchError(`${this.where} is damaged`);
+    // New <si> go after the last existing <si>: the schema puts <extLst> last.
+    const ext = this.text.slice(after, close).search(new RegExp(`<${regexEscape(P)}extLst\\b`));
+    const at = ext >= 0 ? after + ext : close;
+    return this.text.slice(0, m.index) + open + this.text.slice(after, at) + this.added.join('') + this.text.slice(at);
+  }
+}
+
+// ----- styles -----
+
+type StyleSectionName = 'numFmts' | 'fonts' | 'fills' | 'borders' | 'cellXfs';
+
+interface StyleSection {
+  start: number;
+  openEnd: number;
+  closeStart: number;
+  end: number;
+  open: string;
+  items: string[];
+  selfClosing: boolean;
+}
+
+const FONT_CHILD_ORDER = ['b', 'i', 'strike', 'condense', 'extend', 'outline', 'shadow', 'u', 'vertAlign', 'sz', 'color', 'name', 'family', 'charset', 'scheme'];
+const BORDER_CHILD_ORDER = ['start', 'end', 'left', 'right', 'top', 'bottom', 'diagonal', 'vertical', 'horizontal'];
+const XF_CHILD_ORDER = ['alignment', 'protection', 'extLst'];
+const DELTA_BORDER_STYLES: ReadonlySet<string> = new Set(['thin', 'medium', 'thick', 'dashed', 'dotted', 'double', 'hair']);
+const ARGB_RE = /^[0-9A-Fa-f]{8}$/;
+/** Built-in number formats that may be used by id (locale-independent ones only). */
+const BUILTIN_NUMFMT_IDS: Record<string, number> = { General: 0, '0': 1, '0.00': 2, '#,##0': 3, '#,##0.00': 4, '0%': 9, '0.00%': 10, '0.00E+00': 11, '# ?/?': 12, '# ??/??': 13, '@': 49 };
+/** Excel refuses more cell formats than this. */
+const MAX_CELL_XFS = 64000;
+
+/** The children of a container element of styles.xml (for example the <font> items of <fonts>). */
+function styleSection(text: string, P: string, container: StyleSectionName, child: string, where: string): StyleSection | undefined {
+  const m = new RegExp(`<${regexEscape(P)}${container}(?:\\s[^>]*?)?(/?)>`).exec(text);
+  if (!m) return undefined;
+  const start = m.index;
+  const openEnd = start + m[0].length;
+  if (m[1] === '/') return { start, openEnd, closeStart: openEnd, end: openEnd, open: m[0], items: [], selfClosing: true };
+  const closeTag = `</${P}${container}>`;
+  const closeStart = text.indexOf(closeTag, openEnd);
+  if (closeStart < 0) throw new PatchError(`${where} is damaged (<${container}>)`);
+  const body = text.slice(openEnd, closeStart);
+  const items: string[] = [];
+  const tag = `<${P}${child}`;
+  const endTag = `</${P}${child}>`;
+  for (let p = 0; ;) {
+    const i = body.indexOf(tag, p);
+    if (i < 0) break;
+    if (!isXmlNameEnd(body.charCodeAt(i + tag.length))) {
+      p = i + tag.length;
+      continue;
+    }
+    const gt = body.indexOf('>', i);
+    const end = body[gt - 1] === '/' ? gt + 1 : body.indexOf(endTag, gt) + endTag.length;
+    if (gt < 0 || end < gt) throw new PatchError(`${where} is damaged (<${child}>)`);
+    items.push(body.slice(i, end));
+    p = end;
+  }
+  return { start, openEnd, closeStart, end: closeStart + closeTag.length, open: m[0], items, selfClosing: false };
+}
+
+/** Later deltas override earlier ones property by property (every StyleDelta property is an absolute "set"). */
+function mergeStyleDeltas(deltas: readonly StyleDelta[]): StyleDelta {
+  const out: StyleDelta = {};
+  for (const delta of deltas) {
+    const border = delta.border ? { ...out.border, ...delta.border } : out.border;
+    Object.assign(out, delta);
+    if (border) out.border = border;
+  }
+  return out;
+}
+
+/** styles.xml, append-only: derived fonts / fills / borders / number formats / cell xfs are added (deduplicated). */
+class StylesPatch {
+  private readonly P: string;
+  private readonly sec: Record<StyleSectionName, StyleSection | undefined>;
+  private readonly added: Record<StyleSectionName, string[]> = { numFmts: [], fonts: [], fills: [], borders: [], cellXfs: [] };
+  private readonly memo = new Map<string, number>();
+  /** Highest numFmtId used anywhere in the part (numFmts, xfs, dxfs): a new custom format gets a higher id. */
+  private readonly maxNumFmtId: number;
+
+  constructor(private readonly text: string, private readonly where: string) {
+    let maxId = 163;
+    for (const m of text.matchAll(/\snumFmtId\s*=\s*["'](\d+)["']/g)) maxId = Math.max(maxId, Number(m[1]));
+    this.maxNumFmtId = maxId;
+    const P = (this.P = xmlRootPrefix(text, 'styleSheet', where));
+    this.sec = {
+      numFmts: styleSection(text, P, 'numFmts', 'numFmt', where),
+      fonts: styleSection(text, P, 'fonts', 'font', where),
+      fills: styleSection(text, P, 'fills', 'fill', where),
+      borders: styleSection(text, P, 'borders', 'border', where),
+      cellXfs: styleSection(text, P, 'cellXfs', 'xf', where),
+    };
+    if (!this.sec.fonts || !this.sec.fills || !this.sec.cellXfs) throw new PatchError(`${where} has no fonts, fills or cell formats`);
+  }
+
+  private count(name: StyleSectionName): number {
+    return (this.sec[name]?.items.length ?? 0) + this.added[name].length;
+  }
+
+  private item(name: StyleSectionName, i: number): string | undefined {
+    const base = this.sec[name]?.items ?? [];
+    return i < base.length ? base[i] : this.added[name][i - base.length];
+  }
+
+  /** Index of an item with exactly this XML, appending it when there is none. */
+  private push(name: StyleSectionName, xml: string): number {
+    const base = this.sec[name]?.items ?? [];
+    const found = base.indexOf(xml);
+    if (found >= 0) return found;
+    const added = this.added[name].indexOf(xml);
+    if (added >= 0) return base.length + added;
+    this.added[name].push(xml);
+    return this.count(name) - 1;
+  }
+
+  /** The xf that is xf `base` with the deltas applied (in order). Existing xfs never change. */
+  deriveXf(base: number, deltas: readonly StyleDelta[], where: string): number {
+    const key = `${base}|${JSON.stringify(deltas)}`;
+    const memo = this.memo.get(key);
+    if (memo !== undefined) return memo;
+    const P = this.P;
+    const xfXml = Number.isInteger(base) && base >= 0 ? this.item('cellXfs', base) : undefined;
+    if (xfXml === undefined) throw new PatchError(`${where}: the cell format ${base} does not exist`);
+    const d = mergeStyleDeltas(deltas);
+    const xf = parseXmlElement(xfXml, this.where);
+    const idOf = (name: string): number => Number(xmlAttrText(xf.attrs, name) ?? 0);
+    if (d.bold !== undefined || d.italic !== undefined || d.underline !== undefined || d.strike !== undefined || d.fontColor !== undefined) {
+      const fontXml = this.item('fonts', idOf('fontId'));
+      if (fontXml === undefined) throw new PatchError(`${where}: the font ${idOf('fontId')} does not exist`);
+      const font = parseXmlElement(fontXml, this.where);
+      const flag = (local: string, on: boolean | undefined): void => {
+        if (on !== undefined) setXmlChild(font, local, on ? `<${P}${local}/>` : null, FONT_CHILD_ORDER);
+      };
+      flag('b', d.bold);
+      flag('i', d.italic);
+      flag('strike', d.strike);
+      if (d.underline !== undefined) {
+        if (d.underline !== null && d.underline !== 'single' && d.underline !== 'double') throw new PatchError(`${where}: unknown underline`);
+        setXmlChild(font, 'u', d.underline === null ? null : d.underline === 'double' ? `<${P}u val="double"/>` : `<${P}u/>`, FONT_CHILD_ORDER);
+      }
+      if (d.fontColor !== undefined) {
+        if (d.fontColor !== null && !ARGB_RE.test(d.fontColor)) throw new PatchError(`${where}: invalid font colour`);
+        setXmlChild(font, 'color', d.fontColor === null ? null : `<${P}color rgb="${d.fontColor.toUpperCase()}"/>`, FONT_CHILD_ORDER);
+      }
+      setXmlAttr(xf.attrs, 'fontId', String(this.push('fonts', buildXmlElement(font))));
+      setXmlAttr(xf.attrs, 'applyFont', '1');
+    }
+    if (d.fill !== undefined) {
+      if (d.fill !== null && !ARGB_RE.test(d.fill)) throw new PatchError(`${where}: invalid fill colour`);
+      let fillId: number;
+      if (d.fill === null) {
+        const first = this.item('fills', 0) ?? '';
+        fillId = /patternType\s*=\s*["']none["']/.test(first) ? 0 : this.push('fills', `<${P}fill><${P}patternFill patternType="none"/></${P}fill>`);
+      } else {
+        fillId = this.push('fills', `<${P}fill><${P}patternFill patternType="solid"><${P}fgColor rgb="${d.fill.toUpperCase()}"/><${P}bgColor indexed="64"/></${P}patternFill></${P}fill>`);
+      }
+      setXmlAttr(xf.attrs, 'fillId', String(fillId));
+      setXmlAttr(xf.attrs, 'applyFill', '1');
+    }
+    if (d.border) {
+      const borderXml = this.item('borders', idOf('borderId'));
+      if (borderXml === undefined) throw new PatchError(`${where}: the border ${idOf('borderId')} does not exist`);
+      const border = parseXmlElement(borderXml, this.where);
+      for (const side of ['left', 'right', 'top', 'bottom'] as const) {
+        const value = d.border[side];
+        if (value === undefined) continue;
+        if (value !== null && (!DELTA_BORDER_STYLES.has(value.style) || (value.color !== undefined && !ARGB_RE.test(value.color)))) {
+          throw new PatchError(`${where}: invalid border`);
+        }
+        const xml = value === null
+          ? `<${P}${side}/>`
+          : value.color
+            ? `<${P}${side} style="${value.style}"><${P}color rgb="${value.color.toUpperCase()}"/></${P}${side}>`
+            : `<${P}${side} style="${value.style}"/>`;
+        setXmlChild(border, side, xml, BORDER_CHILD_ORDER);
+      }
+      setXmlAttr(xf.attrs, 'borderId', String(this.push('borders', buildXmlElement(border))));
+      setXmlAttr(xf.attrs, 'applyBorder', '1');
+    }
+    if (d.hAlign !== undefined || d.vAlign !== undefined || d.wrap !== undefined) {
+      const current = xf.children.find((child) => child.local === 'alignment');
+      const align = current ? parseXmlAttrs(current.open) : new Map<string, XmlAttr>();
+      if (d.hAlign !== undefined) {
+        if (d.hAlign !== null && !['left', 'center', 'right', 'justify'].includes(d.hAlign)) throw new PatchError(`${where}: invalid alignment`);
+        if (d.hAlign === null) align.delete('horizontal');
+        else setXmlAttr(align, 'horizontal', d.hAlign);
+      }
+      if (d.vAlign !== undefined) {
+        if (d.vAlign !== null && !['top', 'center', 'bottom'].includes(d.vAlign)) throw new PatchError(`${where}: invalid alignment`);
+        if (d.vAlign === null) align.delete('vertical');
+        else setXmlAttr(align, 'vertical', d.vAlign);
+      }
+      if (d.wrap !== undefined) {
+        if (d.wrap) setXmlAttr(align, 'wrapText', '1');
+        else align.delete('wrapText');
+      }
+      setXmlChild(xf, 'alignment', align.size ? `<${P}alignment${emitXmlAttrs(align)}/>` : null, XF_CHILD_ORDER);
+      setXmlAttr(xf.attrs, 'applyAlignment', '1');
+    }
+    if (d.numFmt !== undefined) {
+      setXmlAttr(xf.attrs, 'numFmtId', String(this.numFmtId(d.numFmt, where)));
+      setXmlAttr(xf.attrs, 'applyNumberFormat', '1');
+    }
+    if (d.quotePrefix !== undefined) {
+      if (d.quotePrefix) setXmlAttr(xf.attrs, 'quotePrefix', '1');
+      else xf.attrs.delete('quotePrefix');
+    }
+    const index = this.push('cellXfs', buildXmlElement(xf));
+    if (index >= MAX_CELL_XFS) throw new PatchError(`${where}: the file has too many cell formats`);
+    this.memo.set(key, index);
+    return index;
+  }
+
+  /**
+   * Id of a number format code: an existing <numFmt> with that code, a built-in id, or a new id ≥ 164 that no part of
+   * styles.xml uses yet (an xf may name a custom id that has no <numFmt>; reusing it would change those cells).
+   */
+  private numFmtId(code: string, where: string): number {
+    if (typeof code !== 'string' || !code || code.length > 255 || XML_INVALID_CHAR_RE.test(code)) throw new PatchError(`${where}: invalid number format`);
+    const items = (this.sec.numFmts?.items ?? []).concat(this.added.numFmts);
+    const ids = new Set<number>();
+    for (const item of items) {
+      const attrs = parseXmlAttrs(item);
+      const id = Number(xmlAttrText(attrs, 'numFmtId'));
+      if (xmlAttrText(attrs, 'formatCode') === code && Number.isInteger(id)) return id;
+      if (Number.isInteger(id)) ids.add(id);
+    }
+    const builtin = Object.hasOwn(BUILTIN_NUMFMT_IDS, code) ? BUILTIN_NUMFMT_IDS[code] : undefined;
+    if (builtin !== undefined && !ids.has(builtin)) return builtin;
+    const id = Math.max(this.maxNumFmtId, ...ids) + 1;
+    this.added.numFmts.push(`<${this.P}numFmt numFmtId="${id}" formatCode="${xmlEscapeAttr(code)}"/>`);
+    return id;
+  }
+
+  get changed(): boolean {
+    return Object.values(this.added).some((list) => list.length > 0);
+  }
+
+  toString(): string {
+    const P = this.P;
+    let text = this.text;
+    const withCount = (open: string, total: number): string =>
+      /\scount\s*=/.test(open) ? open.replace(/(\scount\s*=\s*)(["'])\d*\2/, (_, pre: string, q: string) => `${pre}${q}${total}${q}`) : open.replace(/\s*(\/?)>$/, ` count="${total}"$1>`);
+    // Apply from the end of the text backwards, so the offsets of earlier sections stay valid.
+    const names = (Object.keys(this.sec) as StyleSectionName[]).filter((name) => this.sec[name] && this.added[name].length);
+    names.sort((a, b) => (this.sec[b]?.start ?? 0) - (this.sec[a]?.start ?? 0));
+    for (const name of names) {
+      const s = this.sec[name];
+      if (!s) continue;
+      const open = withCount(s.open, s.items.length + this.added[name].length);
+      const items = this.added[name].join('');
+      text = s.selfClosing
+        ? text.slice(0, s.start) + open.slice(0, -2).replace(/\s+$/, '') + '>' + items + `</${P}${name}>` + text.slice(s.end)
+        : text.slice(0, s.start) + open + text.slice(s.openEnd, s.closeStart) + items + text.slice(s.closeStart);
+    }
+    if (!this.sec.numFmts && this.added.numFmts.length) {
+      const m = new RegExp(`<${regexEscape(P)}styleSheet\\b[^>]*>`).exec(text);
+      if (!m) throw new PatchError(`${this.where} is damaged`);
+      const at = m.index + m[0].length;
+      text = text.slice(0, at) + `<${P}numFmts count="${this.added.numFmts.length}">${this.added.numFmts.join('')}</${P}numFmts>` + text.slice(at);
+    }
+    return text;
+  }
+}
+
+// ----- workbook -----
+
+/** CT_Workbook children that come after <calcPr> (where a missing calcPr is inserted). */
+const AFTER_CALC_PR = ['oleSize', 'customWorkbookViews', 'pivotCaches', 'smartTagPr', 'smartTagTypes', 'webPublishing', 'fileRecoveryPr', 'webPublishObjects', 'extLst'];
+
+/** <calcPr fullCalcOnLoad="1"> with every other calc setting kept; calcPr is inserted in schema order when missing. */
+function setFullCalcOnLoad(text: string, where: string): string {
+  const P = xmlRootPrefix(text, 'workbook', where);
+  const m = new RegExp(`<${regexEscape(P)}calcPr\\b[^>]*>`).exec(text);
+  if (m) {
+    const tag = m[0];
+    const flag = /(\sfullCalcOnLoad\s*=\s*)(["'])([^"']*)\2/.exec(tag);
+    if (flag && (flag[3] === '1' || flag[3] === 'true')) return text;
+    const next = flag ? tag.replace(flag[0], `${flag[1]}${flag[2]}1${flag[2]}`) : tag.replace(/\s*(\/?)>$/, ' fullCalcOnLoad="1"$1>');
+    return text.slice(0, m.index) + next + text.slice(m.index + tag.length);
+  }
+  let at = text.lastIndexOf(`</${P}workbook>`);
+  if (at < 0) throw new PatchError(`${where} is damaged`);
+  for (const name of AFTER_CALC_PR) {
+    const i = text.search(new RegExp(`<${regexEscape(P)}${name}[\\s/>]`));
+    if (i >= 0 && i < at) at = i;
+  }
+  return text.slice(0, at) + `<${P}calcPr fullCalcOnLoad="1"/>` + text.slice(at);
+}
+
+/** Removes the elements `<Name …/>` / `<Name …>…</Name>` (any prefix) for which `drop(attrs)` is true. */
+function removeXmlElements(text: string, name: string, drop: (attrs: Map<string, XmlAttr>) => boolean): string {
+  const re = new RegExp(`<((?:[\\w.-]+:)?)${name}\\b[^>]*?(?:/>|>[\\s\\S]*?</\\1${name}>)`, 'g');
+  return text.replace(re, (element: string) => (drop(parseXmlAttrs(element.slice(0, element.indexOf('>') + 1))) ? '' : element));
+}
+
+/** [Content_Types].xml and workbook rels without the calcChain parts. */
+function dropCalcChainRefs(ctXml: string, wbRelsXml: string, wbPath: string, chainPaths: readonly string[]): { ctXml: string; wbRelsXml: string } {
+  const names = new Set(chainPaths.map((path) => path.toLowerCase()));
+  return {
+    ctXml: removeXmlElements(ctXml, 'Override', (attrs) => names.has(resolvePartTarget('', xmlAttrText(attrs, 'PartName') ?? '').toLowerCase())),
+    wbRelsXml: removeXmlElements(wbRelsXml, 'Relationship', (attrs) =>
+      xmlAttrText(attrs, 'TargetMode') !== 'External' && names.has(resolvePartTarget(wbPath, xmlAttrText(attrs, 'Target') ?? '').toLowerCase())),
+  };
+}
+
+// ===== XLSX SAVE =====
+//
+// Surgical xlsx save (P1, D-006; contract §2.3, §4.2). buildXlsx = the loaded bytes (`base`) + the PackageOps of the
+// journal: only the touched parts are rewritten, every other zip entry is copied byte for byte. verifyXlsx checks the
+// new bytes before anything is written (V1 zip, V2 XML, V3 read-back, V4 reload with the loader); checkPatchable tells
+// at load whether a file can be saved this way at all (else it is hard read-only, §4.7). ExcelJS never writes a file.
+
+
+export interface SaveReport {
+  changedParts: string[];
+  removedParts: string[];
+  identicalParts: number;
+  timings: Record<string, number>;
+}
+
+/**
+ * What one saved cell must hold (V3/V4). The expected value and formula come from the display model (§4.2 step 4).
+ * Content is checked when `value` or `formula` is given: `formula` absent = the cell has no formula; `value` with a
+ * formula = its cached value (absent = not checked); `value: null` = no value. `styleIndex` = the xf index (s).
+ */
+export interface CellExpectation {
+  sheet: number;
+  r: number;
+  c: number;
+  value?: FileValue | null;
+  formula?: string;
+  styleIndex?: number;
+}
+
+/** A check of the new bytes failed (§4.2 step 4): nothing is written, the edits are kept. */
+export class SaveVerifyError extends Error {
+  constructor(readonly step: 'V1' | 'V2' | 'V3' | 'V4', message: string) {
+    super(`${step}: ${message}`);
+    this.name = 'SaveVerifyError';
+  }
+}
+
+/** Rewritten parts up to this size are parsed whole in V2; bigger cell-patched sheet parts are checked row by row. */
+const VERIFY_FULL_PARSE_BYTES = 32 << 20;
+/** V4 (reload with the loader) runs for files up to this size unless the caller says otherwise (D-008). */
+export const VERIFY_DEEP_MAX_BYTES = 10 << 20;
+/** V4 also needs a modest sharedStrings part: text-heavy workbooks compress 25:1, a 3.7 MB file can hold 95 MB of strings. */
+export const VERIFY_DEEP_MAX_SST_BYTES = 32 << 20;
+
+/** Whether V4 (a synchronous ExcelJS reload) may run: the zip is small AND its parts are small once unpacked. */
+export function deepVerifyAllowed(bytes: Uint8Array): boolean {
+  if (bytes.length > VERIFY_DEEP_MAX_BYTES) return false;
+  try {
+    return !parseZip(bytes).entries.some((e) => /sharedStrings[^/]*$/i.test(e.name) && e.usize > VERIFY_DEEP_MAX_SST_BYTES);
+  } catch {
+    return false; // V1 reports a damaged zip
+  }
+}
+/** Most rows walked between two yields to the event loop (a walk also yields after SAVE_SLICE_MS, see saveSlicer). */
+const SAVE_YIELD_ROWS = 10_000;
+/** Text decoded and parsed between two yields in V2. */
+const VERIFY_PARSE_CHUNK = 256 << 10;
+
+const WORKSHEET_REL_RE = /\/worksheet$/;
+
+function saveNow(): number {
+  return performance.now();
+}
+
+/** Cell content patch (value or formula), as opposed to style-only or cached-only patches. */
+function isContentPatch(patch: CellPatch): boolean {
+  return patch.value !== undefined || patch.formula !== undefined;
+}
+
+/**
+ * Header cells of the tables of a sheet as {r0, r1, c0, c1} boxes (0-based, inclusive). Excel needs the header text to
+ * equal the tableColumn name and repairs the file otherwise, so a content patch there is refused (defense in depth,
+ * the edit layer blocks these cells too).
+ */
+async function tableHeaderBoxes(pkg: XlsxPackage, sheetPart: string, onYield?: SaveYieldHook): Promise<{ r0: number; r1: number; c0: number; c1: number }[]> {
+  const out: { r0: number; r1: number; c0: number; c1: number }[] = [];
+  const relsPath = entryNameOf(pkg.zip, relsPartOf(sheetPart));
+  const relsXml = relsPath ? await readPartText(pkg.zip, relsPath, onYield) : undefined;
+  if (!relsXml) return out;
+  for (const rel of parseRels(relsXml)) {
+    if (rel.external || !/\/table$/.test(rel.type)) continue;
+    const tablePath = entryNameOf(pkg.zip, resolvePartTarget(sheetPart, rel.target));
+    const xml = tablePath ? await readPartText(pkg.zip, tablePath, onYield) : undefined;
+    const tag = xml ? /<(?:[\w.-]+:)?table\b[^>]*>/.exec(xml)?.[0] : undefined;
+    if (!tag) continue;
+    const attrs = parseXmlAttrs(tag);
+    const m = /^\$?([A-Za-z]{1,3})\$?(\d+)(?::\$?([A-Za-z]{1,3})\$?(\d+))?$/.exec((xmlAttrText(attrs, 'ref') ?? '').trim());
+    if (!m) continue;
+    const headerRows = xmlAttrText(attrs, 'headerRowCount') === undefined ? 1 : Number(xmlAttrText(attrs, 'headerRowCount'));
+    if (!(headerRows > 0)) continue;
+    const r0 = parseInt(m[2], 10) - 1;
+    out.push({ r0, r1: r0 + headerRows - 1, c0: colToIndex(m[1].toUpperCase()), c1: colToIndex((m[3] ?? m[1]).toUpperCase()) });
+  }
+  return out;
+}
+
+/**
+ * Cells written outside the old <dimension ref>: widen it (Excel does not care, readers that trust the dimension do).
+ * The head of the part (everything before <sheetData>) is always inside parts[0].
+ */
+function widenDimension(parts: Buffer[], L: SheetXmlLayout, rows: Map<number, Map<number, CellPatch[]>>): void {
+  let r0 = Infinity;
+  let r1 = -1;
+  let c0 = Infinity;
+  let c1 = -1;
+  for (const [r, cols] of rows) {
+    for (const [c, list] of cols) {
+      if (!list.some((p) => isContentPatch(p) && p.value !== null)) continue;
+      r0 = Math.min(r0, r);
+      r1 = Math.max(r1, r);
+      c0 = Math.min(c0, c);
+      c1 = Math.max(c1, c);
+    }
+  }
+  if (r1 < 0 || parts[0].length < L.sdOpen) return;
+  const head = parts[0].toString('utf8', 0, L.sdOpen);
+  const re = new RegExp(`<${regexEscape(L.P)}dimension\\b[^>]*>`);
+  const tag = re.exec(head)?.[0];
+  if (!tag) return;
+  const attrs = parseXmlAttrs(tag);
+  const m = /^\$?([A-Za-z]{1,3})\$?(\d+)(?::\$?([A-Za-z]{1,3})\$?(\d+))?$/.exec((xmlAttrText(attrs, 'ref') ?? '').trim());
+  if (!m) return;
+  const a0 = colToIndex(m[1].toUpperCase());
+  const a1 = colToIndex((m[3] ?? m[1]).toUpperCase());
+  const b0 = parseInt(m[2], 10) - 1;
+  const b1 = parseInt(m[4] ?? m[2], 10) - 1;
+  const n0 = Math.min(a0, c0);
+  const n1 = Math.max(a1, c1);
+  const q0 = Math.min(b0, r0);
+  const q1 = Math.max(b1, r1);
+  if (n0 === a0 && n1 === a1 && q0 === b0 && q1 === b1) return;
+  const ref = `${indexToCol(n0)}${q0 + 1}:${indexToCol(n1)}${q1 + 1}`;
+  const newTag = tag.replace(/(\sref\s*=\s*)("[^"]*"|'[^']*')/, `$1"${ref}"`);
+  parts[0] = Buffer.concat([Buffer.from(head.replace(tag, () => newTag), 'utf8'), parts[0].subarray(L.sdOpen)]);
+}
+
+function sheetLabel(sheet: XlsxSheetRef): string {
+  return sheet.name || `sheet ${sheet.sheetId}`;
+}
+
+/** The worksheet with this sheetId (PatchError when there is none or it is not a worksheet, e.g. a chart sheet). */
+function worksheetOf(pkg: XlsxPackage, sheetId: number): XlsxSheetRef & { part: string } {
+  const sheet = pkg.sheets.find((s) => s.sheetId === sheetId);
+  if (!sheet) throw new PatchError(`the workbook has no sheet with id ${sheetId}`);
+  if (!WORKSHEET_REL_RE.test(sheet.type)) throw new PatchError(`the sheet "${sheetLabel(sheet)}" is not a worksheet`);
+  if (!sheet.part || !pkg.zip.get(sheet.part)) throw new PatchError(`the part of the sheet "${sheetLabel(sheet)}" is missing`);
+  return sheet as XlsxSheetRef & { part: string };
+}
+
+/**
+ * The new package for `base` with `ops` applied (§4.2 step 3). Only `cells` ops exist in P1 (others throw PatchError
+ * until P4). No ops, or ops that change nothing, return `base` itself: an unmodified workbook is never re-serialized.
+ * Throws ZipError / PatchError when the package cannot be patched safely (nothing is written). Cooperative: yields
+ * every `yieldEvery` rows, 8 MB of CRC and between parts; `onYield` runs at every yield and may throw to cancel.
+ */
+export async function buildXlsx(
+  base: Uint8Array,
+  ops: readonly PackageOp[],
+  o?: { yieldEvery?: number; onYield?: SaveYieldHook },
+): Promise<{ bytes: Uint8Array; report: SaveReport }> {
+  const t0 = saveNow();
+  const timings: Record<string, number> = {};
+  const lap = (name: string, from: number): number => {
+    const now = saveNow();
+    timings[name] = (timings[name] ?? 0) + (now - from);
+    return now;
+  };
+  const unchanged = (identical: number): { bytes: Uint8Array; report: SaveReport } => {
+    timings.total = saveNow() - t0;
+    return { bytes: base, report: { changedParts: [], removedParts: [], identicalParts: identical, timings } };
+  };
+  if (!ops.length) {
+    let identical = 0;
+    try {
+      identical = parseZip(base).entries.length;
+    } catch {
+      // Save As of a clean, unpatchable (hard read-only) file: base is written as it is.
+    }
+    return unchanged(identical);
+  }
+  const onYield = o?.onYield;
+  const yieldEvery = Math.max(1, Math.floor(o?.yieldEvery ?? SAVE_YIELD_ROWS));
+  let t = t0;
+  const zip = parseZip(base);
+  const pkg = await openXlsxPackage(zip, onYield);
+  if (pkg.strict) throw new PatchError('it uses Strict Open XML');
+  // Group the cell patches per sheet and cell, in op order (later patches apply on top of earlier ones).
+  const bySheet = new Map<number, Map<number, Map<number, CellPatch[]>>>();
+  let needSst = false;
+  let needStyles = false;
+  for (const op of ops) {
+    if (op.kind !== 'cells') throw new PatchError(`saving "${op.kind}" changes is not supported yet`);
+    let rows = bySheet.get(op.sheet);
+    if (!rows) bySheet.set(op.sheet, (rows = new Map()));
+    for (const [r, c, patch] of op.cells) {
+      if (!Number.isInteger(r) || !Number.isInteger(c) || r < 0 || r >= MAX_ROWS || c < 0 || c >= MAX_COLS) {
+        throw new PatchError(`a change has an invalid cell position (${r}, ${c})`);
+      }
+      let cols = rows.get(r);
+      if (!cols) rows.set(r, (cols = new Map()));
+      let list = cols.get(c);
+      if (!list) cols.set(c, (list = []));
+      list.push(patch);
+      if (patch.value && patch.value.t === 's') needSst = true;
+      if (patch.style?.length) needStyles = true;
+    }
+  }
+  let sst: SharedStringsPatch | undefined;
+  if (needSst && pkg.sstPath) {
+    sst = new SharedStringsPatch((await readPartText(zip, pkg.sstPath, onYield)) ?? '', pkg.sstPath);
+  }
+  let styles: StylesPatch | undefined;
+  if (needStyles) {
+    if (!pkg.stylesPath) throw new PatchError('it has no styles part');
+    styles = new StylesPatch((await readPartText(zip, pkg.stylesPath, onYield)) ?? '', pkg.stylesPath);
+  }
+  t = lap('open', t);
+  const changes = new Map<string, readonly Uint8Array[] | null>();
+  for (const [sheetId, rows] of bySheet) {
+    const sheet = worksheetOf(pkg, sheetId);
+    const entry = zip.get(sheet.part);
+    if (!entry) throw new PatchError(`the part of the sheet "${sheetLabel(sheet)}" is missing`);
+    const buf = await readEntry(zip, entry, onYield);
+    t = lap('inflate', t);
+    const L = await sheetLayout(buf, `the sheet "${sheetLabel(sheet)}"`, onYield);
+    const contentCells = new Set<number>();
+    for (const [r, cols] of rows) {
+      for (const [c, list] of cols) if (list.some(isContentPatch)) contentCells.add(r * MAX_COLS + c);
+    }
+    if (contentCells.size) {
+      for (const box of await tableHeaderBoxes(pkg, sheet.part, onYield)) {
+        for (const key of contentCells) {
+          const r = Math.floor(key / MAX_COLS);
+          const c = key % MAX_COLS;
+          if (r >= box.r0 && r <= box.r1 && c >= box.c0 && c <= box.c1) {
+            throw new PatchError(`${sheetLabel(sheet)}!${indexToCol(c)}${r + 1} is a table header cell (Excel needs it to match the table column name)`);
+          }
+        }
+      }
+    }
+    const ctx: CellPatchContext = {
+      P: L.P,
+      where: sheetLabel(sheet),
+      sst: () => sst,
+      styles: () => {
+        if (!styles) throw new PatchError('the style table was not loaded');
+        return styles;
+      },
+      arrays: contentCells.size ? await findArrayRanges(buf, L, onYield) : [],
+      masters: [],
+    };
+    const fns = new Map<number, Map<number, CellPatchFn>>();
+    for (const [r, cols] of rows) {
+      const rowFns = new Map<number, CellPatchFn>();
+      for (const [c, list] of cols) {
+        rowFns.set(c, (oldXml, rr, cc, inheritS) => {
+          let xml = oldXml;
+          for (const patch of list) xml = applyCellPatch(xml, patch, rr, cc, inheritS, ctx) ?? undefined;
+          return xml ?? null;
+        });
+      }
+      fns.set(r, rowFns);
+    }
+    const res = await patchSheetCells(buf, L, fns, { yieldEvery, onYield });
+    // Defense in depth (D-068): a shared-formula master whose content changed must have no clone left that still
+    // points at it (P2 de-shares at plan time; a clone without its own new content would lose its formula).
+    for (const master of ctx.masters) {
+      for (const cell of await findSharedFormulaCells(buf, L, master.si, onYield)) {
+        if (!cell.master && !contentCells.has(cell.r * MAX_COLS + cell.c)) {
+          throw new PatchError(
+            `${ctx.where}!${master.addr} is the first cell of a shared formula that ${indexToCol(cell.c)}${cell.r + 1} still uses`,
+          );
+        }
+      }
+    }
+    if (res.changed) {
+      widenDimension(res.parts, L, rows);
+      changes.set(entry.name, res.parts);
+    }
+    t = lap('sheets', t);
+    await saveYield(onYield);
+  }
+  if (!changes.size) return unchanged(zip.entries.length);
+  if (sst?.changed && pkg.sstPath) changes.set(pkg.sstPath, [Buffer.from(sst.toString(), 'utf8')]);
+  if (styles?.changed && pkg.stylesPath) changes.set(pkg.stylesPath, [Buffer.from(styles.toString(), 'utf8')]);
+  t = lap('sharedStringsStyles', t);
+  // workbook: full calculation on load (cached values may be stale); the calc chain is dropped with its relationship
+  // and content type (a stale chain makes Excel repair the file; s2-save negative control).
+  const wbXml = setFullCalcOnLoad(pkg.wbXml, pkg.wbPath);
+  if (wbXml !== pkg.wbXml) changes.set(pkg.wbPath, [Buffer.from(wbXml, 'utf8')]);
+  if (pkg.calcChainPaths.length) {
+    const dropped = dropCalcChainRefs(pkg.ctXml, pkg.wbRelsXml, pkg.wbPath, pkg.calcChainPaths);
+    if (dropped.ctXml !== pkg.ctXml) changes.set('[Content_Types].xml', [Buffer.from(dropped.ctXml, 'utf8')]);
+    if (dropped.wbRelsXml !== pkg.wbRelsXml) changes.set(pkg.wbRelsPath, [Buffer.from(dropped.wbRelsXml, 'utf8')]);
+    for (const path of pkg.calcChainPaths) changes.set(path, null);
+  }
+  t = lap('workbook', t);
+  const written = await writeZip(zip, changes, { onYield });
+  lap('zip', t);
+  timings.total = saveNow() - t0;
+  return {
+    bytes: written.bytes,
+    report: { changedParts: written.changed, removedParts: written.removed, identicalParts: written.identical, timings },
+  };
+}
+
+// ----- verify -----
+
+/** V2: the whole part is well-formed UTF-8 XML (saxes, fed in 256 KB pieces with yields in between). */
+async function verifyXmlWellFormed(data: Uint8Array, where: string, onYield?: SaveYieldHook): Promise<void> {
+  const parser = new SaxesParser({ xmlns: false });
+  let error: string | undefined;
+  parser.on('error', (err: Error) => {
+    error ??= err.message;
+  });
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  for (let i = 0; i < data.length && error === undefined; i += VERIFY_PARSE_CHUNK) {
+    try {
+      parser.write(decoder.decode(data.subarray(i, Math.min(data.length, i + VERIFY_PARSE_CHUNK)), { stream: true }));
+    } catch (err) {
+      error ??= saveErrorText(err);
+    }
+    if (data.length > VERIFY_PARSE_CHUNK) await saveYield(onYield);
+  }
+  if (error === undefined) {
+    try {
+      const rest = decoder.decode();
+      if (rest) parser.write(rest);
+      parser.close();
+    } catch (err) {
+      error ??= saveErrorText(err);
+    }
+  }
+  if (error !== undefined) throw new SaveVerifyError('V2', `${where} is not well-formed XML (${error})`);
+}
+
+/** Row spans of a sheet part's <sheetData> (walks the whole part; yields every SAVE_YIELD_ROWS rows or SAVE_SLICE_MS). */
+async function sheetRowSpans(buf: Buffer, L: SheetXmlLayout, onYield?: SaveYieldHook): Promise<RowSpan[]> {
+  const rows: RowSpan[] = [];
+  if (L.sdSelfClosing) return rows;
+  const step = saveSlicer(onYield, SAVE_YIELD_ROWS);
+  for (let pos = L.sdOpenEnd; ;) {
+    const rs = findStartTag(buf, L.rowTag, pos, L.sdClose);
+    if (rs < 0) break;
+    const row = readRowAt(buf, L, rs);
+    rows.push(row);
+    pos = row.end;
+    const pause = step();
+    if (pause) await pause;
+  }
+  return rows;
+}
+
+/**
+ * V2 for a big sheet part that only had cell patches: every patched row is parsed alone (well-formed), the rows are
+ * in order, and the part without the patched rows is byte-identical to the base part without them (so every splice
+ * point is a row element boundary and nothing else moved). Self-closing <sheetData/> in the base → full parse.
+ */
+async function verifySheetRows(baseBuf: Buffer, newBuf: Buffer, patchedRows: ReadonlySet<number>, where: string, onYield?: SaveYieldHook): Promise<void> {
+  let baseRows: RowSpan[];
+  let newRows: RowSpan[];
+  let LB: SheetXmlLayout;
+  try {
+    LB = await sheetLayout(baseBuf, where, onYield);
+    if (LB.sdSelfClosing) {
+      await verifyXmlWellFormed(newBuf, where, onYield);
+      return;
+    }
+    baseRows = await sheetRowSpans(baseBuf, LB, onYield);
+    newRows = await sheetRowSpans(newBuf, await sheetLayout(newBuf, where, onYield), onYield);
+  } catch (err) {
+    if (err instanceof PatchError) throw new SaveVerifyError('V2', saveErrorText(err));
+    throw err;
+  }
+  let prevR = -1;
+  for (const row of newRows) {
+    if (row.r <= prevR) throw new SaveVerifyError('V2', `${where} has rows out of order (row ${row.r + 1})`);
+    prevR = row.r;
+    if (patchedRows.has(row.r)) await verifyXmlWellFormed(newBuf.subarray(row.start, row.end), `${where} row ${row.r + 1}`, onYield);
+  }
+  /** The part as a list of [start, end) spans without the patched rows. */
+  const kept = (rows: readonly RowSpan[], size: number): [number, number][] => {
+    const out: [number, number][] = [];
+    let from = 0;
+    for (const row of rows) {
+      if (!patchedRows.has(row.r)) continue;
+      out.push([from, row.start]);
+      from = row.end;
+    }
+    out.push([from, size]);
+    return out;
+  };
+  const a = kept(baseRows, baseBuf.length);
+  const b = kept(newRows, newBuf.length);
+  // Compare the two span lists as one byte stream each.
+  let ia = 0;
+  let ib = 0;
+  let pa = a[0][0];
+  let pb = b[0][0];
+  let compared = 0;
+  for (;;) {
+    while (ia < a.length && pa >= a[ia][1]) pa = ++ia < a.length ? a[ia][0] : 0;
+    while (ib < b.length && pb >= b[ib][1]) pb = ++ib < b.length ? b[ib][0] : 0;
+    if (ia >= a.length || ib >= b.length) {
+      if (ia < a.length || ib < b.length) throw new SaveVerifyError('V2', `${where} changed outside the edited rows`);
+      return;
+    }
+    const n = Math.min(a[ia][1] - pa, b[ib][1] - pb, 8 << 20);
+    if (baseBuf.compare(newBuf, pb, pb + n, pa, pa + n) !== 0) throw new SaveVerifyError('V2', `${where} changed outside the edited rows`);
+    pa += n;
+    pb += n;
+    compared += n;
+    if (compared >= 8 << 20) {
+      compared = 0;
+      await saveYield(onYield);
+    }
+  }
+}
+
+/** The text of an <si> / <is> body: all <t> runs, without phonetic (<rPh>) text, unescaped and _xHHHH_-decoded. */
+function xstringItemText(xml: string, P: string): string {
+  const body = xml.replace(new RegExp(`<${regexEscape(P)}rPh\\b[\\s\\S]*?</${regexEscape(P)}rPh>`, 'g'), '');
+  let text = '';
+  for (const m of body.matchAll(new RegExp(`<${regexEscape(P)}t(?:\\s[^>]*)?(?:/>|>([\\s\\S]*?)</${regexEscape(P)}t>)`, 'g'))) {
+    text += m[1] ?? '';
+  }
+  return decodeXstring(xmlUnescape(text));
+}
+
+/** One cell as found in the saved XML (V3). */
+interface SavedCell {
+  s: number;
+  formula?: string;
+  /** The <f> is a clone of a shared formula (<f t="shared" si="n"/>, no text of its own; kept byte for byte). */
+  sharedClone?: boolean;
+  /** undefined = no value. */
+  value?: FileValue;
+}
+
+/** Reads the <c> element text of a saved cell (strings through `sstText`). */
+function readSavedCell(xml: string, P: string, where: string, sstText: (i: number) => string): SavedCell {
+  const gt = xml.indexOf('>');
+  const attrs = parseXmlAttrs(xml.slice(0, gt + 1));
+  const out: SavedCell = { s: Number(xmlAttrText(attrs, 's') ?? 0) };
+  if (xml[gt - 1] === '/') return out;
+  const children = splitXmlChildren(xml.slice(gt + 1, xml.length - `</${P}c>`.length), where);
+  const t = xmlAttrText(attrs, 't') ?? 'n';
+  const f = children.find((child) => child.local === 'f');
+  if (f) {
+    const fAttrs = parseXmlAttrs(f.open);
+    out.formula = f.open.endsWith('/>') ? '' : xmlUnescape(f.xml.slice(f.open.length, f.xml.length - `</${P}f>`.length));
+    if (xmlAttrText(fAttrs, 't') === 'shared' && !fAttrs.has('ref')) out.sharedClone = true;
+  }
+  const is = children.find((child) => child.local === 'is');
+  const v = children.find((child) => child.local === 'v');
+  if (t === 'inlineStr' && is) {
+    out.value = { t: 's', v: xstringItemText(is.xml, P) };
+  } else if (v) {
+    const raw = v.open.endsWith('/>') ? '' : xmlUnescape(v.xml.slice(v.open.length, v.xml.length - `</${P}v>`.length));
+    switch (t) {
+      case 's':
+        out.value = { t: 's', v: sstText(Number(raw)) };
+        break;
+      case 'str':
+        out.value = { t: 's', v: decodeXstring(raw) };
+        break;
+      case 'b':
+        out.value = { t: 'b', v: raw.trim() === '1' || raw.trim() === 'true' };
+        break;
+      case 'e':
+        out.value = { t: 'e', v: raw };
+        break;
+      case 'n':
+        out.value = { t: 'n', v: raw.trim() === '' ? NaN : Number(raw) };
+        break;
+      default:
+        throw new SaveVerifyError('V3', `${where} has the unexpected cell type "${t}"`);
+    }
+  }
+  return out;
+}
+
+function fileValueText(value: FileValue | null | undefined): string {
+  return value === undefined ? 'nothing' : value === null ? 'no value' : `${value.t}:${JSON.stringify(value.v)}`;
+}
+
+function sameFileValue(a: FileValue | null | undefined, b: FileValue | null | undefined): boolean {
+  if (!a || !b) return !a && !b;
+  return a.t === b.t && (a.t === 'n' ? a.v === b.v || (Number.isNaN(a.v) && Number.isNaN(b.v as number)) : a.v === b.v);
+}
+
+/** Shared strings of the saved package, read once and indexed lazily (V3). */
+function sharedStringReader(text: string | undefined, where: string): (i: number) => string {
+  let items: string[] | undefined;
+  let P = '';
+  return (i: number): string => {
+    if (text === undefined) throw new SaveVerifyError('V3', `${where}: a cell uses a shared string but the file has none`);
+    if (!items) {
+      P = xmlRootPrefix(text, 'sst', 'sharedStrings');
+      items = [];
+      const tag = `<${P}si`;
+      const end = `</${P}si>`;
+      for (let p = text.indexOf(tag); p >= 0; p = text.indexOf(tag, p + tag.length)) {
+        if (!isXmlNameEnd(text.charCodeAt(p + tag.length))) continue;
+        const gt = text.indexOf('>', p);
+        const close = text[gt - 1] === '/' ? gt + 1 : text.indexOf(end, gt) + end.length;
+        items.push(text.slice(p, close));
+        p = close - tag.length;
+      }
+    }
+    const item = Number.isInteger(i) ? items[i] : undefined;
+    if (item === undefined) throw new SaveVerifyError('V3', `${where}: shared string ${i} does not exist`);
+    return xstringItemText(item, P);
+  };
+}
+
+/** V3: every expected cell is in the new sheet XML with the expected value / formula / style index. */
+async function verifyReadBack(zip: ZipPackage, expect: readonly CellExpectation[], cache: ReadonlyMap<string, Buffer>, onYield?: SaveYieldHook): Promise<void> {
+  if (!expect.length) return;
+  let pkg: XlsxPackage;
+  try {
+    pkg = await openXlsxPackage(zip, onYield);
+  } catch (err) {
+    if (err instanceof PatchError || err instanceof ZipError) throw new SaveVerifyError('V3', saveErrorText(err));
+    throw err;
+  }
+  let sstText: string | undefined;
+  if (pkg.sstPath) sstText = cache.get(pkg.sstPath)?.toString('utf8') ?? (await readPartText(zip, pkg.sstPath, onYield));
+  const sstAt = sharedStringReader(sstText, 'sharedStrings');
+  const bySheet = new Map<number, CellExpectation[]>();
+  for (const e of expect) {
+    const list = bySheet.get(e.sheet);
+    if (list) list.push(e);
+    else bySheet.set(e.sheet, [e]);
+  }
+  for (const [sheetId, list] of bySheet) {
+    let sheet: XlsxSheetRef & { part: string };
+    let L: SheetXmlLayout;
+    let buf: Buffer;
+    const wanted = new Map<number, Map<number, string>>();
+    for (const e of list) wanted.set(e.r, new Map());
+    try {
+      sheet = worksheetOf(pkg, sheetId);
+      const entry = zip.get(sheet.part);
+      if (!entry) throw new PatchError(`the part of sheet ${sheetId} is missing`);
+      buf = cache.get(entry.name) ?? (await readEntry(zip, entry, onYield));
+      L = await sheetLayout(buf, `the sheet "${sheetLabel(sheet)}"`, onYield);
+      let last = -1;
+      for (const r of wanted.keys()) last = Math.max(last, r);
+      const step = saveSlicer(onYield, SAVE_YIELD_ROWS);
+      for (let pos = L.sdOpenEnd; !L.sdSelfClosing;) {
+        const rs = findStartTag(buf, L.rowTag, pos, L.sdClose);
+        if (rs < 0) break;
+        const row = readRowAt(buf, L, rs);
+        const cells = wanted.get(row.r);
+        if (cells && !row.selfClosing) {
+          const text = decodeRowText(buf, row, L.where);
+          const body = text.slice(row.tag.length, text.lastIndexOf(`</${L.P}row>`));
+          for (const span of parseRowCells(body, L.P, row.r, L.where)) cells.set(span.c, body.slice(span.start, span.end));
+        }
+        if (row.r >= last) break;
+        pos = row.end;
+        const pause = step();
+        if (pause) await pause;
+      }
+    } catch (err) {
+      if (err instanceof PatchError || err instanceof ZipError) throw new SaveVerifyError('V3', saveErrorText(err));
+      throw err;
+    }
+    for (const e of list) {
+      const where = `${sheetLabel(sheet)}!${indexToCol(e.c)}${e.r + 1}`;
+      const xml = wanted.get(e.r)?.get(e.c);
+      const got: SavedCell = xml === undefined ? { s: 0 } : readSavedCell(xml, L.P, where, sstAt);
+      if (e.styleIndex !== undefined && got.s !== e.styleIndex) {
+        throw new SaveVerifyError('V3', `${where} has style ${got.s}, expected ${e.styleIndex}`);
+      }
+      if (e.value === undefined && e.formula === undefined) continue;
+      // A shared-formula clone has no formula text of its own: only a cached-value patch can leave it in place (its <f>
+      // bytes are kept); the expanded formula is compared by V4.
+      const formulaOk = got.sharedClone ? e.formula !== undefined : (got.formula ?? undefined) === e.formula;
+      if (!formulaOk) {
+        throw new SaveVerifyError('V3', `${where} has the formula ${JSON.stringify(got.formula ?? null)}, expected ${JSON.stringify(e.formula ?? null)}`);
+      }
+      if (e.value !== undefined && !sameFileValue(got.value, e.value)) {
+        throw new SaveVerifyError('V3', `${where} holds ${fileValueText(got.value ?? null)}, expected ${fileValueText(e.value)}`);
+      }
+    }
+  }
+}
+
+/** V4: the new bytes load with the loader and every expected cell shows the expected value / formula (D-008). */
+async function verifyDeep(bytes: Uint8Array, expect: readonly CellExpectation[]): Promise<void> {
+  if (!expect.length) return;
+  let model: WorkbookModel;
+  try {
+    model = workbookToModel(await loadWorkbook(bytes));
+  } catch (err) {
+    throw new SaveVerifyError('V4', `the saved file cannot be read back (${saveErrorText(err)})`);
+  }
+  const worksheets = model.workbook.worksheets;
+  for (const e of expect) {
+    const index = worksheets.findIndex((ws) => ws.id === e.sheet);
+    const where = `${index >= 0 ? worksheets[index].name : `sheet ${e.sheet}`}!${indexToCol(e.c)}${e.r + 1}`;
+    if (index < 0) throw new SaveVerifyError('V4', `${where}: the sheet is missing after reload`);
+    if (e.value === undefined && e.formula === undefined) continue;
+    const cell = model.getRows(index, e.r, e.r + 1, e.c, e.c).rows.find((row) => row.r === e.r)?.cells.find((x) => x.c === e.c);
+    // Cases where the loader shows something else for correct XML (V3 still checks the XML): not comparable here.
+    if (cell?.link !== undefined) continue; // hyperlink cells: the loader drops the formula / shows the link text
+    if (model.getMeta().sheets[index]?.merges.some((m) => e.r >= m.r0 && e.r <= m.r1 && e.c >= m.c0 && e.c <= m.c1 && !(e.r === m.r0 && e.c === m.c0))) continue; // merged non-anchor cell
+    if (e.value && e.value.t === 'n' && cell?.t === 'e' && cell.v === '#VALUE!') continue; // a huge number in a date format
+    if (e.value && e.value.t === 's' && e.value.v === '') continue; // an empty string value reads back as an empty cell
+    const formula = e.formula === undefined ? undefined : displayFormula(e.formula);
+    if ((cell?.f || undefined) !== (formula || undefined)) {
+      throw new SaveVerifyError('V4', `${where} shows the formula ${JSON.stringify(cell?.f ?? null)} after reload, expected ${JSON.stringify(formula ?? null)}`);
+    }
+    if (e.value === undefined) continue;
+    const empty = !cell || cell.t === 'z' || (formula !== undefined && cell.t === 's' && cell.v === '');
+    let same: boolean;
+    if (e.value === null) {
+      same = empty;
+    } else if (e.value.t === 'n') {
+      const v = cell?.v;
+      same = typeof v === 'number' && (cell?.t === 'n' ? v === e.value.v : cell?.t === 'd' && Math.abs(v - e.value.v) <= 1e-8 * Math.max(1, Math.abs(v)));
+    } else if (e.value.t === 's') {
+      same = cell?.t === 's' && cell.v === e.value.v;
+    } else {
+      same = cell?.t === e.value.t && cell.v === e.value.v;
+    }
+    if (!same) {
+      throw new SaveVerifyError('V4', `${where} shows ${cell ? `${cell.t}:${JSON.stringify(cell.v ?? null)}` : 'nothing'} after reload, expected ${fileValueText(e.value)}`);
+    }
+  }
+}
+
+/**
+ * Checks the bytes buildXlsx made from `base` and `ops` before they are written (§4.2 step 4). Throws SaveVerifyError
+ * (nothing may be written) when: V1 the zip does not parse, an entry is missing / added / reordered, an entry that
+ * `ops` cannot change is not byte-identical, a rewritten entry does not inflate to its size + CRC, or a removed part
+ * is still referenced; V2 a rewritten XML part is not well-formed (big cell-patched sheet parts: each patched row is
+ * parsed and the rest must equal the base); V3 an expected cell is not in the new XML as expected; V4 (`o.deep`,
+ * default: file ≤ 10 MB) the loader does not show the expected cells.
+ */
+export async function verifyXlsx(
+  base: Uint8Array,
+  bytes: Uint8Array,
+  ops: readonly PackageOp[],
+  expect: CellExpectation[],
+  o?: { deep: boolean; onYield?: SaveYieldHook },
+): Promise<void> {
+  const onYield = o?.onYield;
+  let baseZip: ZipPackage;
+  let zip: ZipPackage;
+  try {
+    baseZip = parseZip(base);
+  } catch (err) {
+    throw new SaveVerifyError('V1', `the original file is not a valid zip package (${saveErrorText(err)})`);
+  }
+  try {
+    zip = parseZip(bytes);
+  } catch (err) {
+    throw new SaveVerifyError('V1', `the new file is not a valid zip package (${saveErrorText(err)})`);
+  }
+  // ----- V1: entry set, order, raw bytes -----
+  const allowedChanged = new Set<string>();
+  const allowedRemoved = new Set<string>();
+  const patchedRows = new Map<string, Set<number>>();
+  let basePkg: XlsxPackage | undefined;
+  if (ops.length) {
+    try {
+      basePkg = await openXlsxPackage(baseZip, onYield);
+    } catch (err) {
+      if (err instanceof PatchError || err instanceof ZipError) throw new SaveVerifyError('V1', saveErrorText(err));
+      throw err;
+    }
+    for (const op of ops) {
+      if (op.kind !== 'cells') throw new SaveVerifyError('V1', `"${op.kind}" changes cannot be checked yet`);
+      let part: string;
+      try {
+        part = worksheetOf(basePkg, op.sheet).part.toLowerCase();
+      } catch (err) {
+        throw new SaveVerifyError('V1', saveErrorText(err));
+      }
+      allowedChanged.add(part);
+      let rows = patchedRows.get(part);
+      if (!rows) patchedRows.set(part, (rows = new Set()));
+      for (const [r] of op.cells) rows.add(r);
+    }
+    for (const path of [basePkg.sstPath, basePkg.stylesPath, basePkg.wbPath, basePkg.wbRelsPath, '[Content_Types].xml']) {
+      if (path) allowedChanged.add(path.toLowerCase());
+    }
+    for (const path of basePkg.calcChainPaths) allowedRemoved.add(path.toLowerCase());
+  }
+  if (baseZip.comment.compare(zip.comment) !== 0) throw new SaveVerifyError('V1', 'the zip comment changed');
+  if (baseZip.buf.compare(zip.buf, 0, zip.prefixEnd, 0, baseZip.prefixEnd) !== 0) {
+    throw new SaveVerifyError('V1', 'the bytes before the first part changed');
+  }
+  const rewritten = new Map<string, Buffer>();
+  const removed: string[] = [];
+  for (const e of baseZip.entries) {
+    const n = zip.get(e.name);
+    if (!n) {
+      if (!allowedRemoved.has(e.name.toLowerCase())) throw new SaveVerifyError('V1', `the part ${e.name} is missing`);
+      removed.push(e.name);
+      continue;
+    }
+    const same = n.method === e.method && n.crc === e.crc && n.usize === e.usize && n.csize === e.csize &&
+      n.spanEnd - n.lho === e.spanEnd - e.lho && baseZip.buf.compare(zip.buf, n.lho, n.spanEnd, e.lho, e.spanEnd) === 0 &&
+      n.nameBytes.equals(e.nameBytes);
+    if (same) continue;
+    if (!allowedChanged.has(e.name.toLowerCase())) throw new SaveVerifyError('V1', `the part ${e.name} changed but must stay byte-identical`);
+    try {
+      rewritten.set(n.name, await readEntry(zip, n, onYield));
+    } catch (err) {
+      if (err instanceof ZipError) throw new SaveVerifyError('V1', saveErrorText(err));
+      throw err; // cancelled (onYield)
+    }
+  }
+  const expectedOrder = baseZip.entries.filter((e) => zip.get(e.name)).map((e) => e.name);
+  if (zip.entries.length !== expectedOrder.length) throw new SaveVerifyError('V1', 'the new file has parts the original does not have');
+  if (zip.entries.some((e, i) => e.name !== expectedOrder[i])) throw new SaveVerifyError('V1', 'the order of the zip directory changed');
+  const expectedLocal = baseZip.byOffset.filter((e) => zip.get(e.name)).map((e) => e.name);
+  if (zip.byOffset.some((e, i) => e.name !== expectedLocal[i])) throw new SaveVerifyError('V1', 'the order of the parts changed');
+  if (removed.length && basePkg) {
+    // A removed part must not be referenced any more (content type override, workbook relationship).
+    const ct = rewritten.get('[Content_Types].xml')?.toString('utf8') ?? (await readPartText(zip, '[Content_Types].xml', onYield)) ?? '';
+    const relsEntry = zip.get(basePkg.wbRelsPath);
+    const rels = (relsEntry && (rewritten.get(relsEntry.name)?.toString('utf8') ?? (await readPartText(zip, relsEntry.name, onYield)))) ?? '';
+    const gone = new Set(removed.map((name) => name.toLowerCase()));
+    for (const m of ct.matchAll(/<(?:[\w.-]+:)?Override\b[^>]*>/g)) {
+      const name = xmlAttrText(parseXmlAttrs(m[0]), 'PartName');
+      if (name && gone.has(resolvePartTarget('', name).toLowerCase())) throw new SaveVerifyError('V1', `the removed part ${name} still has a content type`);
+    }
+    for (const rel of parseRels(rels)) {
+      if (!rel.external && gone.has(resolvePartTarget(basePkg.wbPath, rel.target).toLowerCase())) {
+        throw new SaveVerifyError('V1', `the removed part ${rel.target} is still referenced by the workbook`);
+      }
+    }
+  }
+  // ----- V2: rewritten XML parts are well-formed -----
+  for (const [name, data] of rewritten) {
+    if (!/\.(xml|rels)$/i.test(name)) continue;
+    const rows = patchedRows.get(name.toLowerCase());
+    if (data.length > VERIFY_FULL_PARSE_BYTES && rows) {
+      const baseEntry = baseZip.get(name);
+      if (!baseEntry) throw new SaveVerifyError('V2', `${name} has no original`);
+      await verifySheetRows(await readEntry(baseZip, baseEntry, onYield), data, rows, name, onYield);
+    } else {
+      await verifyXmlWellFormed(data, name, onYield);
+    }
+  }
+  // ----- V3: read back the edited cells -----
+  await verifyReadBack(zip, expect, rewritten, onYield);
+  // ----- V4: reload with the loader (small files) -----
+  if (o?.deep ?? deepVerifyAllowed(bytes)) await verifyDeep(bytes, expect);
+}
+
+// ----- patchable check -----
+
+/** Hard read-only scan of one worksheet part (§4.7): rows with numbers and in order, cells inside their row and in order. */
+async function scanSheetPart(buf: Buffer, where: string, yieldEvery: number, onYield?: SaveYieldHook): Promise<void> {
+  const L = await sheetLayout(buf, where, onYield);
+  if (L.sdSelfClosing) return;
+  const gapOk = (from: number, to: number): boolean => {
+    if (to <= from) return true;
+    return /^(?:\s|<!--[\s\S]*?-->)*$/.test(buf.toString('latin1', from, to));
+  };
+  let pos = L.sdOpenEnd;
+  let prevR = -1;
+  const step = saveSlicer(onYield, yieldEvery);
+  for (;;) {
+    const rs = findStartTag(buf, L.rowTag, pos, L.sdClose);
+    if (!gapOk(pos, rs < 0 ? L.sdClose : rs)) throw new PatchError(`${where} has cells outside a row`);
+    if (rs < 0) break;
+    const row = readRowAt(buf, L, rs);
+    if (row.r <= prevR) throw new PatchError(`${where} has rows out of order (row ${row.r + 1})`);
+    prevR = row.r;
+    if (!row.selfClosing) {
+      const inner = buf.toString('latin1', row.openEnd, row.end - L.rowEndTag.length);
+      // The patcher walks bytes, not an XML tree: a comment or CDATA section inside a row could hide a fake <c> or </row>.
+      if (inner.includes('<!--') || inner.includes('<![CDATA[')) throw new PatchError(`${where} has an XML comment or CDATA section inside a row (row ${row.r + 1})`);
+      parseRowCells(inner, L.P, row.r, where);
+    }
+    pos = row.end;
+    const pause = step();
+    if (pause) await pause;
+  }
+}
+
+/**
+ * Whether the save path can patch this package (§4.7 hard read-only; reason = plain text for "FileStudio cannot
+ * edit this file safely: <reason>. It is open read-only."): ZIP64, encrypted entries, compression other than
+ * store/deflate, duplicate part names, damaged zip, Strict Open XML, parts that are not UTF-8, and — unless
+ * `scanSheets` is false — every worksheet part is scanned for rows without numbers, rows out of order and cells
+ * outside their row or out of order. Cooperative (for the background check after load); `onYield` may throw to cancel.
+ */
+export async function checkPatchable(
+  base: Uint8Array,
+  o?: { scanSheets?: boolean; yieldEvery?: number; onYield?: SaveYieldHook },
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const state = { cancelled: false };
+  const userYield = o?.onYield;
+  const onYield: SaveYieldHook | undefined = userYield
+    ? (): void => {
+      try {
+        userYield();
+      } catch (err) {
+        state.cancelled = true;
+        throw err;
+      }
+    }
+    : undefined;
+  const yieldEvery = Math.max(1, Math.floor(o?.yieldEvery ?? SAVE_YIELD_ROWS));
+  try {
+    const zip = parseZip(base);
+    const pkg = await openXlsxPackage(zip, onYield);
+    if (pkg.strict) return { ok: false, reason: 'it uses Strict Open XML' };
+    for (const path of [pkg.sstPath, pkg.stylesPath]) {
+      const entry = path ? zip.get(path) : undefined;
+      if (entry) {
+        const text = partText(await readEntry(zip, entry, onYield), entry.name);
+        if (path === pkg.sstPath && (text.includes('<!--') || text.includes('<![CDATA['))) {
+          return { ok: false, reason: 'its shared strings contain an XML comment or CDATA section' };
+        }
+      }
+    }
+    if (o?.scanSheets !== false) {
+      for (const sheet of pkg.sheets) {
+        if (!WORKSHEET_REL_RE.test(sheet.type)) continue;
+        const entry = sheet.part ? zip.get(sheet.part) : undefined;
+        if (!entry) return { ok: false, reason: `the part of the sheet "${sheetLabel(sheet)}" is missing` };
+        await scanSheetPart(await readEntry(zip, entry, onYield), `the sheet "${sheetLabel(sheet)}"`, yieldEvery, onYield);
+        await saveYield(onYield);
+      }
+    }
+    return { ok: true };
+  } catch (err) {
+    if (state.cancelled) throw err;
+    if (err instanceof ZipError || err instanceof PatchError) return { ok: false, reason: err.message };
+    return { ok: false, reason: `it could not be checked (${saveErrorText(err)})` };
+  }
 }

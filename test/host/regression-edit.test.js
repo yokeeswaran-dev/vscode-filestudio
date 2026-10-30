@@ -226,3 +226,19 @@ test('R3-027: Open with FileStudio on a text tab replaces it; a tab with unsaved
     assert.equal(T.tabGroup.tabs.includes(textTab), isDirty, isDirty ? 'dirty text tab kept' : 'clean text tab closed');
   }
 });
+
+test('size limit: a workbook over the limit shows the "too large to edit" banner in init', async () => {
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet('Data');
+  sheet.getCell(1001, 100).value = 1; // 100,100 cells
+  const uri = writeTmp('too-large.xlsx', Buffer.from(await workbook.xlsx.writeBuffer()));
+  const provider = new host.SheetEditorProvider(extensionUri);
+  const document = provider.openCustomDocument(uri, {}, token);
+  const panel = T.createPanel();
+  provider.resolveCustomEditor(document, panel, token);
+  panel.send({ type: 'ready' });
+  const init = await waitFor(() => lastOf(panel, 'init'), 5000, 'init');
+  assert.match(init.banner, /too large to edit safely in this version/);
+  assert.match(init.banner, /later version/);
+  assert.equal(init.readOnly, true);
+});

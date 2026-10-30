@@ -8,21 +8,32 @@
 //
 // All of them share getHtml() (strict CSP + nonce) and the message protocol below.
 
-import type { CellStyle, Range, RowData, SelectionStats, WorkbookMeta } from './renderers/sheet';
+import type { CellExpectation, CellStyle, PackageOp, Range, RowData, SaveReport, SelectionStats, WorkbookMeta } from './renderers/sheet';
 import type { TaskMarker, TocEntry } from './renderers/markdown';
 import type { PptxDeckMeta, PptxSlide } from './renderers/pptx';
 import type { BorderSide, EditIntent, EditKind, FindQuery, SheetId, SheetMeta, StyleDelta } from './renderers/sheet';
 import type { MdBlock, MdTextEdit } from './renderers/markdown';
 
 import { execFile } from 'child_process';
-import { randomBytes } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { constants as fsConstants } from 'fs';
 import { access, open as openFileHandle, stat as statPath } from 'fs/promises';
+import * as fsp from 'fs/promises';
+import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
+  buildXlsx,
+  checkPatchable,
   CsvGridModel,
   detectLossyFeatures,
+  hardReadOnlyText,
+  xlsxTooLargeReason,
+  xlsxEditCostBytes,
+  lossyEditAnyway,
+  SaveVerifyError,
+  deepVerifyAllowed,
+  verifyXlsx,
   detectSsvDelimiter,
   loadWorkbook,
   parseCsv,
@@ -82,7 +93,8 @@ export type AskId =
   | 'sheetDelete'
   | 'fidelity'
   | 'ownerFile'
-  | 'inPlaceNoBackup';
+  | 'inPlaceNoBackup'
+  | 'externalChange';
 
 /** Extension -> webview. */
 export type HostMessage =
@@ -1738,7 +1750,7 @@ export class SerialQueue {
 export async function ask(
   id: AskId,
   message: string,
-  options: { modal: true; detail?: string },
+  options: { modal: boolean; detail?: string },
   ...buttons: string[]
 ): Promise<string | undefined> {
   if (testApiEnabled) {
@@ -1846,16 +1858,16 @@ export interface DocGateState {
   block?: string;
 }
 
-/** §3.2 step 3 (synchronous): document state → poisoned, lossy, fidelity (pending first), hard blocks. */
+/** §3.2 step 3 (synchronous): document state → poisoned, hard blocks (before lossy: no "Edit anyway" for a hard read-only file), lossy, fidelity (pending first). */
 export function documentGate(s: DocGateState): GateResult {
   if (s.poisoned) return { ok: false, code: 'internal', reason: EDIT_TEXT.poisoned };
+  if (s.block !== undefined) return { ok: false, code: 'blocked', reason: s.block };
   if (s.lossy && !s.lossy.accepted) return { ok: false, code: 'lossy', reason: EDIT_TEXT.lossy };
   if (s.fidelity) {
     if (s.fidelity.pending) return { ok: false, code: 'fidelity', reason: EDIT_TEXT.fidelityPending };
     if (s.fidelity.blocked !== undefined) return { ok: false, code: 'blocked', reason: s.fidelity.blocked };
     if (!s.fidelity.ok && !s.fidelity.accepted) return { ok: false, code: 'fidelity', reason: EDIT_TEXT.fidelity };
   }
-  if (s.block !== undefined) return { ok: false, code: 'blocked', reason: s.block };
   return { ok: true };
 }
 
@@ -2446,14 +2458,8 @@ type Workbook = Awaited<ReturnType<typeof loadWorkbook>>;
 
 const EMPTY_STATS: Readonly<SelectionStats> = Object.freeze({ count: 0, numCount: 0, sum: 0 });
 
-function toUint8Array(data: ArrayBuffer | ArrayBufferView): Uint8Array {
-  return ArrayBuffer.isView(data)
-    ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
-    : new Uint8Array(data);
-}
-
 function sameUri(a: vscode.Uri, b: vscode.Uri): boolean {
-  return a.toString() === b.toString();
+  return a.toString() === b.toString() || isSameFile(a, b); // case-insensitive paths on Windows and macOS (D-F12)
 }
 
 function lossyBanner(features: readonly string[], what: 'workbook' | 'presentation' = 'workbook'): string | undefined {
@@ -2461,9 +2467,382 @@ function lossyBanner(features: readonly string[], what: 'workbook' | 'presentati
   return `This ${what} contains content that FileStudio does not display: ${features.join(', ')}.`;
 }
 
+// ----- safe write (contract §4.4) -----
+
+/** The file system calls the safe write and the save checks use (node fs/promises). Tests pass a faulty copy (ENOSPC, EXDEV ...). */
+export type SafeFs = Pick<
+  typeof fsp,
+  'open' | 'rename' | 'unlink' | 'copyFile' | 'realpath' | 'stat' | 'readFile' | 'writeFile' | 'access' | 'mkdir' | 'readdir'
+>;
+
+/** Seams for tests only (nothing in the product sets them): a faulty file system, a pause after the verify step. */
+export const sheetSaveHooks: {
+  fs: SafeFs;
+  /** Runs after build + verify, before the write (contract §14 P1: an external change in this window must be caught). */
+  afterVerify?: () => void | Promise<void>;
+  /** The next hot-exit backup fails its verify step. */
+  failBackupVerify?: boolean;
+} = { fs: fsp };
+
+/** What writeFileSafely left behind. `finish()` deletes the in-place pre-image once the caller has read the file back. */
+export interface SafeWriteResult {
+  inPlace: boolean;
+  /** Path of the copy of the file as it was before an in-place write (kept until `finish`). */
+  preImage?: string;
+  finish(): Promise<void>;
+}
+
+function errnoCode(err: unknown): string | undefined {
+  return (err as NodeJS.ErrnoException | undefined)?.code;
+}
+
+function randomTag(): string {
+  return randomBytes(6).toString('hex');
+}
+
+async function writeAllAt(handle: fsp.FileHandle, bytes: Uint8Array): Promise<void> {
+  let offset = 0;
+  while (offset < bytes.length) {
+    const { bytesWritten } = await handle.write(bytes, offset, bytes.length - offset, offset);
+    if (bytesWritten <= 0) throw new Error('The file system accepted no more data.');
+    offset += bytesWritten;
+  }
+}
+
 /**
- * An .xlsx file opened in the spreadsheet editor. Loading starts on construction and never rejects: failures are
- * kept in `loadError` so the webview can show them. Phase 1 is read-only; phase 2 records edits through `pushEdit`.
+ * Writes `bytes` to `target` so that a crash never leaves a half-written file (contract §4.4). Default: a temp file
+ * in the folder of the real file (symlinks stay intact), fsync, the Zone.Identifier stream and the mode bits copied,
+ * rename over the target. In place only for a hard link, a folder without write rights, or EXDEV; then a pre-image of
+ * the CURRENT file is made first and written back when the write fails. Other schemes use `workspace.fs.writeFile`.
+ */
+export async function writeFileSafely(
+  target: vscode.Uri,
+  bytes: Uint8Array,
+  o: { storageDir?: string; fs?: SafeFs } = {},
+): Promise<SafeWriteResult> {
+  if (target.scheme !== 'file') {
+    await vscode.workspace.fs.writeFile(target, bytes);
+    return { inPlace: false, finish: async () => undefined };
+  }
+  const fs = o.fs ?? sheetSaveHooks.fs;
+  let real = target.fsPath;
+  let st: Awaited<ReturnType<SafeFs['stat']>> | undefined;
+  try {
+    real = await fs.realpath(real);
+    st = await fs.stat(real);
+  } catch (err) {
+    if (errnoCode(err) !== 'ENOENT') throw err;
+  }
+  const posix = process.platform !== 'win32';
+  if (st && st.nlink > 1) return writeInPlace(fs, real, bytes, o.storageDir);
+  // A new file would get the folder's permissions and lose the Hidden / System flags: write such a file in place.
+  if (st && process.platform === 'win32' && (await hasCustomWindowsMetadata(real))) return writeInPlace(fs, real, bytes, o.storageDir);
+
+  const dir = path.dirname(real);
+  const name = path.basename(real);
+  await removeStaleTemps(fs, dir, name);
+  const tmp = path.join(dir, `.~${name.slice(0, 40)}.fs-${randomTag()}.tmp`); // a short name: a 250-character file name must not break the temp name
+  let handle: fsp.FileHandle | undefined;
+  try {
+    try {
+      handle = await fs.open(tmp, 'wx', st && posix ? Number(st.mode) & 0o7777 : undefined);
+    } catch (err) {
+      // No right to create files in the folder: the file itself may still be writable.
+      if (st && ['EACCES', 'EPERM', 'EROFS'].includes(errnoCode(err) ?? '')) return writeInPlace(fs, real, bytes, o.storageDir);
+      throw err;
+    }
+    await writeAllAt(handle, bytes);
+    await handle.sync();
+    if (st && posix) await handle.chmod(Number(st.mode) & 0o7777); // a 0600 workbook must not become 0644
+    await handle.close();
+    handle = undefined;
+    if (st && process.platform === 'win32') await copyZoneIdentifier(fs, real, tmp);
+    try {
+      await renameWithRetry(fs, tmp, real);
+    } catch (err) {
+      if (st && errnoCode(err) === 'EXDEV') {
+        await fs.unlink(tmp).catch(() => undefined);
+        return writeInPlace(fs, real, bytes, o.storageDir);
+      }
+      const code = errnoCode(err);
+      if (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES') {
+        logError(`[sheet] Could not replace ${name}`, err);
+        throw new Error(`“${name}” is open in another program (for example Excel). Close it there, then save again.`);
+      }
+      throw err;
+    }
+  } catch (err) {
+    if (handle) await handle.close().catch(() => undefined);
+    await fs.unlink(tmp).catch(() => undefined);
+    throw err;
+  }
+  return { inPlace: false, finish: async () => undefined };
+}
+
+/** A crash between the temp write and the rename leaves `.~name.fs-<tag>.tmp`: remove those of this file older than 10 minutes. Never fails the save. */
+async function removeStaleTemps(fs: SafeFs, dir: string, name: string): Promise<void> {
+  try {
+    const re = new RegExp(`^\\.~${regexEscapeText(name.slice(0, 40))}\\.fs-[0-9a-f]{12}\\.tmp$`);
+    for (const entry of await fs.readdir(dir)) {
+      if (!re.test(entry)) continue;
+      const file = path.join(dir, entry);
+      const st = await fs.stat(file);
+      if (st.isFile() && Date.now() - st.mtimeMs > 10 * 60 * 1000) await fs.unlink(file);
+    }
+  } catch {
+    // Best effort.
+  }
+}
+
+function regexEscapeText(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Pre-images (`.~name.fs-<tag>.prev`) an interrupted in-place write left next to `file` or in the storage folder. */
+async function findPreImages(file: string, storageDir: string | undefined): Promise<string[]> {
+  const found: string[] = [];
+  const name = path.basename(file);
+  const looks = (entry: string, inDir: boolean): boolean =>
+    inDir ? entry.startsWith(`.~${name}.fs-`) && entry.endsWith('.prev') : entry.endsWith(`-${name}.prev`);
+  for (const [dir, inDir] of [[path.dirname(file), true], [storageDir, false]] as const) {
+    if (!dir) continue;
+    try {
+      for (const entry of await fsp.readdir(dir)) if (looks(entry, inDir)) found.push(path.join(dir, entry));
+    } catch {
+      // No such folder.
+    }
+  }
+  return found;
+}
+
+/**
+ * Windows only: true when the file has its own ACL (an entry that is not inherited from the folder) or the Hidden / System
+ * flag. A temp file + rename would lose both. Any failure of the tools means "no" (the normal path).
+ */
+async function hasCustomWindowsMetadata(file: string): Promise<boolean> {
+  const run = (cmd: string): Promise<string> =>
+    new Promise((resolve, reject) => {
+      execFile(cmd, [file], { windowsHide: true, timeout: 5000 }, (err, out) => (err ? reject(err) : resolve(String(out))));
+    });
+  try {
+    const acl = await run('icacls');
+    // The file path is in the first line: a name like "Budget (I).xlsx" must not look like an inherited entry.
+    if (acl.split(file).join('').split('\n').some((line) => line.includes(':(') && !line.includes('(I)'))) return true;
+    const attrs = await run('attrib');
+    const at = attrs.toLowerCase().indexOf(file.toLowerCase());
+    return at > 0 && /[HS]/i.test(attrs.slice(0, at));
+  } catch {
+    return false;
+  }
+}
+
+/** Rename over the target; a short lock (antivirus, sync client, preview pane) gives EPERM/EBUSY/EACCES on Windows: retry a few times. */
+async function renameWithRetry(fs: SafeFs, from: string, to: string): Promise<void> {
+  const delays = process.platform === 'win32' ? [100, 200, 300, 400] : [];
+  for (let i = 0; ; i++) {
+    try {
+      await fs.rename(from, to);
+      return;
+    } catch (err) {
+      const code = errnoCode(err);
+      if (i >= delays.length || !(code === 'EPERM' || code === 'EBUSY' || code === 'EACCES')) throw err;
+      await new Promise((resolve) => setTimeout(resolve, delays[i]));
+    }
+  }
+}
+
+/** The "downloaded from the internet" mark of the old file (NTFS alternate stream) goes to the new file too. */
+async function copyZoneIdentifier(fs: SafeFs, from: string, to: string): Promise<void> {
+  try {
+    const mark = await fs.readFile(`${from}:Zone.Identifier`);
+    await fs.writeFile(`${to}:Zone.Identifier`, mark);
+  } catch {
+    // No mark, or a file system without streams.
+  }
+}
+
+async function writeInPlace(
+  fs: SafeFs,
+  real: string,
+  bytes: Uint8Array,
+  storageDir: string | undefined,
+): Promise<SafeWriteResult> {
+  const dir = path.dirname(real);
+  const name = path.basename(real);
+  // The pre-image is a copy of the CURRENT file: an old .bak holds an older version and does not protect this write.
+  let preImage: string | undefined;
+  const candidates = [path.join(dir, `.~${name}.fs-${randomTag()}.prev`)];
+  if (storageDir) candidates.push(path.join(storageDir, `${randomTag()}-${name}.prev`));
+  for (const candidate of candidates) {
+    try {
+      if (path.dirname(candidate) === storageDir) await fs.mkdir(storageDir, { recursive: true });
+      await fs.copyFile(real, candidate, fsConstants.COPYFILE_EXCL);
+      preImage = candidate;
+      break;
+    } catch {
+      // Try the next place.
+    }
+  }
+  if (!preImage) {
+    const answer = await ask(
+      'inPlaceNoBackup',
+      `FileStudio cannot keep a safety copy while saving “${name}” in place. Save anyway?`,
+      { modal: true },
+      'Save',
+    );
+    if (answer !== 'Save') throw new vscode.CancellationError();
+  }
+  let handle: fsp.FileHandle | undefined;
+  try {
+    handle = await fs.open(real, 'r+');
+    await writeAllAt(handle, bytes);
+    await handle.truncate(bytes.length);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+  } catch (err) {
+    if (handle) await handle.close().catch(() => undefined);
+    if (preImage) {
+      try {
+        await fs.copyFile(preImage, real);
+        await fs.unlink(preImage).catch(() => undefined);
+      } catch (restoreErr) {
+        logError(`[sheet] Could not write the pre-image ${preImage} back to ${real}`, restoreErr);
+        throw new Error(`${errorMessageOf(err)} The original file is saved at ${preImage}.`);
+      }
+    }
+    throw err;
+  }
+  const kept = preImage;
+  return {
+    inPlace: true,
+    ...(kept ? { preImage: kept } : {}),
+    finish: async () => {
+      if (kept) await fs.unlink(kept).catch(() => undefined);
+    },
+  };
+}
+
+/** Owner / lock files that other programs leave next to an open workbook (Excel `~$`, LibreOffice `.~lock.`). */
+async function ownerFileOf(fs: SafeFs, uri: vscode.Uri): Promise<string | undefined> {
+  if (uri.scheme !== 'file') return undefined;
+  const dir = path.dirname(uri.fsPath);
+  const name = path.basename(uri.fsPath);
+  for (const candidate of new Set([`~$${name}`, `~$${name.slice(2)}`, `.~lock.${name}#`])) {
+    try {
+      await fs.stat(path.join(dir, candidate));
+      return candidate;
+    } catch {
+      // Not there.
+    }
+  }
+  return undefined;
+}
+
+/** A user text when `uri` cannot be written now (read-only attribute, or open in another program), else undefined. */
+async function writeBlockOf(fs: SafeFs, uri: vscode.Uri): Promise<string | undefined> {
+  if (uri.scheme !== 'file') return undefined;
+  const name = path.basename(uri.fsPath);
+  try {
+    await fs.access(uri.fsPath, fsConstants.W_OK);
+  } catch (err) {
+    if (errnoCode(err) === 'ENOENT') return undefined;
+    return `“${name}” is read-only (no write permission). Use Save As to keep your edits.`;
+  }
+  try {
+    const handle = await fs.open(uri.fsPath, 'r+');
+    await handle.close();
+  } catch (err) {
+    const code = errnoCode(err);
+    if (code === 'EACCES') return `“${name}” cannot be written (no write permission). Use Save As to keep your edits.`;
+    if (code === 'EBUSY' || code === 'EPERM' || code === 'ETXTBSY') {
+      return `“${name}” is open in another program (for example Excel). Close it there, then save again.`;
+    }
+  }
+  return undefined;
+}
+
+// ----- SheetDocument -----
+
+/** Package changes of one user action (contract §4.1). P2 fills `apply`/`invert` (display) and `after.expect`. */
+export interface JournalEdit {
+  id: number;
+  label: string;
+  /** Changes which cell a position means (structure, merge): raises `structureVersion` (contract §3.3). */
+  structural?: boolean;
+  after: { ops: PackageOp[]; expect: CellExpectation[] };
+  /** Redo on the display model; throws = poison (§3.5). */
+  apply?(): void | Promise<void>;
+  /** Undo on the display model; throws = poison. */
+  invert?(): void | Promise<void>;
+}
+
+/** The sidecar next to a hot-exit backup (contract §4.6). */
+interface BackupSidecar {
+  v: 1;
+  lossyAccepted: boolean;
+  sourceStamp: DiskStamp | null;
+  divergedFromDisk: boolean;
+}
+
+interface LoadedSheet {
+  data: Uint8Array;
+  workbook: Workbook;
+  model: WorkbookModel;
+  lossy: string[];
+  stamp: DiskStamp | undefined;
+  fromBackup: boolean;
+  sidecar?: BackupSidecar;
+}
+
+function sameStamp(a: DiskStamp | undefined, b: DiskStamp | undefined): boolean {
+  return a !== undefined && b !== undefined && a.size === b.size && a.mtime === b.mtime;
+}
+
+function sha256Of(bytes: Uint8Array): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+/**
+ * One expectation per cell: the file holds the LAST state of a cell, so an earlier edit of the same cell must not be
+ * checked against the file (edit A1 twice: only the second value is there).
+ */
+function lastExpectations(list: readonly CellExpectation[]): CellExpectation[] {
+  const byCell = new Map<string, CellExpectation>();
+  for (const e of list) {
+    const key = `${e.sheet}:${e.r}:${e.c}`;
+    byCell.delete(key);
+    byCell.set(key, e);
+  }
+  return [...byCell.values()];
+}
+
+/** The cells a list of ops writes, as V3 expectations (used where the display model gives none: the test API). */
+export function expectationsOfOps(ops: readonly PackageOp[]): CellExpectation[] {
+  const byCell = new Map<string, CellExpectation>();
+  for (const op of ops) {
+    if (op.kind !== 'cells') continue;
+    for (const [r, c, patch] of op.cells) {
+      const key = `${op.sheet}:${r}:${c}`;
+      if (patch.value === undefined && patch.formula === undefined) continue; // style / cached-only: nothing to read back
+      const e: CellExpectation = { sheet: op.sheet, r, c };
+      if (patch.formula !== undefined) {
+        e.formula = patch.formula;
+        if (patch.cached !== undefined) e.value = patch.cached;
+      } else {
+        e.value = patch.value;
+      }
+      byCell.set(key, e);
+    }
+  }
+  return [...byCell.values()];
+}
+
+/**
+ * An .xlsx file opened in the spreadsheet editor (contract §4). Loading starts on construction and never rejects:
+ * failures are kept in `loadError` so the webview can show them. The file on disk is always `base` (the loaded bytes)
+ * plus the package ops of `journal[0..pos)`; ExcelJS only displays. Everything that changes state runs in `queue`.
+ * P1 has no edit UI: the test API pushes edits; P2 wires the real ones through `commit`.
  */
 export class SheetDocument implements vscode.CustomDocument {
   /** Every webview panel currently showing this document. */
@@ -2474,37 +2853,68 @@ export class SheetDocument implements vscode.CustomDocument {
   readonly onDidChange = this._onDidChange.event;
   private readonly _onDidDispose = new vscode.EventEmitter<void>();
   readonly onDidDispose = this._onDidDispose.event;
+  private readonly _onDidChangeState = new vscode.EventEmitter<void>();
+  /** The document's own edit state changed (poisoned, lossy accepted, hard read-only found, reloaded). */
+  readonly onDidChangeState = this._onDidChangeState.event;
+  /** Set by the provider: every panel shows the reloaded workbook (after a revert chosen from the external-change warning). */
+  onReloaded: (() => void) | undefined;
+
+  readonly queue = new SerialQueue();
 
   private _loading: Promise<void>;
+  /** The first load only. Jobs that run in the queue wait for this one, never for `_loading`: a queued reload is `_loading` and waits behind them. */
+  private readonly initialLoad: Promise<void>;
   private _workbook: Workbook | undefined;
   private _model: WorkbookModel | undefined;
   private _loadError: unknown;
   private _lossyFeatures: string[] = [];
 
-  /** Bumped by every edit / undo / redo; equals savedVersion when the in-memory workbook matches the last save. */
-  private changeVersion = 0;
-  private savedVersion = 0;
-  /** Loaded from a backup or untitled data, so the bytes on disk are not what the workbook holds. */
+  /** Exact bytes loaded (disk or hot-exit backup); changes only on reload / revert (contract §4.1). */
+  private base: Uint8Array = new Uint8Array(0);
+  private journal: JournalEdit[] = [];
+  private pos = 0;
+  private stateId = 0;
+  private savedStateId = 0;
+  private nextStateId = 1;
+  /** The state id at `pos` 0 (0 at open; a new id after every revert / reload). */
+  private baseStateId = 0;
+  private generation = 0;
+  private version = 0;
+  private structureVersion = 0;
+  /** Restored from hot exit, or the disk changed while dirty and the user kept the edits. */
   private divergedFromDisk = false;
-  /** The file as last loaded or saved by us; a watcher event with the same stamp is not an external change. */
+  /** The file as we last read or wrote it; a watcher event with the same stamp is not an external change. */
   private diskStamp: DiskStamp | undefined;
+  /** A restored backup without a readable sidecar: every save asks `diskChangedOnSave` until one save succeeds. */
+  private stampUnknown = false;
+  private lossyAccepted = false;
+  private lossyAcceptedList: string[] = [];
+  private poisoned = false;
+  private hardReadOnlyReason: string | undefined;
+  /** Over the size limit (set at load): no edit is recorded, so nothing can write the file. */
+  private tooLarge = false;
+  private scan: Promise<void> | undefined;
+  private warnedStamp: DiskStamp | undefined;
   /** Our own write to the file, if one is in progress (its watcher events must not trigger a reload). */
   private ownWrite: Promise<void> = Promise.resolve();
   private bakAttempted = false;
   private disposed = false;
+  /** The report of the last save of the own file (test API `lastSaveReport`). */
+  lastSaveReport: SaveReport | undefined;
 
   /** Opens `uri`, restoring from the hot-exit backup (falling back to the file) or untitled data when given. */
-  static open(uri: vscode.Uri, openContext: vscode.CustomDocumentOpenContext): SheetDocument {
-    if (openContext.untitledDocumentData) return new SheetDocument(uri, [openContext.untitledDocumentData]);
-    if (openContext.backupId) return new SheetDocument(uri, [vscode.Uri.parse(openContext.backupId), uri]);
-    return new SheetDocument(uri, [uri]);
+  static open(uri: vscode.Uri, openContext: vscode.CustomDocumentOpenContext, storageDir?: string): SheetDocument {
+    if (openContext.untitledDocumentData) return new SheetDocument(uri, [openContext.untitledDocumentData], storageDir);
+    if (openContext.backupId) return new SheetDocument(uri, [vscode.Uri.parse(openContext.backupId), uri], storageDir);
+    return new SheetDocument(uri, [uri], storageDir);
   }
 
   private constructor(
     readonly uri: vscode.Uri,
     sources: (vscode.Uri | Uint8Array)[],
+    private readonly storageDir: string | undefined,
   ) {
-    this._loading = this.load(sources);
+    this._loading = this.initialLoad = this.loadInitial(sources);
   }
 
   get fileName(): string {
@@ -2533,182 +2943,738 @@ export class SheetDocument implements vscode.CustomDocument {
     return this._lossyFeatures;
   }
 
+  /** Banner for a workbook over the size limit (hard read-only), else undefined. */
+  get tooLargeBanner(): string | undefined {
+    return this.tooLarge ? this.hardReadOnlyReason : undefined;
+  }
+
   get hasUnsavedChanges(): boolean {
-    return this.divergedFromDisk || this.changeVersion !== this.savedVersion;
+    return this.stateId !== this.savedStateId || this.divergedFromDisk;
   }
 
-  /**
-   * Phase 2 entry point: puts an edit on VS Code's undo stack (marking the document dirty). `undo`/`redo` must
-   * update the workbook and notify the webviews themselves.
-   */
-  pushEdit(edit: { label: string; undo: () => void | Thenable<void>; redo: () => void | Thenable<void> }): void {
-    this.changeVersion++;
-    this._onDidChange.fire({
-      document: this,
-      label: edit.label,
-      undo: async () => {
-        this.changeVersion++;
-        await edit.undo();
-      },
-      redo: async () => {
-        this.changeVersion++;
-        await edit.redo();
-      },
-    });
-  }
-
-  /** Writes the workbook to its own file. An unmodified workbook is never re-serialized (ExcelJS is lossy). */
-  async save(token: vscode.CancellationToken): Promise<void> {
-    if (!this.hasUnsavedChanges) {
-      getLog().info(`[sheet] Save of ${this.fileName} skipped: no changes, the file on disk is left untouched`);
-      return;
-    }
-    await this.writeBakOnce();
-    const write = this.writeWorkbookTo(this.uri, token).then(async () => {
-      this.diskStamp = await diskStampOf(this.uri);
-    });
-    this.ownWrite = write.catch(() => undefined);
-    await write;
-    this.markSaved();
-  }
-
-  async saveAs(target: vscode.Uri, token: vscode.CancellationToken): Promise<void> {
-    if (sameUri(target, this.uri)) {
-      await this.save(token);
-      return;
-    }
-    await this.writeTo(target, token);
-  }
-
-  /** Discards in-memory state and reloads the file from disk. */
-  async revert(): Promise<void> {
-    this._loading = this.load([this.uri]);
-    await this._loading;
-    this.changeVersion = 0;
-    this.savedVersion = 0;
-  }
-
-  /**
-   * Called (debounced) by the file watcher: reloads when the file differs from what was last loaded or saved.
-   * Unsaved changes are never discarded (phase 2: VS Code reports the conflict on save). Returns whether it reloaded.
-   */
-  async reloadIfChangedOnDisk(): Promise<boolean> {
-    await this._loading;
-    await this.ownWrite;
-    if (this.disposed || isUnchanged(await diskStampOf(this.uri), this.diskStamp)) return false;
-    if (this.hasUnsavedChanges) {
-      getLog().warn(`[sheet] ${this.fileName} changed on disk; not reloaded because it has unsaved changes`);
-      return false;
-    }
-    getLog().info(`[sheet] ${this.fileName} changed on disk; reloading`);
-    await this.revert();
-    return !this.disposed;
-  }
-
-  async backup(destination: vscode.Uri, token: vscode.CancellationToken): Promise<vscode.CustomDocumentBackup> {
-    await this.writeTo(destination, token);
+  /** For the edit gate (contract §3.1): the document's own state. */
+  get gateState(): DocGateState {
     return {
-      id: destination.toString(),
-      delete: async () => {
-        try {
-          await vscode.workspace.fs.delete(destination);
-        } catch {
-          // Already gone.
-        }
-      },
+      ...(this.poisoned ? { poisoned: true } : {}),
+      ...(this._lossyFeatures.length ? { lossy: { accepted: this.lossyAccepted } } : {}),
+      ...(this.hardReadOnlyReason !== undefined ? { block: hardReadOnlyText(this.hardReadOnlyReason) } : {}),
     };
   }
 
-  dispose(): void {
-    if (this.disposed) return;
-    this.disposed = true;
-    this._onDidDispose.fire();
-    this._onDidDispose.dispose();
-    this._onDidChange.dispose();
-    this.panels.clear();
+  /** Host version numbers (contract §3.3): `version` counts every change of the display, `structureVersion` the structural ones. */
+  get versions(): { version: number; structureVersion: number } {
+    return { version: this.version, structureVersion: this.structureVersion };
   }
 
-  private async load(sources: (vscode.Uri | Uint8Array)[]): Promise<void> {
-    // Stamp before reading: a write racing the read then shows up as a change at the next watcher event.
-    this.diskStamp = await diskStampOf(this.uri);
-    try {
-      const { data, source } = await readFirstAvailable(sources);
-      this.divergedFromDisk = !(source instanceof vscode.Uri && sameUri(source, this.uri));
-      let lossyError: unknown;
-      // Relative links to other workbooks are shown in the file's folder (Excel's formula bar does the same).
-      const folder = this.uri.scheme === 'file' ? path.dirname(this.uri.fsPath) : undefined;
-      const [workbook, lossy] = await Promise.all([
-        loadWorkbook(data, { folder }),
-        detectLossyFeatures(data).catch((err: unknown): string[] => {
-          lossyError = err ?? new Error('Unknown error');
-          return [];
-        }),
-      ]);
-      // Only worth a log line when the workbook itself loaded (otherwise the load error says it all).
-      if (lossyError !== undefined) logError(`[sheet] Could not inspect ${this.fileName} for unsupported features`, lossyError);
-      const model = workbookToModel(workbook);
-      this._workbook = workbook;
-      this._model = model;
-      this._lossyFeatures = lossy;
-      this._loadError = undefined;
-      getLog().info(`[sheet] Loaded ${this.uri.toString(true)}${lossy.length ? ` (not displayed: ${lossy.join(', ')})` : ''}`);
-    } catch (err) {
-      this._workbook = undefined;
-      this._model = undefined;
-      this._lossyFeatures = [];
-      this._loadError = err ?? new Error('Unknown error');
-      logError(`[sheet] Could not load ${this.uri.toString(true)}`, err);
+  /** State of the journal, for the test API and the host tests. */
+  get testState(): { stateId: number; savedStateId: number; generation: number; poisoned: boolean; pos: number; journalLength: number; diverged: boolean } {
+    return {
+      stateId: this.stateId,
+      savedStateId: this.savedStateId,
+      generation: this.generation,
+      poisoned: this.poisoned,
+      pos: this.pos,
+      journalLength: this.journal.length,
+      diverged: this.divergedFromDisk,
+    };
+  }
+
+  /** The edit state this document contributes now (xlsx stays not editable until P2 wires the edits). */
+  computeEditState(): EditState {
+    if (this._loadError !== undefined || !this._model) return viewOnlyEditState();
+    const result = documentGate(this.gateState);
+    if (result.ok) return viewOnlyEditState();
+    return {
+      ...editStateOf(result, []),
+      ...(result.code === 'lossy' ? { canEditAnyway: lossyEditAnyway(this._lossyFeatures) } : {}),
+    };
+  }
+
+  /** "Edit anyway" was accepted for this document (all panels). */
+  acceptLossy(): void {
+    this.lossyAccepted = true;
+    this.lossyAcceptedList = [...this._lossyFeatures];
+    this.changed();
+  }
+
+  /** Starts (once per load) the check of every worksheet part (contract §4.7); resolves when it is done. Never rejects. */
+  ensureScan(): Promise<void> {
+    if (!this.scan) {
+      const generation = this.generation;
+      this.scan = checkPatchable(this.base).then(
+        (result) => {
+          if (generation === this.generation && !result.ok) {
+            this.hardReadOnlyReason = result.reason;
+            getLog().warn(`[sheet] ${this.fileName} cannot be edited safely: ${result.reason}`);
+            this.changed();
+          }
+        },
+        (err: unknown) => logError(`[sheet] Could not check ${this.fileName} for safe editing`, err),
+      );
     }
+    return this.scan;
   }
 
-  /** Workbook bytes to `target`: re-serialized when modified, otherwise the original file copied byte for byte. */
-  private async writeTo(target: vscode.Uri, token: vscode.CancellationToken): Promise<void> {
-    if (this.hasUnsavedChanges) {
-      await this.writeWorkbookTo(target, token);
+  /** Marks the document poisoned (contract §3.5): an undo/redo/rollback step failed; save and backup stay allowed. */
+  poison(why: unknown): void {
+    this.poisoned = true;
+    logError(`[sheet] ${this.fileName} is poisoned; edits stop, the file on disk is not changed`, why);
+    this.changed();
+  }
+
+  /**
+   * Records an edit whose display change has been applied (call it inside `queue`, contract §4.1): truncates the
+   * journal at `pos`, pushes, bumps the versions and gives VS Code one undo step.
+   */
+  commit(e: Omit<JournalEdit, 'id'>): JournalEdit {
+    if (this.hardReadOnlyReason !== undefined) throw new Error(hardReadOnlyText(this.hardReadOnlyReason)); // too large, or the scan found it unpatchable
+    if (this.poisoned) throw new Error(EDIT_TEXT.poisoned); // contract §3.5: a poisoned document takes no new edits
+    void this.lazyScan(); // the first edit starts the check of every worksheet part (callers await it first: edit gate, test API; save and backup wait for it too)
+    const edit: JournalEdit = { ...e, id: this.nextStateId++ };
+    this.journal.length = this.pos;
+    this.journal.push(edit);
+    this.pos++;
+    this.stateId = edit.id;
+    this.version++;
+    if (edit.structural) this.structureVersion = this.version;
+    const generation = this.generation;
+    this._onDidChange.fire({
+      document: this,
+      label: edit.label,
+      undo: () => this.queue.run(() => this.step('undo', edit, generation)),
+      redo: () => this.queue.run(() => this.step('redo', edit, generation)),
+    });
+    // A content-change event (no undo/redo) sets VS Code's sticky changed flag until save/revert. Without it VS Code's own
+    // undo stack can land on its save point again (save, undo, new edit) and show the tab clean while this document is dirty.
+    this._onDidChange.fire({ document: this } as unknown as vscode.CustomDocumentEditEvent<SheetDocument>);
+    this.changed();
+    return edit;
+  }
+
+  /** One VS Code undo / redo of `edit` (in the queue). A closure that no longer fits changes nothing and says so. */
+  private async step(direction: 'undo' | 'redo', edit: JournalEdit, generation: number): Promise<void> {
+    const fits =
+      generation === this.generation &&
+      (direction === 'undo' ? this.journal[this.pos - 1] === edit : this.journal[this.pos] === edit);
+    if (!fits) {
+      this.stepRefused('This undo step belongs to an earlier version of the file (reloaded or reverted). Nothing was changed.');
       return;
     }
-    const original = await vscode.workspace.fs.readFile(this.uri);
-    if (token.isCancellationRequested) throw new vscode.CancellationError();
-    await vscode.workspace.fs.writeFile(target, original);
-  }
-
-  private async writeWorkbookTo(target: vscode.Uri, token: vscode.CancellationToken): Promise<void> {
-    await this._loading;
-    const workbook = this._workbook;
-    if (!workbook) {
-      throw new Error(`"${this.fileName}" could not be loaded, so it cannot be saved: ${errorMessageOf(this._loadError)}`);
+    if (this.poisoned) {
+      this.stepRefused(EDIT_TEXT.poisoned);
+      return;
     }
-    const buffer = await workbook.xlsx.writeBuffer();
-    if (token.isCancellationRequested) throw new vscode.CancellationError();
-    await vscode.workspace.fs.writeFile(target, toUint8Array(buffer as ArrayBuffer | ArrayBufferView));
+    try {
+      if (direction === 'undo') await edit.invert?.();
+      else await edit.apply?.();
+    } catch (err) {
+      this.poison(err);
+      this.stepRefused(EDIT_TEXT.poisoned);
+      return;
+    }
+    this.pos += direction === 'undo' ? -1 : 1;
+    this.stateId = this.pos > 0 ? this.journal[this.pos - 1].id : this.baseStateId;
+    this.version++;
+    if (edit.structural) this.structureVersion = this.version;
+    this.changed();
   }
 
-  private markSaved(): void {
-    this.savedVersion = this.changeVersion;
-    this.divergedFromDisk = false;
+  private stepRefused(message: string): void {
+    getLog().info(`[sheet] undo/redo of ${this.fileName} did nothing: ${message}`);
+    void vscode.window.showInformationMessage(message);
+    if (this.hasUnsavedChanges) this.fireDirtyMark();
+  }
+
+  /**
+   * VS Code computes "dirty" from its own edit stack (contract §4.1, D-067). When it could say "clean" while this
+   * document still has unsaved work, one no-op edit keeps it dirty until the next save or revert. Its undo and redo do
+   * nothing, and fire another no-op while the document is dirty.
+   */
+  /**
+   * Keeps VS Code's tab dirty without adding an undo step: a no-op edit on top of real edits would swallow every Ctrl+Z
+   * (its undo only fires another no-op). With real edits in the journal only the content-change event is sent (as commit()
+   * does); with nothing to undo the no-op edit is used.
+   */
+  private fireDirtyMark(): void {
+    if (this.disposed) return;
+    if (this.pos === 0) this.fireNoopEdit();
+    else this._onDidChange.fire({ document: this } as unknown as vscode.CustomDocumentEditEvent<SheetDocument>);
+  }
+
+  private fireNoopEdit(): void {
+    if (this.disposed) return;
+    const again = (): void => {
+      if (this.hasUnsavedChanges) this.fireNoopEdit();
+    };
+    this._onDidChange.fire({ document: this, label: 'Unsaved changes', undo: again, redo: again });
+  }
+
+  /**
+   * A reload that failed while the document still has unsaved edits (a half-written file on disk). VS Code clears the tab's
+   * dirty mark when Revert File was asked, also when revertCustomDocument rejects (seen in VS Code 1.123), so the tab would
+   * show "clean" and closing it would drop the edits that are still here: one no-op edit keeps it dirty (D-067 rule).
+   */
+  keepDirtyMark(): void {
+    if (this.hasUnsavedChanges) this.fireNoopEdit();
+  }
+
+  private changed(): void {
+    if (!this.disposed) this._onDidChangeState.fire();
+  }
+
+  // ----- save, save as, revert -----
+
+  /** Writes the document to its own file (contract §4.2). Runs in the queue; stays dirty on any failure. */
+  save(token: vscode.CancellationToken): Promise<void> {
+    return this.queue.run(() => this.saveNow(token));
+  }
+
+  saveAs(target: vscode.Uri, token: vscode.CancellationToken): Promise<void> {
+    if (sameUri(target, this.uri)) return this.save(token);
+    return this.queue.run(() => this.saveAsNow(target, token));
+  }
+
+  /** `base` + the ops of journal[0..pos), checked (V1-V4); nothing is written. */
+  private async buildAndVerify(
+    snapshot: { base: Uint8Array; ops: PackageOp[]; expect: CellExpectation[] },
+    token: vscode.CancellationToken,
+    isBackup = false,
+  ): Promise<{ bytes: Uint8Array; report: SaveReport }> {
+    const onYield = (): void => {
+      if (token.isCancellationRequested) throw new vscode.CancellationError();
+    };
+    const name = this.fileName;
+    // The scan result decides: edits that were journaled before it ended (restored backup, direct commit) are not written.
+    await this.lazyScan();
+    if (snapshot.ops.length > 0 && this.hardReadOnlyReason !== undefined) {
+      logError(`[sheet] ${name} has edits but cannot be edited safely`, new Error(this.hardReadOnlyReason));
+      throw new Error(`${hardReadOnlyText(this.hardReadOnlyReason)} The unsaved edits cannot be saved or backed up. Your file on disk is not changed.`);
+    }
+    let built: { bytes: Uint8Array; report: SaveReport };
+    try {
+      built = await buildXlsx(snapshot.base, snapshot.ops, { onYield });
+      if (built.bytes !== snapshot.base) {
+        if (isBackup && sheetSaveHooks.failBackupVerify) {
+          sheetSaveHooks.failBackupVerify = false;
+          throw new SaveVerifyError('V2', 'test hook: the backup failed its check');
+        }
+        await verifyXlsx(snapshot.base, built.bytes, snapshot.ops, snapshot.expect, {
+          deep: !isBackup && deepVerifyAllowed(snapshot.base),
+          onYield,
+        });
+      }
+    } catch (err) {
+      if (err instanceof vscode.CancellationError) throw err;
+      logError(`[sheet] Could not build ${name} safely`, err);
+      const why = err instanceof SaveVerifyError ? `check ${err.step} failed` : errorMessageOf(err);
+      throw new Error(`FileStudio could not save “${name}” safely (${why}). Your edits are kept. Details are in the FileStudio output.`);
+    }
+    return built;
+  }
+
+  private snapshot(): { base: Uint8Array; ops: PackageOp[]; expect: CellExpectation[]; generation: number; stateId: number } {
+    const applied = this.journal.slice(0, this.pos);
+    return {
+      base: this.base,
+      ops: applied.flatMap((e) => e.after.ops),
+      expect: lastExpectations(applied.flatMap((e) => e.after.expect)),
+      generation: this.generation,
+      stateId: this.stateId,
+    };
+  }
+
+  /** §4.2 step 2 / 4b for the disk stamp: asks when the file changed since `known`; returns the stamp that was accepted. */
+  private async confirmDiskStamp(known: DiskStamp | undefined, force: boolean): Promise<DiskStamp | undefined> {
+    const current = await diskStampOf(this.uri);
+    if (current === undefined && known !== undefined && this.uri.scheme === 'file') {
+      const answer = await ask(
+        'diskChangedOnSave',
+        `“${this.fileName}” was deleted or moved after you opened it. Saving creates it again at the old place.`,
+        { modal: true },
+        'Recreate',
+        'Save As…',
+      );
+      if (answer === 'Save As…') void vscode.commands.executeCommand('workbench.action.files.saveAs');
+      if (answer !== 'Recreate') throw new vscode.CancellationError();
+      return undefined;
+    }
+    const changed = current !== undefined && (force || (known !== undefined && !sameStamp(current, known)));
+    if (!changed) return current;
+    const answer = await ask(
+      'diskChangedOnSave',
+      `“${this.fileName}” changed on disk after you opened it. Saving replaces that version.`,
+      { modal: true },
+      'Overwrite',
+      'Save As…',
+    );
+    if (answer === 'Save As…') void vscode.commands.executeCommand('workbench.action.files.saveAs');
+    if (answer !== 'Overwrite') throw new vscode.CancellationError();
+    return current;
+  }
+
+  /** §4.2 step 2 / 4b for the own file: read-only, locked, owner file. Throws a user error or CancellationError. */
+  private async checkOwnFile(seen: { owner: boolean }): Promise<void> {
+    const why = await readonlyReasonOf(this.uri);
+    if (why !== undefined) throw new Error(`“${this.fileName}” is read-only (${why}). Use Save As to keep your edits.`);
+    const block = await writeBlockOf(sheetSaveHooks.fs, this.uri);
+    if (block !== undefined) throw new Error(block);
+    const owner = await ownerFileOf(sheetSaveHooks.fs, this.uri);
+    if (owner !== undefined && !seen.owner) {
+      seen.owner = true; // asked once per save (steps 2 and 4b)
+      const answer = await ask(
+        'ownerFile',
+        `“${this.fileName}” may be open in another program (found ${owner}). If it is, that program can later overwrite your changes.`,
+        { modal: true },
+        'Save',
+      );
+      if (answer !== 'Save') throw new vscode.CancellationError();
+    }
+  }
+
+  private async saveNow(token: vscode.CancellationToken): Promise<void> {
+    await this.initialLoad;
+    // Step 1: nothing to write.
+    if (!this.hasUnsavedChanges) {
+      getLog().info(`[sheet] Save of ${this.fileName} skipped: no changes, the file on disk is left untouched`);
+      this.markSaved();
+      return;
+    }
+    if (this._loadError !== undefined) {
+      throw new Error(`“${this.fileName}” could not be loaded, so it cannot be saved: ${errorMessageOf(this._loadError)}`);
+    }
+    // Step 2: preflight.
+    const seen = { owner: false };
+    let accepted = await this.confirmDiskStamp(this.diskStamp, this.stampUnknown);
+    await this.checkOwnFile(seen);
+    if (token.isCancellationRequested) throw new vscode.CancellationError();
+    // Steps 3-4: build and verify.
+    const snap = this.snapshot();
+    const { bytes, report } = await this.buildAndVerify(snap, token);
+    await sheetSaveHooks.afterVerify?.();
+    // Step 4b: steps 3-4 can take seconds; look again right before writing.
+    accepted = await this.confirmDiskStamp(accepted, false);
+    await this.checkOwnFile(seen);
+    if (token.isCancellationRequested) throw new vscode.CancellationError();
+    // Step 5: .bak (the disk stamp was just checked).
+    await this.writeBakOnce();
+    // Steps 6-7: write, read back.
+    const write = this.writeAndVerify(this.uri, bytes);
+    this.ownWrite = write.then(
+      () => undefined,
+      () => undefined,
+    );
+    const written = await write;
+    // Step 8.
+    this.lastSaveReport = report;
+    this.stampUnknown = false;
+    this.diskStamp = written.stamp;
+    this.markSaved();
+    this.changed();
+  }
+
+  private async saveAsNow(target: vscode.Uri, token: vscode.CancellationToken): Promise<void> {
+    await this.initialLoad;
+    if (this._loadError !== undefined) {
+      throw new Error(`“${this.fileName}” could not be loaded, so it cannot be saved: ${errorMessageOf(this._loadError)}`);
+    }
+    const snap = this.snapshot();
+    const { bytes } = await this.buildAndVerify(snap, token);
+    await sheetSaveHooks.afterVerify?.();
+    // Step 4b for the TARGET: no disk-stamp check (VS Code already asked before replacing a file).
+    const fs = sheetSaveHooks.fs;
+    const block = await writeBlockOf(fs, target);
+    if (block !== undefined) throw new Error(block);
+    if (token.isCancellationRequested) throw new vscode.CancellationError();
+    await this.writeAndVerify(target, bytes);
+  }
+
+  /** Steps 6-7: safe write, then read back and compare length + SHA-256. A mismatch is an error (the document stays dirty). */
+  private async writeAndVerify(target: vscode.Uri, bytes: Uint8Array): Promise<{ stamp: DiskStamp | undefined }> {
+    const own = sameUri(target, this.uri);
+    const name = fileNameOf(target);
+    const result = await writeFileSafely(target, bytes, this.storageDir ? { storageDir: this.storageDir } : {});
+    let back: Uint8Array | undefined;
+    let readError: unknown;
+    try {
+      back = target.scheme === 'file' ? new Uint8Array(await sheetSaveHooks.fs.readFile(target.fsPath)) : await vscode.workspace.fs.readFile(target);
+    } catch (err) {
+      readError = err;
+    }
+    const stamp = await diskStampOf(target);
+    if (back === undefined || back.length !== bytes.length || sha256Of(back) !== sha256Of(bytes)) {
+      const expected = sha256Of(bytes);
+      const actual = back === undefined ? `unreadable (${errorMessageOf(readError)})` : sha256Of(back);
+      getLog().error(`[sheet] Read-back of ${name} differs: wrote ${bytes.length} bytes sha256 ${expected}; found ${back?.length ?? '?'} bytes sha256 ${actual}`);
+      if (own) this.diskStamp = stamp; // a retry must not ask about an external change
+      let original = result.preImage;
+      if (original === undefined && own) {
+        const bak = target.with({ path: `${target.path}.bak` });
+        original = await vscode.workspace.fs.stat(bak).then(() => fileNameOf(bak), () => undefined);
+      }
+      throw new Error(
+        `FileStudio saved “${name}” but the file on disk does not match what was written. Your edits are kept; save again or use Save As. ` +
+          (original !== undefined ? `The original is in ${original}.` : 'No copy of the original was kept.'),
+      );
+    }
+    await result.finish();
+    return { stamp };
   }
 
   /** `fileStudio.xlsx.backupOnSave`: copy the original to `<name>.xlsx.bak` before the first save (never overwritten). */
   private async writeBakOnce(): Promise<void> {
     if (this.bakAttempted) return;
-    this.bakAttempted = true;
-    if (!vscode.workspace.getConfiguration('fileStudio', this.uri).get<boolean>('xlsx.backupOnSave', true)) return;
+    if (!vscode.workspace.getConfiguration('fileStudio', this.uri).get<boolean>('xlsx.backupOnSave', true)) {
+      this.bakAttempted = true;
+      return;
+    }
     const bak = this.uri.with({ path: `${this.uri.path}.bak` });
     try {
-      await vscode.workspace.fs.stat(bak);
-      getLog().info(`[sheet] ${displayPath(bak)} already exists; keeping it`);
-      return;
-    } catch {
-      // No backup yet.
-    }
-    try {
-      await vscode.workspace.fs.copy(this.uri, bak, { overwrite: false });
-      getLog().info(`[sheet] Wrote backup ${displayPath(bak)}`);
+      let exists = false;
+      let isFolder = false;
+      try {
+        const st = await vscode.workspace.fs.stat(bak);
+        isFolder = (st.type & vscode.FileType.Directory) !== 0;
+        exists = !isFolder;
+      } catch {
+        // No backup yet.
+      }
+      if (isFolder) throw new Error(`“${fileNameOf(bak)}” is a folder`);
+      if (exists) {
+        getLog().info(`[sheet] ${displayPath(bak)} already exists; keeping it`);
+      } else if (this.uri.scheme === 'file') {
+        if (!(await sheetSaveHooks.fs.stat(this.uri.fsPath).then(() => true, () => false))) return; // deleted outside: nothing to keep
+        await sheetSaveHooks.fs.copyFile(this.uri.fsPath, bak.fsPath, fsConstants.COPYFILE_EXCL);
+        getLog().info(`[sheet] Wrote backup ${displayPath(bak)}`);
+      } else {
+        await vscode.workspace.fs.copy(this.uri, bak, { overwrite: false });
+      }
+      this.bakAttempted = true;
     } catch (err) {
-      logError(`[sheet] Could not write backup ${displayPath(bak)}; saving anyway`, err);
+      if (errnoCode(err) === 'EEXIST') {
+        this.bakAttempted = true; // another program made it just now: keep it
+        return;
+      }
+      logError(`[sheet] Could not write backup ${displayPath(bak)}`, err);
+      const answer = await ask(
+        'bakFailed',
+        `Could not create the backup “${fileNameOf(bak)}” (${errorMessageOf(err)}). Save without a backup?`,
+        { modal: true },
+        'Save',
+      );
+      if (answer !== 'Save') throw new vscode.CancellationError(); // asked again at the next save
+      this.bakAttempted = true;
     }
   }
+
+  private markSaved(): void {
+    this.savedStateId = this.stateId;
+    this.divergedFromDisk = false;
+  }
+
+  /** Discards in-memory state and reloads the file from disk (contract §4.2). A failed reload changes nothing and throws. */
+  revert(): Promise<void> {
+    const run = this.queue.run(() => this.reloadNow());
+    this._loading = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async reloadNow(): Promise<void> {
+    const loaded = await this.readLoaded([this.uri]); // throws: nothing was changed
+    this.generation++;
+    const keepLossy = this.lossyAccepted && sameList(this.lossyAcceptedList, loaded.lossy);
+    this.install(loaded);
+    this.journal = [];
+    this.pos = 0;
+    this.baseStateId = this.nextStateId++;
+    this.stateId = this.savedStateId = this.baseStateId;
+    this.version++;
+    this.structureVersion = this.version;
+    this.poisoned = false;
+    this.divergedFromDisk = false;
+    this.stampUnknown = false;
+    this.lossyAccepted = keepLossy;
+    this.lossyAcceptedList = keepLossy ? [...loaded.lossy] : [];
+    this.diskStamp = loaded.stamp;
+    this.warnedStamp = undefined;
+    this._loadError = undefined;
+    this.startScanIfEditing();
+    this.changed();
+  }
+
+  /**
+   * Called (debounced) by the file watcher. Clean: reloads when the file differs from what was last loaded or saved.
+   * Dirty: a non-modal warning (once per disk version) with "Reload from Disk" / "Keep My Edits" (contract §4.2).
+   * Returns whether it reloaded.
+   */
+  async reloadIfChangedOnDisk(): Promise<boolean> {
+    await this._loading;
+    await this.ownWrite;
+    let current = await diskStampOf(this.uri);
+    if (this.disposed || isUnchanged(current, this.diskStamp)) return false;
+    if (!this.hasUnsavedChanges) {
+      // The check and the reload run in ONE queue step: an edit queued before it is seen as unsaved work, never wiped.
+      const run = this.queue.run(async () => {
+        current = await diskStampOf(this.uri);
+        if (this.disposed || isUnchanged(current, this.diskStamp) || this.hasUnsavedChanges) return false;
+        getLog().info(`[sheet] ${this.fileName} changed on disk; reloading`);
+        await this.reloadNow();
+        return true;
+      });
+      this._loading = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      const reloaded = await run;
+      if (reloaded) return !this.disposed;
+      if (this.disposed || isUnchanged(current, this.diskStamp)) return false;
+    }
+    if (this.hasUnsavedChanges) {
+      if (!sameStamp(current, this.warnedStamp)) {
+        this.warnedStamp = current;
+        getLog().warn(`[sheet] ${this.fileName} changed on disk; not reloaded because it has unsaved changes`);
+        void this.askExternalChange();
+      }
+      return false;
+    }
+    return false;
+  }
+
+  private async askExternalChange(): Promise<void> {
+    // The answer may come late: it counts only while the document is still in the state in which the message was shown.
+    const generation = this.generation;
+    const stateId = this.stateId;
+    const unchanged = (): boolean => this.generation === generation && this.stateId === stateId && this.hasUnsavedChanges;
+    try {
+      const answer = await ask(
+        'externalChange',
+        `“${this.fileName}” was changed on disk by another program. Your unsaved edits are kept.`,
+        { modal: false },
+        'Reload from Disk (discard my edits)',
+        'Keep My Edits',
+      );
+      if (answer !== undefined && !unchanged()) {
+        getLog().info(`[sheet] The answer to the "changed on disk" message of ${this.fileName} came too late (the document changed meanwhile); ignored`);
+      } else if (answer === 'Reload from Disk (discard my edits)') {
+        await this.revertThroughVsCode();
+        this.onReloaded?.();
+      } else if (answer === 'Keep My Edits') {
+        await this.queue.run(() => {
+          if (!unchanged()) return;
+          this.divergedFromDisk = true; // the next save asks about the disk version (step 2)
+          this.fireDirtyMark();
+          this.changed();
+        });
+      }
+    } catch (err) {
+      logError(`[sheet] Could not handle the change of ${this.fileName} on disk`, err);
+    }
+  }
+
+  /**
+   * The reload chosen in the external-change warning (contract §4.2). VS Code keeps its own "dirty" mark for the editor and
+   * only its own Revert File command clears it. In real VS Code that command ignores a Uri for a custom editor and works
+   * on the ACTIVE editor (tested, decisions.md 29), so the panel is revealed first, and the command is sent only while
+   * this document's own panel is the active one: it can never revert another file's edits. When the command did not
+   * reach `revert()` (no panel, panel not active, command failed), the document reverts itself; the tab may then show a
+   * dirty mark with nothing to write (the next save writes nothing and clears it).
+   */
+  private async revertThroughVsCode(): Promise<void> {
+    const generation = this.generation;
+    const panel = [...this.panels].find((p) => p.active) ?? [...this.panels][0];
+    if (panel) {
+      try {
+        if (!panel.active) panel.reveal(undefined, false);
+        for (let i = 0; i < 20 && !panel.active; i++) await new Promise((resolve) => setTimeout(resolve, 50));
+        if (panel.active) await vscode.commands.executeCommand('workbench.action.files.revert');
+      } catch (err) {
+        logError(`[sheet] VS Code could not revert ${this.fileName}; reverting it directly`, err);
+      }
+      if (this.generation !== generation) return; // the command ran revertCustomDocument
+    }
+    await this.revert();
+  }
+
+  // ----- hot exit (contract §4.6) -----
+
+  /** Hot-exit backup: the snapshot is taken in the queue; build and verify run outside it so edits are not delayed. */
+  async backup(destination: vscode.Uri, token: vscode.CancellationToken): Promise<vscode.CustomDocumentBackup> {
+    await this.initialLoad;
+    if (this._loadError !== undefined) throw new Error(`“${this.fileName}” could not be loaded, so it cannot be backed up.`);
+    const snap = await this.queue.run(() => ({ ...this.snapshot(), lossyAccepted: this.lossyAccepted, diskStamp: this.diskStamp, diverged: this.divergedFromDisk }));
+    // The output is written and then dropped (a 42 MB workbook must not stay in memory); no deep reload (V4) for a backup:
+    // a restored backup is checked again when it is opened, and a bad one falls back to the file (contract 4.6).
+    const bytes = (await this.buildAndVerify(snap, token, true)).bytes;
+    if (snap.generation !== this.generation) throw new vscode.CancellationError(); // reverted meanwhile: the result is stale
+    if (token.isCancellationRequested) throw new vscode.CancellationError();
+    const sidecarUri = destination.with({ path: `${destination.path}.json` });
+    const sidecar: BackupSidecar = {
+      v: 1,
+      lossyAccepted: snap.lossyAccepted,
+      sourceStamp: snap.diskStamp ?? null,
+      divergedFromDisk: snap.diverged,
+    };
+    const remove = async (): Promise<void> => {
+      for (const target of [destination, sidecarUri]) {
+        try {
+          await vscode.workspace.fs.delete(target);
+        } catch {
+          // Already gone.
+        }
+      }
+    };
+    try {
+      await vscode.workspace.fs.writeFile(destination, bytes);
+      await vscode.workspace.fs.writeFile(sidecarUri, new TextEncoder().encode(JSON.stringify(sidecar)));
+    } catch (err) {
+      await remove();
+      throw err;
+    }
+    return { id: destination.toString(), delete: remove };
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    sheetDocs.delete(this.uri.toString());
+    this._onDidDispose.fire();
+    this._onDidDispose.dispose();
+    this._onDidChange.dispose();
+    this._onDidChangeState.dispose();
+    this.panels.clear();
+  }
+
+  // ----- loading -----
+
+  /** A new load: forget the last check. The check itself starts lazily (`lazyScan`): not while a large workbook is still opening. */
+  private startScanIfEditing(): void {
+    this.scan = undefined;
+    // Too large to save within budget: hard read-only now, no scan, no edit (size limit of 0.2.0; streaming save = 0.2.1).
+    this.hardReadOnlyReason = this._model ? xlsxTooLargeReason(this._model.getMeta(), xlsxEditCostBytes(this.base)) : undefined;
+    this.tooLarge = this.hardReadOnlyReason !== undefined;
+    if (this.tooLarge) this.scan = Promise.resolve();
+  }
+
+  /** Starts the patch check at the first edit, save or backup (when editing is on). */
+  lazyScan(): Promise<void> | undefined {
+    return editingEnabled('xlsx', this.uri) ? this.ensureScan() : undefined;
+  }
+
+  private install(l: LoadedSheet): void {
+    this.base = l.data;
+    this._workbook = l.workbook;
+    this._model = l.model;
+    this._lossyFeatures = l.lossy;
+  }
+
+  private async loadInitial(sources: (vscode.Uri | Uint8Array)[]): Promise<void> {
+    sheetDocs.set(this.uri.toString(), this);
+    try {
+      let loaded: LoadedSheet | undefined;
+      const backup = sources.length > 1 && sources[0] instanceof vscode.Uri ? sources[0] : undefined;
+      if (backup) {
+        try {
+          loaded = await this.readLoaded([backup]);
+          const patchable = await checkPatchable(loaded.data);
+          if (!patchable.ok) throw new Error(patchable.reason);
+        } catch (err) {
+          loaded = undefined;
+          await this.keepFailedBackup(backup, err);
+        }
+      }
+      loaded ??= await this.readLoaded(backup ? [this.uri] : sources);
+      this.install(loaded);
+      this.diskStamp = loaded.fromBackup ? loaded.sidecar?.sourceStamp ?? undefined : loaded.stamp;
+      this.divergedFromDisk = loaded.fromBackup;
+      if (loaded.fromBackup) {
+        this.stampUnknown = loaded.sidecar === undefined || loaded.sidecar.sourceStamp === null; // no stamp to compare: ask until one save succeeds
+        this.lossyAccepted = loaded.sidecar?.lossyAccepted === true && loaded.lossy.length > 0;
+        this.lossyAcceptedList = this.lossyAccepted ? [...loaded.lossy] : [];
+      }
+      this._loadError = undefined;
+      getLog().info(`[sheet] Loaded ${this.uri.toString(true)}${loaded.lossy.length ? ` (not displayed: ${loaded.lossy.join(', ')})` : ''}`);
+      this.startScanIfEditing();
+      // The restored edits are unsaved work VS Code knows nothing about: keep its dirty mark (D-067).
+      if (loaded.fromBackup) queueMicrotask(() => this.fireNoopEdit());
+    } catch (err) {
+      this._workbook = undefined;
+      this._model = undefined;
+      this._lossyFeatures = [];
+      this._loadError = err ?? new Error('Unknown error');
+      if (this.uri.scheme === 'file') {
+        // A crash during an in-place write leaves a damaged file and a pre-image: tell the user where the good copy is.
+        const prev = await findPreImages(this.uri.fsPath, this.storageDir);
+        if (prev.length > 0) {
+          this._loadError = new Error(`${errorMessageOf(err)} A copy of the file from before the last save was found: ${prev.join(', ')}. You can restore it by renaming it.`);
+        }
+      }
+      logError(`[sheet] Could not load ${this.uri.toString(true)}`, err);
+    }
+  }
+
+  /** Reads and parses the first readable source. Changes nothing in the document; throws when nothing can be installed. */
+  private async readLoaded(sources: (vscode.Uri | Uint8Array)[]): Promise<LoadedSheet> {
+    // Stamp before reading: a write racing the read then shows up as a change at the next watcher event.
+    const stamp = await diskStampOf(this.uri);
+    const { data, source } = await readFirstAvailable(sources);
+    const fromBackup = !(source instanceof vscode.Uri && sameUri(source, this.uri));
+    let lossyError: unknown;
+    // Relative links to other workbooks are shown in the file's folder (Excel's formula bar does the same).
+    const folder = this.uri.scheme === 'file' ? path.dirname(this.uri.fsPath) : undefined;
+    const [workbook, lossy] = await Promise.all([
+      loadWorkbook(data, { folder }),
+      detectLossyFeatures(data).catch((err: unknown): string[] => {
+        lossyError = err ?? new Error('Unknown error');
+        return [];
+      }),
+    ]);
+    // Only worth a log line when the workbook itself loaded (otherwise the load error says it all).
+    if (lossyError !== undefined) logError(`[sheet] Could not inspect ${this.fileName} for unsupported features`, lossyError);
+    const model = workbookToModel(workbook);
+    let sidecar: BackupSidecar | undefined;
+    if (fromBackup && source instanceof vscode.Uri) sidecar = await readSidecar(source);
+    return { data, workbook, model, lossy, stamp, fromBackup, ...(sidecar ? { sidecar } : {}) };
+  }
+
+  /** A hot-exit backup that cannot be used is never dropped silently: a copy is kept and the user is told (contract §4.6). */
+  private async keepFailedBackup(backup: vscode.Uri, err: unknown): Promise<void> {
+    logError(`[sheet] The backup ${backup.toString(true)} of ${this.fileName} could not be restored`, err);
+    let where = backup.fsPath;
+    try {
+      const bytes = await vscode.workspace.fs.readFile(backup);
+      const folder = path.join(this.storageDir ?? path.join(os.tmpdir(), 'FileStudio'), 'restore-failed');
+      await fsp.mkdir(folder, { recursive: true });
+      where = path.join(folder, `${this.fileName.replace(/\.xlsx$/i, '')}-${new Date().toISOString().replace(/[:.]/g, '-')}.xlsx`);
+      await fsp.writeFile(where, bytes);
+    } catch (copyErr) {
+      logError('[sheet] Could not copy the failed backup', copyErr);
+    }
+    void vscode.window.showWarningMessage(
+      `FileStudio could not restore the unsaved changes of “${this.fileName}”. A copy of the backup is at ${where}.`,
+    );
+  }
 }
+
+function sameList(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+async function readSidecar(backup: vscode.Uri): Promise<BackupSidecar | undefined> {
+  try {
+    const raw = JSON.parse(new TextDecoder().decode(await vscode.workspace.fs.readFile(backup.with({ path: `${backup.path}.json` })))) as Partial<BackupSidecar>;
+    if (raw.v !== 1 || typeof raw.lossyAccepted !== 'boolean') return undefined;
+    const s = raw.sourceStamp;
+    const stamp = s && typeof s.size === 'number' && typeof s.mtime === 'number' ? { size: s.size, mtime: s.mtime } : null;
+    return { v: 1, lossyAccepted: raw.lossyAccepted, sourceStamp: stamp, divergedFromDisk: raw.divergedFromDisk === true };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Open documents by uri (the test API reaches them here). */
+const sheetDocs = new Map<string, SheetDocument>();
 
 /** Reads the first source that can be read (e.g. a backup, then the original file). */
 async function readFirstAvailable(
@@ -2789,14 +3755,19 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
 
   private readonly sessions = new Map<vscode.WebviewPanel, ViewerSession>();
 
-  constructor(private readonly extensionUri: vscode.Uri) {}
+  /** `storageUri`: the extension's global storage (pre-images of in-place saves, failed hot-exit backups). */
+  constructor(
+    private readonly extensionUri: vscode.Uri,
+    private readonly storageUri?: vscode.Uri,
+  ) {}
 
   openCustomDocument(
     uri: vscode.Uri,
     openContext: vscode.CustomDocumentOpenContext,
     _token: vscode.CancellationToken,
   ): SheetDocument {
-    const document = SheetDocument.open(uri, openContext);
+    const document = SheetDocument.open(uri, openContext, this.storageUri?.fsPath);
+    document.onReloaded = () => this.refreshPanels(document);
     const forward = document.onDidChange((e) => this._onDidChangeCustomDocument.fire(e));
     const watcher = watchForDiskChanges(uri, async () => {
       if (await document.reloadIfChangedOnDisk()) this.refreshPanels(document);
@@ -2817,9 +3788,17 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
     );
     document.panels.add(panel);
     this.sessions.set(panel, session);
-    // (v0.2.0, F) Edit gate registry: view-only until the xlsx editing phases (P1/P2) give it a real edit state.
-    const gate = { format: 'xlsx', uri: document.uri, computeEditState: viewOnlyEditState, dirty: () => document.hasUnsavedChanges } as const;
-    session.onDispose(attachEditGateDoc(gate, (state) => session.post({ type: 'editState', state })));
+    // (v0.2.0) Edit gate registry: the document computes its state (poisoned, lossy, hard read-only); P2 turns xlsx editing on.
+    const gate = {
+      format: 'xlsx',
+      uri: document.uri,
+      computeEditState: () => document.computeEditState(),
+      version: () => document.versions.version,
+      dirty: () => document.hasUnsavedChanges,
+    } as const;
+    const handle = attachEditGateDoc(gate, (state) => session.post({ type: 'editState', state }));
+    session.onDispose(handle);
+    session.onDispose(document.onDidChangeState(() => void handle.doc.refresh()));
     session.onDispose({
       dispose: () => {
         document.panels.delete(panel);
@@ -2841,7 +3820,12 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
   }
 
   async revertCustomDocument(document: SheetDocument, _cancellation: vscode.CancellationToken): Promise<void> {
-    await document.revert();
+    try {
+      await document.revert();
+    } catch (err) {
+      document.keepDirtyMark();
+      throw err;
+    }
     this.refreshPanels(document);
     if (document.loadError !== undefined) {
       throw new Error(`Could not reload "${document.fileName}": ${errorMessageOf(document.loadError)}`);
@@ -2890,7 +3874,7 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
         fileName: document.fileName,
         meta: model.getMeta(),
         readOnly: true,
-        banner: lossyBanner(document.lossyFeatures),
+        banner: document.tooLargeBanner ?? lossyBanner(document.lossyFeatures),
         editState: viewOnlyEditState(),
       });
     } catch (err) {
@@ -2921,7 +3905,7 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
       session.post({
         type: 'invalidate',
         meta: model.getMeta(),
-        banner: lossyBanner(document.lossyFeatures) ?? null,
+        banner: document.tooLargeBanner ?? lossyBanner(document.lossyFeatures) ?? null,
         editState: viewOnlyEditState(),
       });
     } catch (err) {
@@ -4436,6 +5420,10 @@ export interface FileStudioTestApi {
   };
   /** Queue answers for the next ask() prompts (button text, or undefined = Cancel). */
   answer(id: AskId, button: string | undefined): void;
+  /** P1: push one Edit with these package ops into the SheetDocument journal (display apply = no-op). */
+  pushPackageOps?(uri: string, ops: PackageOp[], label?: string): Promise<void>;
+  /** P1: the report of the last save of this workbook. */
+  lastSaveReport?(uri: string): SaveReport | undefined;
 }
 
 /** True once activate() created the test API (ExtensionMode.Test): ask() then answers from `testAnswers`. */
@@ -4458,12 +5446,27 @@ export function createTestApi(): FileStudioTestApi {
     state(uri: string) {
       const target = key(uri);
       const doc = [...editGateDocs.values()].find((d) => d.spec.uri.toString() === target);
-      if (!doc) throw new Error(`FileStudio has no open document ${uri}`);
+      const sheet = sheetDocs.get(target);
+      if (!doc && !sheet) throw new Error(`FileStudio has no open document ${uri}`);
+      const s = sheet?.testState;
       return {
-        version: doc.spec.version?.() ?? 0,
-        dirty: doc.spec.dirty?.() ?? false,
-        ...(doc.state ? { editState: doc.state } : {}),
+        version: doc?.spec.version?.() ?? sheet?.versions.version ?? 0,
+        dirty: doc?.spec.dirty?.() ?? sheet?.hasUnsavedChanges ?? false,
+        ...(doc?.state ? { editState: doc.state } : {}),
+        ...(s ? { stateId: s.stateId, savedStateId: s.savedStateId, generation: s.generation, poisoned: s.poisoned } : {}),
       };
+    },
+    async pushPackageOps(uri: string, ops: PackageOp[], label = 'Test edit'): Promise<void> {
+      const sheet = sheetDocs.get(key(uri));
+      if (!sheet) throw new Error(`FileStudio has no open workbook ${uri}`);
+      await sheet.loading;
+      await sheet.lazyScan(); // the scan result is known before the edit is accepted
+      await sheet.queue.run(() => {
+        sheet.commit({ label, after: { ops, expect: expectationsOfOps(ops) } });
+      });
+    },
+    lastSaveReport(uri: string): SaveReport | undefined {
+      return sheetDocs.get(key(uri))?.lastSaveReport;
     },
     answer(id: AskId, button: string | undefined): void {
       const queue = testAnswers.get(id) ?? [];

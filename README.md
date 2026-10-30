@@ -85,7 +85,7 @@ No. Everything runs on your computer: no telemetry, no uploads. Links open only 
 
 ## ⚠️ Known limitations
 
-- Very large `.xlsx` files take a while to open.
+- Very large `.xlsx` files take a while to open. In this version, a workbook with more than about 100,000 cells or a file whose sheets, strings and styles unpack to more than 25 MB opens read-only (pictures do not count) (you can view and copy, not edit). Editing large files comes in a later version.
 - Charts and pivot tables in `.xlsx`, and video and animations in `.pptx`, are not shown yet.
 - `.docx` shows the content, not the exact Word page layout.
 
