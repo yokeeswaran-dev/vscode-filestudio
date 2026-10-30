@@ -224,6 +224,34 @@
     "configuration": {
       "title": "FileStudio",
       "properties": {
+        "fileStudio.editing.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "order": 0,
+          "description": "Allow FileStudio to change files (xlsx, csv/tsv/psv/ssv and Markdown, including task checkboxes). When off, every FileStudio view is read-only. Undo, save and revert of changes already made keep working."
+        },
+        "fileStudio.xlsx.editing": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "order": 1,
+          "description": "Allow editing of Excel workbooks (.xlsx) in FileStudio. Has no effect when fileStudio.editing.enabled is off."
+        },
+        "fileStudio.csv.editing": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "order": 2,
+          "description": "Allow editing of delimited text files (.csv, .tsv, .psv, .ssv) in the FileStudio grid. Has no effect when fileStudio.editing.enabled is off."
+        },
+        "fileStudio.markdown.editing": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "order": 3,
+          "description": "Allow FileStudio to change Markdown files (WYSIWYG mode and task checkboxes). Split mode uses VS Code's own text editor and is not affected. Has no effect when fileStudio.editing.enabled is off."
+        },
         "fileStudio.markdown.defaultMode": {
           "type": "string",
           "enum": [
@@ -233,18 +261,18 @@
           ],
           "enumDescriptions": [
             "Rendered preview.",
-            "Planned for 0.2.0. For now the same as preview.",
-            "Planned for 0.2.0 (editing). For now the same as preview."
+            "Preview with VS Code's text editor beside it; scrolling is synced.",
+            "Edit the rendered document directly (WYSIWYG). Only changed blocks are written back."
           ],
           "default": "preview",
           "scope": "resource",
-          "description": "Mode used when a Markdown file is opened with FileStudio. Only preview is available in this release; split and wysiwyg arrive in 0.2.0."
+          "description": "Mode used when a Markdown file is opened with FileStudio. The toolbar can switch the mode of each open view."
         },
         "fileStudio.xlsx.backupOnSave": {
           "type": "boolean",
           "default": true,
           "scope": "resource",
-          "description": "Used from 0.2.0 (editing): write <name>.xlsx.bak (once) before the first save of a workbook. This release is view-only and never saves a workbook."
+          "description": "Before the first save of a workbook, copy the original file to <name>.xlsx.bak (once; an existing .bak is never overwritten). If the copy fails, FileStudio asks before saving."
         }
       }
     }
@@ -254,11 +282,16 @@
     "watch": "node esbuild.js --watch",
     "package": "node esbuild.js --production",
     "typecheck": "tsc --noEmit",
+    "typecheck:webview": "tsc --ignoreConfig --noEmit --allowJs --checkJs --strict --target ES2022 --module preserve --moduleResolution bundler --lib ES2022,DOM,DOM.Iterable --types node --skipLibCheck media/viewer.js",
     "vscode:prepublish": "npm run typecheck && npm run package",
     "samples": "node test/generate-samples.js",
-    "test": "node test/build-tests.js && cd test/unit && node --test --test-reporter=spec"
+    "test": "node test/build-tests.js && node --test --test-reporter=spec \"test/unit/*.test.js\" \"test/host/*.test.js\"",
+    "test:integration": "node test/integration/runTest.js",
+    "test:webview": "npm run build && node test/build-tests.js && cd test/webview && node --test --test-concurrency=1 --test-reporter=spec \"*.webview.test.js\""
   },
   "dependencies": {
+    "@milkdown/crepe": "7.22.3",
+    "@milkdown/kit": "7.22.3",
     "dompurify": "^3.4.16",
     "echarts": "^6.1.0",
     "exceljs": "^4.4.0",
@@ -273,13 +306,19 @@
     "papaparse": "^5.7.0",
     "pdfjs-dist": "^6.4.299",
     "pptxtojson": "^2.2.0",
-    "ssf": "^0.11.2"
+    "remark-gfm": "4.0.1",
+    "remark-stringify": "11.0.0",
+    "saxes": "5.0.1",
+    "ssf": "^0.11.2",
+    "@borgar/fx": "5.1.3"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",
     "@types/papaparse": "^5.5.2",
     "@types/vscode": "^1.90.0",
+    "@vscode/test-electron": "3.1.0",
     "esbuild": "^0.28.2",
+    "puppeteer-core": "25.12.0",
     "typescript": "^7.0.2"
   }
 }

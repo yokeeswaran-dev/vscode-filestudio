@@ -213,7 +213,14 @@ async function main() {
       '.png': 'file',
       '.gif': 'file',
     },
-    define: { 'process.env.NODE_ENV': production ? '"production"' : '"development"' },
+    define: {
+      'process.env.NODE_ENV': production ? '"production"' : '"development"',
+      // Vue 3 compile-time flags (Vue is only in the lazy Markdown WYSIWYG chunk, used by Milkdown Crepe's UI): no
+      // Options API, no devtools hook, no hydration-mismatch details. Leaves out unused code and silences Vue's warning.
+      __VUE_OPTIONS_API__: 'false',
+      __VUE_PROD_DEVTOOLS__: 'false',
+      __VUE_PROD_HYDRATION_MISMATCH_DETAILS__: 'false',
+    },
     plugins: [...common.plugins, katexFontsPlugin],
   });
 

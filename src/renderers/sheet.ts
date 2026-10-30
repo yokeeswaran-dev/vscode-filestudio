@@ -116,6 +116,10 @@ export interface CellData {
    * validation repeated its list in every cell). Lists are in SheetMeta.validations.
    */
   list?: string[];
+  /** (v0.2.0, P5) Recalc state of a formula cell; absent = value is current (computed or cached and not dirty). */
+  calc?: 'stale' | 'unsupported' | 'circular';
+  /** (v0.2.0, P5) Conditional-format paint computed by the host for this cell (absent = no rule applies). */
+  cf?: CfPaint;
 }
 
 /**
@@ -228,6 +232,8 @@ export interface SheetMeta {
   autoFilter?: Range;
   /** List data validations, one entry per distinct list (absent when the sheet has none). */
   validations?: ListValidation[];
+  /** (v0.2.0, P2) Stable id; survives rename, reorder, undo. Optional only for type compatibility; the host always sets it. */
+  id?: SheetId;
 }
 
 export interface WorkbookMeta {
@@ -300,6 +306,81 @@ export interface CsvModel {
   sepLine?: string;
 }
 
+/** (v0.2.0) Stable sheet id: xlsx = 's' + the <sheet sheetId="n"> attribute of workbook.xml (= ExcelJS ws.id); csv = 'csv'. */
+export type SheetId = string;
+
+/** (v0.2.0, P5) Result of the conditional formats of one cell. `s` replaces CellData.s for painting (cell style + dxf merged). */
+export interface CfPaint {
+  s?: number;
+  /** Colour-scale fill, '#rrggbb'. */
+  fill?: string;
+  bar?: { pct: number; color: string; negative?: boolean; gradient: boolean; showValue: boolean };
+  icon?: { set: string; index: number; showValue: boolean };
+}
+
+// ----- edit intents -----
+// (v0.2.0) What the webview asks the host to change. Declared once here (protocol frozen after track F, D-062) and
+// shared with media/viewer.js as JSDoc typedefs. Shapes and limits are validated in parseWebviewMessage
+// (src/viewerProvider.ts); the meaning is checked again by the phase's planner (planEdit / planCsvEdit / md checks).
+
+/** What the webview asks for. Validated in parseWebviewMessage (shape + limits) and again by planEdit (meaning). */
+export type EditIntent =
+  // ---- values (xlsx P2, csv P3) ----
+  | { kind: 'setCells'; sheetId: SheetId; cells: [r: number, c: number, text: string][] } // typing, paste, fill, replace one
+  | { kind: 'clear'; sheetId: SheetId; ranges: Range[]; what: 'contents' | 'formats' | 'all' } // csv: 'contents' only
+  // ---- structure (csv P3, xlsx P4) ----
+  | { kind: 'insertRows' | 'deleteRows' | 'insertCols' | 'deleteCols'; sheetId: SheetId; at: number; count: number }
+  | { kind: 'sort'; sheetId: SheetId; range: Range; key: number; desc: boolean; header: boolean } // key = absolute column
+  | { kind: 'replaceAll'; query: FindQuery; replace: string } // scope inside the query
+  // ---- xlsx only (P4) ----
+  | { kind: 'style'; sheetId: SheetId; ranges: Range[]; delta: StyleDelta }
+  | { kind: 'merge' | 'unmerge'; sheetId: SheetId; range: Range }
+  | { kind: 'resize'; sheetId: SheetId; axis: 'row' | 'col'; index: number[]; size: number | null } // px; null = default/auto height
+  | { kind: 'sheetAdd'; index: number; name?: string }
+  | { kind: 'sheetRename'; sheetId: SheetId; name: string }
+  | { kind: 'sheetDelete' | 'sheetDuplicate'; sheetId: SheetId }
+  | { kind: 'sheetMove'; sheetId: SheetId; index: number }
+  | { kind: 'sheetHide'; sheetId: SheetId; hidden: boolean }
+  | { kind: 'tabColor'; sheetId: SheetId; argb: string | null }
+  // ---- markdown (P6) ----
+  | { kind: 'mdText'; edits: MdTextEdit[] };
+
+export type EditKind = EditIntent['kind'];
+
+export interface FindQuery {
+  /** csv: always 'csv'. */
+  scope: SheetId | 'workbook';
+  /** At most 1,000 characters. */
+  text: string;
+  matchCase: boolean;
+  regex: boolean;
+  wholeCell: boolean;
+  /** csv: 'values'. */
+  lookIn: 'values' | 'formulas';
+}
+
+/** Applied in order on the cell's ORIGINAL xf (never on an ExcelJS style object). null = remove that property. */
+export interface StyleDelta {
+  bold?: boolean;
+  italic?: boolean;
+  underline?: 'single' | 'double' | null;
+  strike?: boolean;
+  /** 'FFRRGGBB'. */
+  fontColor?: string | null;
+  /** 'FFRRGGBB'. */
+  fill?: string | null;
+  border?: { top?: BorderSide; bottom?: BorderSide; left?: BorderSide; right?: BorderSide };
+  hAlign?: 'left' | 'center' | 'right' | 'justify' | null;
+  vAlign?: 'top' | 'center' | 'bottom' | null;
+  wrap?: boolean;
+  /** OOXML number format code, already escaped. */
+  numFmt?: string;
+  /** Set by typing a leading apostrophe. */
+  quotePrefix?: boolean;
+}
+
+export type BorderSide = { style: 'thin' | 'medium' | 'thick' | 'dashed' | 'dotted' | 'double' | 'hair'; color?: string } | null;
+
 // ===== IMPLEMENTATION =====
 //
 // Public API (phase-1 contract): loadWorkbook, GridSource, WorkbookModel /
@@ -310,10 +391,11 @@ export interface CsvModel {
 //
 // Sections:
 //   LIBRARIES          third-party imports, local typing for untyped ssf
+//   EDIT TYPES         (v0.2.0) file-side edit types: FileValue, CellPatch, PackageOp, BlockReason (host only)
 //   EXCELJS INTERNALS  the (undocumented) slice of ExcelJS' object model we read
 //   CONSTANTS          units, limits and builtin tables
 //   COLORS             theme palette, tint maths, indexed palette, resolveColor
-//   ADDRESSES          A1 helpers, range parsing, shared-formula translation
+//   ADDRESSES          A1 helpers, range parsing, shared-formula translation; (v0.2.0) fx formula tokenizer adapter
 //   NUMBER FORMATS     ssf wrapper with fast paths and caches
 //   STYLES             ExcelJS style -> CellStyle conversion + dedupe table
 //   LOADING            loadWorkbook (raw styles.xml side channel, internal links)
@@ -328,6 +410,10 @@ export interface CsvModel {
 import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import Papa from 'papaparse';
+// Excel formula tokenizer, xlsx flavour (file syntax: [n] external workbook indexes, _xlfn. prefixes). See ADDRESSES
+// `fx adapter`.
+import { parseA1Ref as fxParseA1Ref, tokenize as fxTokenizeRaw, tokenTypes as FX_TOKEN } from '@borgar/fx/xlsx';
+import type { MdTextEdit } from './markdown';
 
 /** The part of ssf (SheetJS number formatter, untyped CommonJS) used here. */
 interface SsfLib {
@@ -376,6 +462,49 @@ interface XCellParser {
   parseClose(name: string): boolean;
 }
 const CellXform = require('exceljs/lib/xlsx/xform/sheet/cell-xform') as { prototype: XCellParser } | undefined;
+
+// ===== EDIT TYPES =====
+// (v0.2.0) What an edit writes into the file. Host only (never sent to the webview). The save path (XLSX SAVE, P1)
+// patches the loaded package with these operations; every phase that changes a workbook produces them.
+
+/** A cell value as the file stores it. */
+export type FileValue = { t: 'n'; v: number } | { t: 's'; v: string } | { t: 'b'; v: boolean } | { t: 'e'; v: string };
+
+export interface CellPatch {
+  /** null = clear contents (keep s). */
+  value?: FileValue | null;
+  /** FILE syntax (_xlfn. prefixes, English names, ','), without '='. */
+  formula?: string;
+  /** <v> of a formula cell; null = write no <v> (unsupported function, D-021). */
+  cached?: FileValue | null;
+  /** Derived xf appended to styles.xml (existing xfs never change). */
+  style?: StyleDelta[];
+}
+
+/** `sheet` = the numeric <sheet sheetId> attribute (SheetId = 's' + sheet). Positions are those at edit time. */
+export type PackageOp =
+  | { kind: 'cells'; sheet: number; cells: [r: number, c: number, patch: CellPatch][] }
+  | { kind: 'merge' | 'unmerge'; sheet: number; range: Range }
+  | { kind: 'insertRows' | 'deleteRows' | 'insertCols' | 'deleteCols'; sheet: number; at: number; count: number }
+  | { kind: 'sort'; sheet: number; range: Range; byRow: Int32Array } // new row range.r0+i <- old row byRow[i]
+  | { kind: 'rowProps'; sheet: number; rows: number[]; height?: number | null; style?: StyleDelta[] } // points
+  | { kind: 'colProps'; sheet: number; cols: number[]; width?: number | null; style?: StyleDelta[] } // Excel char units
+  | { kind: 'sheetAdd'; sheet: number; name: string; index: number }
+  | { kind: 'sheetRename'; sheet: number; name: string }
+  | { kind: 'sheetDelete'; sheet: number }
+  | { kind: 'sheetDuplicate'; sheet: number; newSheet: number; name: string; index: number }
+  | { kind: 'sheetMove'; sheet: number; index: number }
+  | { kind: 'sheetState'; sheet: number; state: 'visible' | 'hidden' }
+  | { kind: 'tabColor'; sheet: number; argb: string | null };
+
+/** Why an edit is refused (editResult code 'blocked'); used by every phase's block rules. */
+export interface BlockReason {
+  code: 'ref' | 'array' | 'merge' | 'table' | 'rule' | 'name' | 'lossy' | 'protected' | 'unsupported' | 'sheet3d' | 'limit';
+  /** Full user text (contract §3.4 style). */
+  message: string;
+  /** E.g. ['Data!H1', 'F!A2'] (first 12, then "+N more"). */
+  where: string[];
+}
 
 // ===== EXCELJS INTERNALS =====
 // ExcelJS 4.4 keeps its document in plain objects that are mostly absent from
@@ -920,6 +1049,532 @@ function isAutomaticColor(color: XColor | undefined): boolean {
 }
 
 // ===== ADDRESSES =====
+
+// ----- fx adapter -----
+// (v0.2.0) Formula text <-> tokens through @borgar/fx (xlsx flavour = file syntax: A1 references only, R1C1 off,
+// [n] external workbook indexes, _xlfn. prefixes). Used by formula input (P2), reference shifting (P4, display and
+// save, one grammar) and recalc (P5). Rules:
+//   - the tokens cover the formula without gaps or overlaps: joining their text always gives the formula back
+//     (fxJoin); text fx cannot read becomes an 'UNKNOWN' token (callers that rewrite a formula must block on it);
+//   - a reference is re-spelled only where it changes (fxEmitRef): an unchanged prefix keeps its text (quotes,
+//     case), an unchanged range end keeps its text ('a1', '$b$2'), an unchanged reference keeps all of it (B5:A1).
+// Ported from ROUND\s2-editmodel\proto\lex-fx.js (E6 fuzz 90,000/90,000, E7 corpus 532/532).
+
+/** A sheet / workbook prefix of a reference ('My Data'!, [1]Sheet1!, Sheet1:Sheet3!, [1]!), unescaped. */
+export interface FxPrefix {
+  /** The prefix was written in quotes ('Sheet1'!A1). */
+  quoted: boolean;
+  /** External workbook as written: '[1]' (file syntax: index into <externalReferences>), else null. */
+  book: string | null;
+  /** First (or only) sheet; null for a workbook-level name ([1]!Name). */
+  sheet1: string | null;
+  /** Last sheet of a 3D reference (Sheet1:Sheet3!A1), else null. */
+  sheet2: string | null;
+}
+
+/**
+ * The rectangle a reference names: 0-based, inclusive. Whole columns ('cols', A:C) run over every row and whole rows
+ * ('rows', 2:4) over every column; their unused `$` flags are false.
+ */
+export interface FxArea {
+  kind: 'cell' | 'area' | 'rows' | 'cols';
+  r0: number;
+  c0: number;
+  r1: number;
+  c1: number;
+  $r0: boolean;
+  $c0: boolean;
+  $r1: boolean;
+  $c1: boolean;
+}
+
+export interface FxRef extends FxArea {
+  prefix: FxPrefix | null;
+  /** Followed by the spill operator (A1#); the '#' is part of the token. */
+  spill: boolean;
+  /** Offset in the formula where the A1 part starts (after the prefix and its '!'). */
+  bodyStart: number;
+}
+
+/**
+ * One formula token: `formula.slice(start, end)` is its text. `type`: 'REF' (cell, range, whole rows / columns, with
+ * `ref`), 'NAME' (defined name, `prefix` when qualified), 'STRUCT' (table reference, `prefix` when qualified), 'ERR'
+ * (a qualified #REF!: Sheet1!#REF!, with `prefix`), 'UNKNOWN' (unreadable text), or fx's own token type for the rest
+ * ('func', 'operator', 'number', 'string', 'bool', 'error', 'whitespace', 'newline', 'fx_prefix').
+ */
+export interface FxToken {
+  type: string;
+  start: number;
+  end: number;
+  ref?: FxRef;
+  prefix?: FxPrefix | null;
+  refError?: boolean;
+}
+
+const FX_TOKENIZE_OPTIONS = { withLocation: true, mergeRefs: true, negativeNumbers: false, allowTernary: false, r1c1: false };
+
+/** "'[1]My ''x'''" -> {quoted, book '[1]', sheet1 "My 'x'"}; 'Sheet1:Sheet3' -> 3D. Text before the '!'. */
+function fxParsePrefix(text: string): FxPrefix {
+  const quoted = text.length >= 2 && text.startsWith("'") && text.endsWith("'");
+  let inner = quoted ? text.slice(1, -1).replace(/''/g, "'") : text;
+  let book: string | null = null;
+  if (inner.startsWith('[')) {
+    const close = inner.indexOf(']');
+    if (close > 0) {
+      book = inner.slice(0, close + 1);
+      inner = inner.slice(close + 1);
+    }
+  }
+  // Excel forbids ':' in sheet names, so a ':' separates the two ends of a 3D reference.
+  const colon = inner.indexOf(':');
+  const sheet1 = (colon >= 0 ? inner.slice(0, colon) : inner) || null;
+  const sheet2 = colon >= 0 ? inner.slice(colon + 1) || null : null;
+  return { quoted, book, sheet1, sheet2 };
+}
+
+/** fx range of a reference -> FxArea of `kind`. */
+function fxToArea(
+  range: { top: number | null; left: number | null; bottom?: number | null; right?: number | null; $top?: boolean | null; $left?: boolean | null; $bottom?: boolean | null; $right?: boolean | null },
+  kind: FxArea['kind'],
+): FxArea | undefined {
+  const r0 = range.top ?? 0;
+  const c0 = range.left ?? 0;
+  const r1 = range.bottom ?? range.top ?? 0;
+  const c1 = range.right ?? range.left ?? 0;
+  if (kind === 'cols') {
+    if (range.left == null) return undefined;
+    return { kind, r0: 0, r1: MAX_ROWS - 1, c0, c1, $r0: false, $r1: false, $c0: !!range.$left, $c1: !!range.$right };
+  }
+  if (kind === 'rows') {
+    if (range.top == null) return undefined;
+    return { kind, r0, r1, c0: 0, c1: MAX_COLS - 1, $r0: !!range.$top, $r1: !!range.$bottom, $c0: false, $c1: false };
+  }
+  if (range.top == null || range.left == null) return undefined;
+  return {
+    kind,
+    r0,
+    c0,
+    r1,
+    c1,
+    $r0: !!range.$top,
+    $c0: !!range.$left,
+    $r1: !!(range.$bottom ?? range.$top),
+    $c1: !!(range.$right ?? range.$left),
+  };
+}
+
+/**
+ * Tokenizes a formula (with or without the leading '='). Never throws: if fx fails, or its tokens do not cover the
+ * text exactly, the result is one 'UNKNOWN' token for the whole formula.
+ */
+/** Longest formula fxTokenize reads (Excel's limit). @borgar/fx is quadratic on some input (apostrophe runs), and a file's formula text is not limited. */
+export const FX_MAX_FORMULA_CHARS = 8192;
+
+/** Runs no real formula has (a sheet name is at most 31 characters): they make @borgar/fx quadratic. */
+const FX_HOSTILE_RUN = /['[]{64,}|\.{64,}|(?:\d\.){64,}/;
+/** Time budget shared by all calls: slow quote-heavy formulas add their time as debt; the debt shrinks with the clock. */
+const FX_DEBT_LIMIT_MS = 1000;
+const FX_SLOW_CALL_MS = 15;
+let fxDebtMs = 0;
+let fxDebtAt = 0;
+function fxNow(): number {
+  return typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+/** The formula with the body of every "text" literal blanked (same length): a dotted leader in a string is harmless. */
+function fxMaskStrings(formula: string): string {
+  if (formula.indexOf('"') < 0) return formula;
+  return formula.replace(/"(?:[^"]|"")*"?/g, (m) => '"' + ' '.repeat(Math.max(0, m.length - 2)) + (m.length > 1 ? '"' : ''));
+}
+
+export function fxTokenize(formula: string): FxToken[] {
+  if (!formula) return [];
+  const whole: FxToken[] = [{ type: 'UNKNOWN', start: 0, end: formula.length }];
+  if (formula.length > FX_MAX_FORMULA_CHARS || FX_HOSTILE_RUN.test(fxMaskStrings(formula))) return whole;
+  // Shared budget: the adapter itself stops a workbook of crafted formulas from freezing the host. Only quote-heavy
+  // text can be slow; once the debt is over the limit such a formula is opaque (one UNKNOWN token).
+  const t0 = fxNow();
+  fxDebtMs = Math.max(0, fxDebtMs - (t0 - fxDebtAt));
+  fxDebtAt = t0;
+  const quoteHeavy = formula.length > 256 && (formula.match(/'/g)?.length ?? 0) > 8;
+  if (quoteHeavy && fxDebtMs > FX_DEBT_LIMIT_MS) return whole;
+  let raw: { type: string; value: string; loc?: number[] }[];
+  try {
+    raw = fxTokenizeRaw(formula, FX_TOKENIZE_OPTIONS);
+  } catch {
+    return whole;
+  } finally {
+    const spent = fxNow() - t0;
+    if (quoteHeavy && spent > FX_SLOW_CALL_MS) fxDebtMs += spent;
+    fxDebtAt = fxNow();
+  }
+  const out: FxToken[] = [];
+  let pos = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const t = raw[i];
+    const start = t.loc?.[0];
+    const end = t.loc?.[1];
+    if (start !== pos || end === undefined || end <= start || formula.slice(start, end) !== t.value) return whole;
+    pos = end;
+    const value = t.value;
+    if (t.type === FX_TOKEN.REF_RANGE || t.type === FX_TOKEN.REF_BEAM) {
+      const ref = fxParseA1Ref(value, { allowNamed: false, allowTernary: false });
+      const range = ref && 'range' in ref ? ref.range : undefined;
+      const bang = value.lastIndexOf('!'); // the A1 part never contains '!'; a quoted sheet name may
+      const body = value.slice(bang + 1);
+      const kind: FxArea['kind'] =
+        t.type === FX_TOKEN.REF_BEAM ? (range?.top == null ? 'cols' : 'rows') : body.includes(':') ? 'area' : 'cell';
+      const area = range ? fxToArea(range, kind) : undefined;
+      if (!area) {
+        out.push({ type: 'UNKNOWN', start, end });
+        continue;
+      }
+      let tokenEnd = end;
+      let spill = false;
+      const next = raw[i + 1];
+      if (next && next.type === FX_TOKEN.OPERATOR && next.value === '#' && next.loc?.[0] === end && next.loc[1] === end + 1) {
+        spill = true;
+        tokenEnd = end + 1;
+        pos = tokenEnd;
+        i++;
+      }
+      const prefix = bang >= 0 ? fxParsePrefix(value.slice(0, bang)) : null;
+      out.push({ type: 'REF', start, end: tokenEnd, ref: { ...area, prefix, spill, bodyStart: start + bang + 1 } });
+    } else if (t.type === FX_TOKEN.REF_NAMED || t.type === FX_TOKEN.REF_STRUCT) {
+      // A table reference's own brackets come after the prefix: split at the last '!' before the first '[' of the
+      // table part ('[1]Sh'!Table1[Col], [@x]); a leading '[n]' is an external book.
+      const bang = fxPrefixEnd(value);
+      out.push({
+        type: t.type === FX_TOKEN.REF_NAMED ? 'NAME' : 'STRUCT',
+        start,
+        end,
+        prefix: bang > 0 ? fxParsePrefix(value.slice(0, bang)) : null,
+      });
+    } else if (
+      (t.type === FX_TOKEN.CONTEXT || t.type === FX_TOKEN.CONTEXT_QUOTE) &&
+      raw[i + 1]?.type === FX_TOKEN.OPERATOR &&
+      raw[i + 1].value === '!' &&
+      raw[i + 2]?.type === FX_TOKEN.ERROR &&
+      raw[i + 2].value.toUpperCase() === '#REF!' &&
+      raw[i + 1].loc?.[0] === end &&
+      raw[i + 2].loc?.[0] === end + 1
+    ) {
+      // Sheet1!#REF! (a reference Excel already broke): one token, so a sheet rename can still rewrite its prefix.
+      const errEnd = end + 1 + raw[i + 2].value.length;
+      if (formula.slice(end + 1, errEnd) !== raw[i + 2].value) return whole;
+      out.push({ type: 'ERR', start, end: errEnd, prefix: fxParsePrefix(value), refError: true });
+      pos = errEnd;
+      i += 2;
+    } else if (t.type === FX_TOKEN.UNKNOWN) {
+      out.push({ type: 'UNKNOWN', start, end });
+    } else {
+      out.push({ type: t.type, start, end });
+    }
+  }
+  if (pos !== formula.length) return whole;
+  return out;
+}
+
+/** Unquoted prefix of a name / table token: optional '[n]' book, sheet text, '!' ('[1]!Name', 'Sheet1!Name'). */
+const FX_PLAIN_PREFIX_RE = /^(?:\[[^\]]*\])?[^[\]'!]*!/;
+
+/**
+ * Offset of the '!' that ends the prefix of a name / table token, or -1 when it has none. A table reference's own
+ * brackets ('Table1[Col]', '[@x]', '[[#This Row],[a]]') never count as a prefix, nor does a '!' inside them.
+ */
+function fxPrefixEnd(value: string): number {
+  if (value.startsWith("'")) {
+    for (let i = 1; i < value.length; i++) {
+      if (value[i] !== "'") continue;
+      if (value[i + 1] === "'") {
+        i++;
+        continue;
+      }
+      return value[i + 1] === '!' ? i + 1 : -1;
+    }
+    return -1;
+  }
+  const m = FX_PLAIN_PREFIX_RE.exec(value);
+  return m ? m[0].length - 1 : -1;
+}
+
+/** Joins the tokens' text: always equals the formula they came from. */
+export function fxJoin(formula: string, tokens: readonly FxToken[]): string {
+  let out = '';
+  for (const t of tokens) out += formula.slice(t.start, t.end);
+  return out;
+}
+
+/** Excel's rule for sheet names in references (checked against Excel's own output: 33 names, s2-editmodel E1). */
+export function sheetNeedsQuotes(name: string): boolean {
+  if (!/^[\p{L}_\\][\p{L}0-9_.\\]*$/u.test(name)) return true; // spaces, punctuation, leading digit or dot, digits of other scripts (Excel quotes x٤)
+  if (/^(TRUE|FALSE)$/i.test(name)) return true;
+  const a1 = /^([A-Za-z]{1,3})([0-9]+)$/.exec(name); // looks like a cell (column <= XFD)
+  if (a1 && colToIndex(a1[1]) < MAX_COLS && +a1[2] >= 1 && +a1[2] <= MAX_ROWS) return true;
+  if (/^(R|C|RC|R[0-9]+|C[0-9]+|R[0-9]*C[0-9]*)$/i.test(name)) return true; // looks like R1C1
+  return false;
+}
+
+/** A sheet name as a reference prefix writes it (without the '!'): quoted only when Excel would. */
+export function quoteSheetForRef(name: string): string {
+  return sheetNeedsQuotes(name) ? `'${name.replace(/'/g, "''")}'` : name;
+}
+
+/** Prefix text including the '!'. `quoted` keeps quotes that were written; otherwise they follow sheetNeedsQuotes. */
+export function fxPrefixText(p: FxPrefix): string {
+  if (p.sheet1 === '' || p.sheet2 === '' || p.book === '') throw new RangeError('fx: empty sheet name in a reference prefix');
+  const inner = (p.book ?? '') + (p.sheet1 ?? '') + (p.sheet2 ? ':' + p.sheet2 : '');
+  const needs =
+    p.quoted ||
+    (p.book !== null && /[\\/ ']/.test(p.book)) ||
+    (p.sheet1 !== null && sheetNeedsQuotes(p.sheet1)) ||
+    (p.sheet2 !== null && sheetNeedsQuotes(p.sheet2));
+  return (needs ? `'${inner.replace(/'/g, "''")}'` : inner) + '!';
+}
+
+/** Throws a RangeError for a coordinate that is not an integer inside the grid (the caller must write #REF! itself); swapped corners are put in order. */
+function fxCheckedArea(a: FxArea): FxArea {
+  const ok = (n: number, max: number) => Number.isInteger(n) && n >= 0 && n < max;
+  const usesRow = a.kind !== 'cols';
+  const usesCol = a.kind !== 'rows';
+  const two = a.kind !== 'cell';
+  if (
+    (usesRow && !(ok(a.r0, MAX_ROWS) && (!two || ok(a.r1, MAX_ROWS)))) ||
+    (usesCol && !(ok(a.c0, MAX_COLS) && (!two || ok(a.c1, MAX_COLS))))
+  ) {
+    throw new RangeError('fx: reference outside the grid');
+  }
+  const swapR = two && usesRow && a.r0 > a.r1;
+  const swapC = two && usesCol && a.c0 > a.c1;
+  if (!swapR && !swapC) return a;
+  return {
+    ...a,
+    r0: swapR ? a.r1 : a.r0, r1: swapR ? a.r0 : a.r1, $r0: swapR ? a.$r1 : a.$r0, $r1: swapR ? a.$r0 : a.$r1,
+    c0: swapC ? a.c1 : a.c0, c1: swapC ? a.c0 : a.c1, $c0: swapC ? a.$c1 : a.$c0, $c1: swapC ? a.$c0 : a.$c1,
+  };
+}
+
+/** One end of a reference: 'B3', '$B$3', 'B' (cols), '3' (rows). */
+function fxEndText(kind: FxArea['kind'], r: number, c: number, $r: boolean, $c: boolean): string {
+  const col = (abs: boolean) => (abs ? '$' : '') + indexToCol(c);
+  const row = (abs: boolean) => (abs ? '$' : '') + (r + 1);
+  if (kind === 'cols') return col($c);
+  if (kind === 'rows') return row($r);
+  return col($c) + row($r);
+}
+
+/** Reference text of an area without prefix: 'A1', 'A1:B2', 'A:C', '2:4' (normalized, upper-case). */
+export function fxAreaText(a: FxArea): string {
+  const first = fxEndText(a.kind, a.r0, a.c0, a.$r0, a.$c0);
+  return a.kind === 'cell' ? first : `${first}:${fxEndText(a.kind, a.r1, a.c1, a.$r1, a.$c1)}`;
+}
+
+const FX_END_RE = /^(\$?)([A-Za-z]{1,3})?(\$?)(\d{1,7})?$/;
+
+function samePrefix(a: FxPrefix | null, b: FxPrefix | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.book === b.book && a.sheet1 === b.sheet1 && a.sheet2 === b.sheet2;
+}
+
+function sameArea(a: FxArea, b: FxArea): boolean {
+  return (
+    a.kind === b.kind && a.r0 === b.r0 && a.c0 === b.c0 && a.r1 === b.r1 && a.c1 === b.c1 &&
+    a.$r0 === b.$r0 && a.$c0 === b.$c0 && a.$r1 === b.$r1 && a.$c1 === b.$c1
+  );
+}
+
+/**
+ * New text of a 'REF' token. `next.prefix` (null = no prefix) and `next.area` replace the token's prefix and range;
+ * undefined keeps them. Unchanged parts keep their original spelling: the whole prefix text when the new prefix names
+ * the same book and sheets, the whole range text when the area is unchanged, and otherwise each end whose row, column
+ * and `$` flags are unchanged. The spill '#' is kept.
+ */
+export function fxEmitRef(formula: string, token: FxToken, next: { prefix?: FxPrefix | null; area?: FxArea }): string {
+  const ref = token.ref;
+  if (!ref) return formula.slice(token.start, token.end);
+  const bodyEnd = token.end - (ref.spill ? 1 : 0);
+  const oldPrefixText = formula.slice(token.start, ref.bodyStart);
+  const oldBody = formula.slice(ref.bodyStart, bodyEnd);
+  let prefixText = oldPrefixText;
+  if (next.prefix !== undefined && !samePrefix(next.prefix, ref.prefix)) {
+    prefixText = next.prefix === null ? '' : fxPrefixText(next.prefix);
+  }
+  let body = oldBody;
+  const area = next.area && fxCheckedArea(next.area);
+  if (area && !sameArea(area, ref)) {
+    const ends = oldBody.split(':');
+    const sameShape = area.kind === ref.kind && ends.length === (area.kind === 'cell' ? 1 : 2);
+    /** The old text of end `k` when it already says (r, c, $r, $c), else the new text. */
+    const keep = (k: 0 | 1, r: number, c: number, $r: boolean, $c: boolean): string => {
+      const m = sameShape ? FX_END_RE.exec(ends[k]) : null;
+      if (m) {
+        const hasCol = m[2] !== undefined;
+        const hasRow = m[4] !== undefined;
+        const colAbs = hasCol && m[1] === '$';
+        const rowAbs = hasCol ? m[3] === '$' : m[1] === '$' || m[3] === '$';
+        const colOk = area.kind === 'rows' ? !hasCol : hasCol && colToIndex(m[2]) === c && colAbs === $c;
+        const rowOk = area.kind === 'cols' ? !hasRow : hasRow && parseInt(m[4], 10) - 1 === r && rowAbs === $r;
+        if (colOk && rowOk) return ends[k];
+      }
+      return fxEndText(area.kind, r, c, $r, $c);
+    };
+    const first = keep(0, area.r0, area.c0, area.$r0, area.$c0);
+    body = area.kind === 'cell' ? first : `${first}:${keep(1, area.r1, area.c1, area.$r1, area.$c1)}`;
+  }
+  return prefixText + body + (ref.spill ? '#' : '');
+}
+
+/** Rebuilds a formula from its tokens: `replace` returns new text for a token, or null to keep its text. */
+export function fxEmit(formula: string, tokens: readonly FxToken[], replace: (token: FxToken) => string | null): string {
+  let out = '';
+  for (const t of tokens) out += replace(t) ?? formula.slice(t.start, t.end);
+  return out;
+}
+
+// ----- formula syntax -----
+// (v0.2.0, P2) Formula INPUT: what the user types in the cell editor (editor syntax: English function names, ',' as
+// separator, no _xlfn. prefixes) -> what the file stores (file syntax: the same text with the _xlfn. prefixes Excel
+// writes for functions newer than Excel 2007). Built on the fx adapter above. A formula that fx cannot parse is refused
+// BEFORE it can reach the file: Excel would "repair" a workbook with a broken <f>.
+// (The import sits here, not in LIBRARIES, so this section never touches lines other tracks edit.)
+import { parse as fxParseAst } from '@borgar/fx/xlsx';
+
+/** Functions Excel stores with a prefix (names newer than Excel 2007): NAME -> prefix. Checked against Excel's own files (see test). */
+const FILE_FUNCTION_PREFIX: ReadonlyMap<string, string> = new Map(
+  (
+    'ACOT ACOTH AGGREGATE ARABIC ARRAYTOTEXT BASE BETA.DIST BETA.INV BINOM.DIST BINOM.DIST.RANGE BINOM.INV BITAND BITLSHIFT BITOR ' +
+    'BITRSHIFT BITXOR CEILING.MATH CEILING.PRECISE CHISQ.DIST CHISQ.DIST.RT CHISQ.INV CHISQ.INV.RT CHISQ.TEST COMBINA CONCAT ' +
+    'CONFIDENCE.NORM CONFIDENCE.T COT COTH COVARIANCE.P COVARIANCE.S CSC CSCH DAYS DECIMAL ENCODEURL ERF.PRECISE ERFC.PRECISE ' +
+    'EXPON.DIST F.DIST F.DIST.RT F.INV F.INV.RT F.TEST FILTERXML FLOOR.MATH FLOOR.PRECISE FORECAST.ETS FORECAST.ETS.CONFINT ' +
+    'FORECAST.ETS.SEASONALITY FORECAST.ETS.STAT FORECAST.LINEAR FORMULATEXT GAMMA GAMMA.DIST GAMMA.INV GAMMALN.PRECISE GAUSS ' +
+    'HYPGEOM.DIST IFNA IFS IMCOSH IMCOT IMCSC IMCSCH IMSEC IMSECH IMSINH IMTAN ISFORMULA ISOWEEKNUM LOGNORM.DIST LOGNORM.INV ' +
+    'MAXIFS MINIFS MODE.MULT MODE.SNGL MUNIT NEGBINOM.DIST NETWORKDAYS.INTL NORM.DIST NORM.INV NORM.S.DIST NORM.S.INV NUMBERVALUE ' +
+    'PDURATION PERCENTILE.EXC PERCENTILE.INC PERCENTRANK.EXC PERCENTRANK.INC PERMUTATIONA PHI POISSON.DIST QUARTILE.EXC ' +
+    'QUARTILE.INC QUERYSTRING RANK.AVG RANK.EQ RRI SEC SECH SHEET SHEETS SKEW.P STDEV.P STDEV.S SWITCH T.DIST T.DIST.2T T.DIST.RT ' +
+    'T.INV T.INV.2T T.TEST TEXTAFTER TEXTBEFORE TEXTJOIN UNICHAR UNICODE VALUETOTEXT VAR.P VAR.S WEBSERVICE WEIBULL.DIST ' +
+    'WORKDAY.INTL XLOOKUP XMATCH XOR Z.TEST'
+  )
+    .split(' ')
+    .map((name): [string, string] => [name, '_xlfn.']),
+);
+// Functions the file stores with the worksheet-function namespace too (used by the spilling functions, which are refused
+// for input below; kept for the tests that read Excel's own formulas back).
+const FILE_FUNCTION_PREFIX_WS: ReadonlyMap<string, string> = new Map([['FILTER', '_xlfn._xlws.'], ['SORT', '_xlfn._xlws.']]);
+
+/** Functions whose result spills into neighbouring cells (Excel 365): refused in new formulas (§5.3). */
+const SPILLING_FUNCTIONS: ReadonlySet<string> = new Set(
+  'SEQUENCE FILTER SORT SORTBY UNIQUE RANDARRAY TEXTSPLIT VSTACK HSTACK TOCOL TOROW TAKE DROP EXPAND WRAPROWS WRAPCOLS CHOOSEROWS CHOOSECOLS TRANSPOSE'.split(' '),
+);
+/** Functions whose parameters are written with special file prefixes (_xlpm.): refused in new formulas. */
+const LAMBDA_FUNCTIONS: ReadonlySet<string> = new Set('LET LAMBDA MAP REDUCE SCAN BYROW BYCOL MAKEARRAY ISOMITTED'.split(' '));
+
+export const FORMULA_PROBLEM_TEXT = "There's a problem with this formula.";
+const FORMULA_LIMITS = { depth: 64, args: 255, text: 255 } as const;
+
+export type FormulaCheck =
+  | { ok: true; /** File syntax, without '='. */ file: string; /** Editor / display syntax, without '='. */ editor: string }
+  | { ok: false; reason: 'invalid'; message: string }
+  | { ok: false; reason: 'blocked'; block: BlockReason };
+
+/** A name that looks like a cell reference outside the grid (A1048577, XFE1): refused, as Excel's formula bar would. */
+const OUT_OF_GRID_NAME_RE = /^\$?[A-Za-z]{1,3}\$?\d{1,8}$/;
+
+function hasLoneSurrogate(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const d = text.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) i++;
+      else return true;
+    } else if (c >= 0xdc00 && c <= 0xdfff) return true;
+  }
+  return false;
+}
+
+/**
+ * Checks a formula typed into a cell (`body` = text after the '=') and converts it to file syntax. Refused as
+ * 'invalid' (cell keeps its content): not parseable, unbalanced quotes / parentheses, a reference outside the grid or
+ * to an unknown sheet, over Excel's limits (8,192 characters, 64 nesting levels, 255 arguments, 255 characters per
+ * text constant). Refused as 'blocked': what FileStudio cannot write safely yet (spilling functions, LET / LAMBDA,
+ * references to other workbooks, table references, spill references `A1#`). Unknown function names are allowed (the
+ * cell shows #NAME? like in Excel). `sheetNames`: every sheet of the workbook (compared ignoring case).
+ */
+export function checkFormulaInput(body: string, sheetNames: readonly string[]): FormulaCheck {
+  const invalid = (): FormulaCheck => ({ ok: false, reason: 'invalid', message: FORMULA_PROBLEM_TEXT });
+  const blocked = (message: string): FormulaCheck => ({ ok: false, reason: 'blocked', block: { code: 'unsupported', message, where: [] } });
+  if (!body.trim() || body.length > FX_MAX_FORMULA_CHARS || body.trimStart().startsWith('=')) return invalid();
+  if (/[\u0000-\u0008\u000b-\u001f￾￿]/.test(body) || hasLoneSurrogate(body)) return invalid();
+  const tokens = fxTokenize(body);
+  if (tokens.some((t) => t.type === 'UNKNOWN')) return invalid();
+  const known = new Set(sheetNames.map((n) => n.toLowerCase()));
+  const text = (t: FxToken): string => body.slice(t.start, t.end);
+  // fx's grammar is lenient at the ends: a formula starts with an operand, '(', '{' or a sign, and does not end on a binary operator.
+  const significant = tokens.filter((t) => t.type !== 'whitespace' && t.type !== 'newline');
+  const first = significant[0];
+  const last = significant[significant.length - 1];
+  if (first.type === 'operator' && !'({+-'.includes(text(first))) return invalid();
+  if (last.type === 'operator' && !')}%#'.includes(text(last))) return invalid();
+  const bounds = (a: FxArea): boolean => a.r0 >= 0 && a.c0 >= 0 && a.r1 < MAX_ROWS && a.c1 < MAX_COLS;
+  // Meaning of every token (before the grammar check, so a blocked formula says why).
+  for (const t of tokens) {
+    if (t.type === 'func') {
+      // _xlfn. / _xlws. are the file prefixes of newer functions: typed by hand they must not get past the checks.
+      const name = text(t).toUpperCase().replace(/^(?:_XLFN\.|_XLWS\.)+/, '');
+      if (SPILLING_FUNCTIONS.has(name)) return blocked("FileStudio can't create spilling (dynamic array) formulas yet. Enter this formula in Excel.");
+      if (LAMBDA_FUNCTIONS.has(name)) return blocked("FileStudio can't create formulas with LET or LAMBDA yet. Enter this formula in Excel.");
+    } else if (t.type === 'operator' && text(t) === '@') {
+      return invalid();
+    } else if (t.type === 'REF' && t.ref) {
+      if (t.ref.spill) return blocked("FileStudio can't create spilling (dynamic array) formulas yet. Enter this formula in Excel.");
+      if (!bounds(t.ref)) return invalid();
+    } else if (t.type === 'STRUCT') {
+      return blocked("FileStudio can't create formulas with table references yet. Enter this formula in Excel.");
+    } else if (t.type === 'NAME' && !t.prefix && OUT_OF_GRID_NAME_RE.test(text(t))) {
+      return invalid();
+    } else if (t.type === 'string') {
+      if (text(t).length - 2 - (text(t).match(/""/g)?.length ?? 0) > FORMULA_LIMITS.text) return invalid();
+    } else if (t.type === 'number') {
+      if (!Number.isFinite(Number(text(t)))) return invalid();
+    }
+    const prefix = t.ref ? t.ref.prefix : t.prefix;
+    if ((t.type === 'REF' || t.type === 'NAME' || t.type === 'STRUCT' || t.type === 'ERR') && prefix) {
+      if (prefix.book !== null) return blocked("FileStudio can't create formulas that refer to other workbooks yet. Enter this formula in Excel.");
+      for (const sheet of [prefix.sheet1, prefix.sheet2]) if (sheet !== null && !known.has(sheet.toLowerCase())) return invalid();
+    }
+  }
+  // Grammar (fx parser) and Excel's nesting limits.
+  try {
+    // The parser wants merged references and negative numbers as one token (unlike the adapter's own tokens).
+    const raw = fxTokenizeRaw(body, { mergeRefs: true, negativeNumbers: true, allowTernary: false, r1c1: false });
+    fxParseAst(raw);
+    const stack: { func: boolean; args: number }[] = [];
+    let prev = '';
+    for (const r of raw) {
+      if (r.type === 'operator') {
+        if (r.value === '(' || r.value === '{') {
+          stack.push({ func: r.value === '(' && prev === 'func', args: 1 });
+          if (stack.length > FORMULA_LIMITS.depth) return invalid();
+        } else if (r.value === ')' || r.value === '}') {
+          stack.pop();
+        } else if (r.value === ',' && stack.length) {
+          const top = stack[stack.length - 1];
+          if (++top.args > FORMULA_LIMITS.args && top.func) return invalid();
+        }
+      }
+      if (r.type !== 'whitespace' && r.type !== 'newline') prev = r.type;
+    }
+  } catch {
+    return invalid();
+  }
+  const file = fxEmit(body, tokens, (t) => {
+    if (t.type !== 'func') return null;
+    const name = text(t);
+    if (/^_xl/i.test(name)) return null; // typed with its prefix: kept
+    const upper = name.toUpperCase();
+    return (FILE_FUNCTION_PREFIX.get(upper) ?? FILE_FUNCTION_PREFIX_WS.get(upper) ?? '') + upper;
+  });
+  return { ok: true, file, editor: file.includes('_xl') ? file.replace(/_xl(?:fn|ws|pm)\./g, '') : file };
+}
 
 /** 'A' -> 0, 'XFD' -> 16383; -1 when not letters. */
 function colToIndex(letters: string): number {
@@ -2327,6 +2982,8 @@ interface WorkbookExtras {
   fillIndex: Map<object, number>;
   /** ExcelJS' backslash-stripped format code -> original code. */
   strippedFormats: Map<string, string>;
+  /** The bytes passed to loadWorkbook (see loadedBytes). */
+  bytes?: Uint8Array;
 }
 
 const workbookExtras = new WeakMap<object, WorkbookExtras>();
@@ -2384,6 +3041,8 @@ export interface LoadOptions {
  * notes are kept when written without runs or on cells absent from <sheetData>,
  * threaded comments are read (readThreadedComments), and the _xHHHH_ escapes
  * of inline strings and formula results are decoded (patchCellParser).
+ * Numbers in unit formats with a literal 'm' stay numbers and <b val="0"/> is
+ * read as not bold (patchDisplayFixes); loadedBytes(workbook) is `data` itself.
  */
 export async function loadWorkbook(data: Uint8Array, options?: LoadOptions): Promise<ExcelJS.Workbook> {
   const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
@@ -2392,6 +3051,7 @@ export async function loadWorkbook(data: Uint8Array, options?: LoadOptions): Pro
   patchSheetNameCheck();
   patchCommentParser();
   patchCellParser();
+  patchDisplayFixes();
   const rawParts = readRawParts(buffer, options?.folder);
   const workbook = new ExcelJS.Workbook();
   const captured: CapturedLoad = { arraysParsedBefore: arrayFormulasParsed };
@@ -2414,7 +3074,7 @@ export async function loadWorkbook(data: Uint8Array, options?: LoadOptions): Pro
     // best effort only: the workbook itself loaded
   }
   const arrayFormulas = captured.arrays ? arrayFormulasById(captured.arrays, dynamicArrayCells) : undefined;
-  workbookExtras.set(workbook, { ...buildExtras(styles, captured.styles), externalBooks, arrayFormulas, threadedNotes });
+  workbookExtras.set(workbook, { ...buildExtras(styles, captured.styles), externalBooks, arrayFormulas, threadedNotes, bytes: data });
   return workbook;
 }
 
@@ -3173,6 +3833,135 @@ function decodeXmlEntities(text: string): string {
   });
 }
 
+// ----- display fixes (D-055) -----
+// Two ExcelJS 4.4 misreads that matter once a cell can be edited (the editor starts from the shown value):
+//  - a number whose custom format has a literal 'm' ('#,##0.00\ \m', '0\ \k\m') became a JS Date: ExcelJS strips the
+//    backslashes (style/numfmt-xform.js) before utils.isDateFmt looks for date letters (sheet/cell-xform.js
+//    reconcile). The serial lost precision, and values past the year 275760 became '#VALUE!'.
+//  - <b val="0"/>, <i val="false"/>, <strike val="0"/> (any ST_OnOff "off" value) were read as set: BooleanXform
+//    (simple/boolean-xform.js) ignores the attribute.
+// The parsers are wrapped once, for good, like the other load patches.
+
+/** ExcelJS' parser of <b>, <i>, <strike> ... (an internal module; see patchDisplayFixes). */
+interface XBooleanParser {
+  tag?: string;
+  attr?: string;
+  model?: unknown;
+  parseOpen(node: { name: string; attributes?: Record<string, string | undefined> }): unknown;
+}
+const BooleanXform = require('exceljs/lib/xlsx/xform/simple/boolean-xform') as { prototype: XBooleanParser } | undefined;
+/** ExcelJS' parser of one <numFmt> (an internal module; see patchDisplayFixes). */
+interface XNumFmtParser {
+  model?: { id?: number; formatCode?: string };
+  parseOpen(node: { name: string; attributes?: Record<string, string | undefined> }): boolean;
+}
+const NumFmtXform = require('exceljs/lib/xlsx/xform/style/numfmt-xform') as { prototype: XNumFmtParser } | undefined;
+
+/** The cell model and options ExcelJS' CellXform#reconcile works on (sheet/cell-xform.js). */
+interface XReconcileCell {
+  type?: number;
+  value?: unknown;
+  result?: unknown;
+  styleId?: number;
+}
+interface XStylesForReconcile {
+  model?: { styles?: ({ numFmtId?: number } | undefined)[]; numFmts?: ({ id?: number } | undefined)[] };
+}
+type XReconcile = (this: unknown, model: XReconcileCell, options: { styles?: XStylesForReconcile } | undefined) => void;
+
+/** ST_OnOff "off" values (the attribute is case-sensitive in the schema; read leniently). */
+const ON_OFF_FALSE_RE = /^(?:0|false|off)$/i;
+/** Each parsed <numFmt> model -> its formatCode as written in the file (escapes intact). */
+const rawFormatCodes = new WeakMap<object, string>();
+/** Per StylesXform of a load: cellXfs index -> "keep the number" (its format is not a date format for FileStudio). */
+const numberStyles = new WeakMap<object, { formatter: NumberFormatter; keep: Map<number, boolean> }>();
+let displayFixesPatched = false;
+
+/**
+ * Wraps BooleanXform#parseOpen (an "off" val gives false, which FontXform then leaves unset), NumFmtXform#parseOpen
+ * (records the file's format code) and CellXform#reconcile (a number or formula result keeps its numeric value when
+ * ExcelJS would turn it into a Date but FileStudio's own formatter does not show that format as a date; the display
+ * then formats the exact number, see StyleConverter numFmt and NumberFormatter.isDate).
+ */
+function patchDisplayFixes(): void {
+  if (displayFixesPatched) return;
+  displayFixesPatched = true;
+  const bool = BooleanXform?.prototype;
+  const boolOpen = bool?.parseOpen;
+  if (bool && typeof boolOpen === 'function') {
+    bool.parseOpen = function parseOpenOnOff(this: XBooleanParser, node): unknown {
+      const handled = boolOpen.call(this, node);
+      if (node.name === this.tag && ON_OFF_FALSE_RE.test(node.attributes?.[this.attr ?? 'val'] ?? '')) this.model = false;
+      return handled;
+    };
+  }
+  const numFmt = NumFmtXform?.prototype;
+  const numFmtOpen = numFmt?.parseOpen;
+  if (numFmt && typeof numFmtOpen === 'function') {
+    numFmt.parseOpen = function parseOpenKeepingCode(this: XNumFmtParser, node): boolean {
+      const handled = numFmtOpen.call(this, node);
+      const code = node.attributes?.formatCode;
+      if (handled && this.model && typeof this.model === 'object' && typeof code === 'string') rawFormatCodes.set(this.model, code);
+      return handled;
+    };
+  }
+  const cell = CellXform?.prototype as unknown as { reconcile?: XReconcile } | undefined;
+  const reconcile = cell?.reconcile;
+  if (cell && typeof reconcile === 'function') {
+    cell.reconcile = function reconcileKeepingNumbers(this: unknown, model, options): void {
+      const type = model?.type;
+      const value = model?.value;
+      const result = model?.result;
+      const keep =
+        ((type === VT.Number && typeof value === 'number') || (type === VT.Formula && typeof result === 'number')) &&
+        typeof model.styleId === 'number' &&
+        styleKeepsNumber(options?.styles, model.styleId);
+      reconcile.call(this, model, options);
+      if (!keep) return;
+      if (type === VT.Number) {
+        model.type = VT.Number;
+        model.value = value;
+      } else {
+        model.result = result;
+      }
+    };
+  }
+}
+
+/** Whether cells with this cellXfs index keep their number: the xf's custom format is not a date for FileStudio. */
+function styleKeepsNumber(styles: XStylesForReconcile | undefined, styleId: number): boolean {
+  if (!styles || typeof styles !== 'object') return false;
+  let cache = numberStyles.get(styles);
+  if (!cache) {
+    cache = { formatter: new NumberFormatter(false), keep: new Map() };
+    numberStyles.set(styles, cache);
+  }
+  let keep = cache.keep.get(styleId);
+  if (keep === undefined) {
+    keep = false;
+    const id = styles.model?.styles?.[styleId]?.numFmtId;
+    const list = styles.model?.numFmts;
+    if (typeof id === 'number' && Array.isArray(list)) {
+      // the last <numFmt> with this id wins, as in StylesXform's index
+      let code: string | undefined;
+      for (const entry of list) {
+        if (entry && entry.id === id) code = rawFormatCodes.get(entry) ?? code;
+      }
+      if (code !== undefined) keep = !cache.formatter.isDate(code);
+    }
+    cache.keep.set(styleId, keep);
+  }
+  return keep;
+}
+
+/**
+ * The bytes a workbook was loaded from: the very object passed to loadWorkbook (never a copy, never changed), so the
+ * host keeps exactly what the display model shows as the base of every save (contract §4.1 `base`, D-006).
+ */
+export function loadedBytes(workbook: ExcelJS.Workbook): Uint8Array | undefined {
+  return workbookExtras.get(workbook)?.bytes;
+}
+
 // ===== GRID SOURCE =====
 
 /** Anything the grid can display. Implemented by WorkbookModel (xlsx) and CsvGridModel (csv). */
@@ -3198,6 +3987,16 @@ function columnWindow(c0: number | undefined, c1: number | undefined): [number, 
 interface SheetContext {
   ws: XWorksheet;
   index: number;
+  /** (v0.2.0, P2) Stable sheet id ('s' + the <sheet sheetId> attribute); the position in `index` can change, this cannot. */
+  id: SheetId;
+  /** (v0.2.0, P2) Position -> id maps and the cell overlay of the sheet (EDITING); every read goes through it. */
+  view: SheetView;
+  /** (v0.2.0, P2) Every array / spill range of the sheet as loaded (dynamic ones too): value edits inside are blocked. */
+  arrays: ArrayFormulaInfo[];
+  /** (v0.2.0, P2) Lazy lookups of the loaded merges and tables, and the used range of the loaded sheet. */
+  mergeIndex?: RangeIndex;
+  tables?: LoadedTable[];
+  loadedExtent?: { rowCount: number; colCount: number };
   /** Resolved list values per validation formula. */
   lists: Map<string, string[] | undefined>;
   /** Masters of the sheet's dynamic-array formulas (row * MAX_COLS + col), shown without braces. */
@@ -3236,6 +4035,18 @@ export class WorkbookModel implements GridSource {
   private readonly threadedNotes: ReadonlyMap<number, ReadonlyMap<number, string>> | undefined;
   private sheets: SheetContext[] = [];
   private meta: Omit<WorkbookMeta, 'styles'> = { sheets: [], activeSheet: 0, defaultFont: { name: 'Calibri', size: 11 }, date1904: false };
+  /** (v0.2.0, P2) Sheet position by id. */
+  private sheetById = new Map<SheetId, number>();
+  /**
+   * (v0.2.0, P2) Set when the workbook's sheet ids cannot identify its sheets (two sheets with the same <sheet sheetId>, or
+   * none): the model then refuses every edit (planEdit) and says why.
+   */
+  idProblem: string | undefined;
+  /**
+   * (v0.2.0, P2) Set by the host for facts only the package knows (a cell with `vm` = in-cell picture / linked data type,
+   * a pivot range): returns the message of the block, or undefined. Asked for every cell a value edit changes.
+   */
+  extraCellBlock: ((sheet: SheetId, r: number, c: number) => string | undefined) | undefined;
 
   constructor(workbook: ExcelJS.Workbook) {
     this.workbook = workbook;
@@ -3267,11 +4078,19 @@ export class WorkbookModel implements GridSource {
   /** Recomputes the sheet structure from the workbook (after edits / sheet changes). */
   refresh(): WorkbookMeta {
     this.styleTable.forgetObjects();
+    // Stable ids (EDITING): 's' + the sheetId attribute. A missing or repeated attribute cannot identify a sheet: such a
+    // sheet gets a fresh id and the model refuses edits (idProblem) instead of addressing the wrong sheet.
+    const ids = assignSheetIds(this.wb.worksheets);
+    this.idProblem = ids.problem;
+    this.sheetById = new Map(ids.ids.map((id, index) => [id, index]));
     this.sheets = this.wb.worksheets.map((ws, index) => {
       const arrays = (typeof ws.id === 'number' ? this.arrayFormulas?.get(ws.id) : undefined) ?? [];
       return {
         ws,
         index,
+        id: ids.ids[index],
+        view: newSheetView(ids.ids[index], ws),
+        arrays,
         lists: new Map(),
         dynamicArrays: new Set(arrays.filter((a) => a.dynamic).map((a) => a.r * MAX_COLS + a.c)),
         arrayRanges: arrays
@@ -3285,11 +4104,304 @@ export class WorkbookModel implements GridSource {
     return this.getMeta();
   }
 
+  // ----- editing support (v0.2.0): the EDITING section (planEdit / applyEdit / invertEdit) reads and changes the model through these -----
+
+  /** Position of the sheet with this id, -1 when there is none. */
+  sheetIndexOf(id: SheetId): number {
+    return this.sheetById.get(id) ?? -1;
+  }
+
+  /** Id of the sheet at a position. */
+  sheetIdAt(index: number): SheetId | undefined {
+    return this.sheets[index]?.id;
+  }
+
+  /** Names of all sheets (hidden ones too), in tab order. */
+  sheetNames(): string[] {
+    return this.sheets.map((s) => String(s.ws.name));
+  }
+
+  get usesDate1904(): boolean {
+    return this.date1904;
+  }
+
+  /** The view (maps + overlay) of a sheet. */
+  viewOf(id: SheetId): SheetView | undefined {
+    return this.sheets[this.sheetById.get(id) ?? -1]?.view;
+  }
+
+  /** Meta of one sheet as the webview needs it now (after the used range changed). */
+  sheetMeta(id: SheetId): SheetMeta | undefined {
+    return this.meta.sheets[this.sheetById.get(id) ?? -1];
+  }
+
+  /**
+   * Recomputes the meta of one sheet (used range, ...) after edits and returns it (undefined: no such sheet). The base
+   * workbook never changes, so this is only needed when the view changed something the meta shows.
+   */
+  refreshSheet(id: SheetId): SheetMeta | undefined {
+    const index = this.sheetById.get(id);
+    const ctx = index === undefined ? undefined : this.sheets[index];
+    if (!ctx || index === undefined) return undefined;
+    ctx.lists.clear();
+    const meta = this.safeSheetMeta(ctx);
+    this.meta.sheets[index] = meta;
+    return meta;
+  }
+
+  /** The cached lists of data validations read from cells: dropped after any edit (the next read looks again). */
+  dropListCaches(): void {
+    for (const ctx of this.sheets) ctx.lists.clear();
+  }
+
+  /** What planEdit needs to know about the cell at logical (r, c) of a sheet. */
+  cellState(id: SheetId, r: number, c: number): CellState | undefined {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    if (!ctx) return undefined;
+    const view = ctx.view;
+    const rowId = view.contentMap.get(r);
+    const colId = view.colMap.get(c);
+    const key = cellKey(rowId, colId);
+    const over = view.over.get(key);
+    const brow = rowId < NEW_ROW_BASE ? ctx.ws._rows[rowId] : undefined;
+    const base = colId < NEW_COL_BASE ? brow?._cells[colId] : undefined;
+    const style = over?.s ?? this.baseStyleIndex(ctx, base, rowId, colId);
+    const st = this.styleTable.styles[style];
+    let value: FileValue | undefined;
+    let formula: string | undefined;
+    let sharedMaster = false;
+    if (over) {
+      if (over.f !== undefined) formula = over.f;
+      if (over.t === 'e') value = typeof over.v === 'string' ? { t: 'e', v: over.v } : undefined;
+      else if (over.t === 'z' || over.v === undefined || over.v === null) value = undefined;
+      else if (typeof over.v === 'number') value = { t: 'n', v: over.v };
+      else if (typeof over.v === 'boolean') value = { t: 'b', v: over.v };
+      else value = { t: 's', v: over.v };
+    } else if (base) {
+      const xv = base._value;
+      const m = xv.model;
+      switch (xv.type) {
+        case VT.Number:
+          if (typeof m.value === 'number') value = { t: 'n', v: m.value };
+          break;
+        case VT.Date: {
+          const serial = m.value instanceof Date ? this.dateSerial(m.value) : undefined;
+          if (serial !== undefined) value = { t: 'n', v: serial };
+          break;
+        }
+        case VT.String:
+        case VT.SharedString:
+          if (typeof m.value === 'string') value = { t: 's', v: m.value };
+          break;
+        case VT.RichText:
+          value = { t: 's', v: richTextPlain(m.value) };
+          break;
+        case VT.Boolean:
+          if (typeof m.value === 'boolean') value = { t: 'b', v: m.value };
+          break;
+        case VT.Error:
+          value = { t: 'e', v: String((m.value as { error?: unknown } | undefined)?.error ?? '#VALUE!') };
+          break;
+        case VT.Hyperlink:
+          value = typeof m.text === 'string' ? { t: 's', v: m.text } : typeof m.text === 'number' ? { t: 'n', v: m.text } : undefined;
+          break;
+        case VT.Formula: {
+          value = this.resultValue(m.result);
+          if (typeof m.formula === 'string' && m.formula) {
+            formula = m.formula.startsWith('=') ? m.formula.slice(1) : m.formula;
+            sharedMaster = m.shareType === 'shared';
+          } else if (typeof m.sharedFormula === 'string') {
+            const master = decodeCell(m.sharedFormula);
+            const masterFormula = master ? ctx.ws._rows[master.r]?._cells[master.c]?._value?.model?.formula : undefined;
+            if (master && typeof masterFormula === 'string') {
+              formula = translateFormula(masterFormula.startsWith('=') ? masterFormula.slice(1) : masterFormula, rowId - master.r, colId - master.c);
+            }
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+    return {
+      rowId,
+      colId,
+      key,
+      override: over,
+      value,
+      formula,
+      style,
+      numFmt: st.numFmt ?? 'General',
+      wrap: !!st.align?.wrap,
+      locked: this.cellLocked(ctx, base, rowId, colId),
+      sharedMaster: sharedMaster && !over,
+      hasHyperlink: !!base && base._value.type === VT.Hyperlink,
+    };
+  }
+
+  /** A formula's cached result (ExcelJS value) as the file stores it; undefined when there is none. */
+  private resultValue(result: unknown): FileValue | undefined {
+    if (typeof result === 'number') return Number.isFinite(result) ? { t: 'n', v: result } : undefined;
+    if (typeof result === 'string') return { t: 's', v: result };
+    if (typeof result === 'boolean') return { t: 'b', v: result };
+    if (result instanceof Date) {
+      const serial = this.dateSerial(result);
+      return serial === undefined ? undefined : { t: 'n', v: serial };
+    }
+    if (isErrorValue(result)) return { t: 'e', v: String((result as { error: unknown }).error) };
+    return undefined;
+  }
+
+  /** Visits the cells inside `range` that exist (loaded or in the overlay), row by row, with their logical position. */
+  forEachExistingCell(id: SheetId, range: Range, visit: (r: number, c: number) => void): void {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    if (!ctx) return;
+    const view = ctx.view;
+    const last = Math.min(range.r1, viewRowLimit(view) - 1);
+    for (let r = range.r0; r <= last; r++) {
+      this.visitRowCells(ctx, view.contentMap.get(r), range.c0, range.c1, (c) => {
+        visit(r, c);
+        return true;
+      });
+    }
+  }
+
+  /** Is the cell locked (the default) in the file's own style? Only matters on a protected sheet. */
+  private cellLocked(ctx: SheetContext, base: XCell | undefined, rowId: number, colId: number): boolean {
+    const own = (st: XStyle | undefined): boolean | undefined => (st as { protection?: { locked?: boolean } } | undefined)?.protection?.locked;
+    const row = rowId < NEW_ROW_BASE ? ctx.ws._rows[rowId] : undefined;
+    const column = colId < NEW_COL_BASE ? ctx.ws._columns?.[colId] : undefined;
+    return (own(base?.style) ?? (base ? undefined : own(row?.style) ?? own(column?.style))) !== false;
+  }
+
+  /** The array / spill range (legacy or dynamic) of the loaded sheet that holds the base cell (rowId, colId). */
+  arrayRangeAt(id: SheetId, rowId: number, colId: number): Range | undefined {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    return ctx?.arrays.find((a) => rowId >= a.range.r0 && rowId <= a.range.r1 && colId >= a.range.c0 && colId <= a.range.c1)?.range;
+  }
+
+  /** The merged area (loaded merges) that holds logical (r, c), if any. */
+  mergeAt(id: SheetId, r: number, c: number): Range | undefined {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    if (!ctx) return undefined;
+    ctx.mergeIndex ??= buildRangeIndex(this.sheetMerges(ctx.ws));
+    return findInRangeIndex(ctx.mergeIndex, r, c);
+  }
+
+  /** The table whose header or totals row holds logical (r, c), if any. */
+  tableCellAt(id: SheetId, r: number, c: number): { name: string; part: 'header' | 'totals' } | undefined {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    if (!ctx) return undefined;
+    ctx.tables ??= loadedTables(ctx.ws);
+    for (const t of ctx.tables) {
+      if (c < t.range.c0 || c > t.range.c1) continue;
+      if (t.header && r === t.range.r0) return { name: t.name, part: 'header' };
+      if (t.totals && r === t.range.r1) return { name: t.name, part: 'totals' };
+    }
+    return undefined;
+  }
+
+  /** The sheet has "Protect Sheet" on (cells with the default locked state cannot be changed in Excel). */
+  sheetProtected(id: SheetId): boolean {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    return !!(ctx?.ws as { sheetProtection?: { sheet?: boolean } | null } | undefined)?.sheetProtection?.sheet;
+  }
+
+  /**
+   * Is logical row r a data row of the sheet's autofilter that is hidden (filtered out)? Excel's Clear Contents skips
+   * such rows, so the user never loses data they cannot see. Rows added by edits are never hidden.
+   */
+  filterHidesRow(id: SheetId, r: number): boolean {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    if (!ctx) return false;
+    const filter = decodeAutoFilter(ctx.ws.autoFilter);
+    if (!filter || r <= filter.r0 || r > filter.r1) return false;
+    const rowId = ctx.view.contentMap.get(r);
+    const row = rowId < NEW_ROW_BASE ? ctx.ws._rows[rowId] : undefined;
+    return !!(row as { hidden?: boolean } | undefined)?.hidden;
+  }
+
+  /**
+   * The other cells of the shared formula whose master is at base cell (rowId, colId): [r, c, formula (file syntax), cached
+   * value]. 'large' when the group is too big to separate in one edit. Cells already replaced by the overlay are left out.
+   */
+  sharedClones(id: SheetId, rowId: number, colId: number): { r: number; c: number; formula: string; cached: FileValue | null }[] | 'large' | undefined {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    const master = ctx?.ws._rows[rowId]?._cells[colId]?._value;
+    if (!ctx || !master || master.type !== VT.Formula || master.model.shareType !== 'shared' || typeof master.model.formula !== 'string') return undefined;
+    const ref = typeof master.model.ref === 'string' ? decodeRange(master.model.ref) : undefined;
+    if (!ref) return undefined;
+    if ((ref.r1 - ref.r0 + 1) * (ref.c1 - ref.c0 + 1) > SHARED_GROUP_CAP) return 'large';
+    const address = `${indexToCol(colId)}${rowId + 1}`;
+    const masterText = master.model.formula.startsWith('=') ? master.model.formula.slice(1) : master.model.formula;
+    const view = ctx.view;
+    const out: { r: number; c: number; formula: string; cached: FileValue | null }[] = [];
+    for (let r = ref.r0; r <= Math.min(ref.r1, ctx.ws._rows.length - 1); r++) {
+      const cells = ctx.ws._rows[r]?._cells;
+      if (!cells) continue;
+      for (let c = ref.c0; c <= Math.min(ref.c1, cells.length - 1); c++) {
+        const xv = cells[c]?._value;
+        if (!xv || xv.type !== VT.Formula || xv.model.sharedFormula !== address) continue;
+        const own = view.over.get(cellKey(r, c));
+        if (own && (own.f !== undefined || own.v !== undefined || own.t !== undefined)) continue; // already its own cell
+        out.push({ r, c, formula: translateFormula(masterText, r - rowId, c - colId), cached: this.resultValue(xv.model.result) ?? null });
+      }
+    }
+    return out;
+  }
+
+  /** Style-table index of `base` with number format / wrap changes applied (display only; the file derives its own xf). */
+  deriveStyle(base: number, deltas: readonly StyleDelta[]): number {
+    const from = this.styleTable.styles[base] ?? {};
+    let next: CellStyle | undefined;
+    for (const d of deltas) {
+      if (d.numFmt !== undefined && (d.numFmt === 'General' ? from.numFmt !== undefined : d.numFmt !== from.numFmt)) {
+        next = { ...(next ?? from) };
+        if (d.numFmt === 'General') delete next.numFmt;
+        else next.numFmt = d.numFmt;
+      }
+      if (d.wrap !== undefined && !!(next ?? from).align?.wrap !== d.wrap) {
+        next = { ...(next ?? from), align: { ...(next ?? from).align, wrap: d.wrap } };
+      }
+    }
+    return next ? this.styleTable.add(next) : base;
+  }
+
+  /** Recomputes how far the overlay reaches and, when that changed the used range of the sheet, its meta. true = meta changed. */
+  updateExtent(id: SheetId): boolean {
+    const index = this.sheetById.get(id);
+    const ctx = index === undefined ? undefined : this.sheets[index];
+    const meta = index === undefined ? undefined : this.meta.sheets[index];
+    if (!ctx || !meta) return false;
+    const extent = viewExtent(ctx.view);
+    // The used range grows with edits and goes back when the edit is undone; it never drops below the loaded one.
+    const loaded = ctx.loadedExtent ?? (ctx.loadedExtent = this.loadedUsedRange(ctx));
+    const rowCount = Math.max(loaded.rowCount, extent.rows);
+    const colCount = Math.max(loaded.colCount, extent.cols);
+    if (rowCount === meta.rowCount && colCount === meta.colCount) return false;
+    this.meta.sheets[index as number] = { ...meta, rowCount, colCount };
+    return true;
+  }
+
+  private loadedUsedRange(ctx: SheetContext): { rowCount: number; colCount: number } {
+    const ws = ctx.ws;
+    const props = ws.properties ?? {};
+    const rowPx = typeof props.defaultRowHeight === 'number' && props.defaultRowHeight > 0 ? ptToPx(props.defaultRowHeight) : ptToPx(DEFAULT_ROW_HEIGHT_PT);
+    const colPx = typeof props.defaultColWidth === 'number' && props.defaultColWidth > 0 ? widthToPx(props.defaultColWidth) : DEFAULT_COL_WIDTH_PX;
+    try {
+      return this.usedRange(ws, this.sheetMerges(ws), this.sheetImages(ws), decodeAutoFilter(ws.autoFilter), colPx, rowPx);
+    } catch {
+      return { rowCount: 1, colCount: 1 };
+    }
+  }
+
   getRows(sheet: number, start: number, end: number, c0?: number, c1?: number): { rows: RowData[]; styles: [number, CellStyle][] } {
     const ctx = this.sheets[sheet];
     if (!ctx) {
       return { rows: [], styles: [] };
     }
+    // (v0.2.0) A sheet with edits reads through its view; an unedited one keeps the loop below (identity fast path).
+    if (!viewIsPlain(ctx.view)) return this.getRowsThroughView(ctx, start, end, c0, c1);
     const xrows = ctx.ws._rows;
     const lo = Math.max(0, Math.floor(start) || 0);
     const hi = Math.min(Math.floor(end) || 0, xrows.length, MAX_ROWS);
@@ -3325,6 +4437,132 @@ export class WorkbookModel implements GridSource {
     return { rows, styles: this.styleTable.entries(used) };
   }
 
+  // ----- reading through a sheet view (v0.2.0, EDITING) -----
+
+  /** getRows for a sheet with edits: positions go through the view's maps, the overlay replaces and adds cells. */
+  private getRowsThroughView(ctx: SheetContext, start: number, end: number, c0?: number, c1?: number): { rows: RowData[]; styles: [number, CellStyle][] } {
+    const view = ctx.view;
+    const lo = Math.max(0, Math.floor(start) || 0);
+    const hi = Math.min(Math.floor(end) || 0, viewRowLimit(view), MAX_ROWS);
+    const [colLo, colHi] = columnWindow(c0, c1);
+    // Multi-cell legacy array formulas of the (unmoved) base positions reaching into this window.
+    const arrays = view.contentMap.identity && ctx.arrayRanges.length ? ctx.arrayRanges.filter((a) => a.range.r0 < hi && a.range.r1 >= lo) : [];
+    const rows: RowData[] = [];
+    const used = new Set<number>();
+    for (let r = lo; r < hi; r++) {
+      const rowId = view.contentMap.get(r);
+      const cells: CellData[] = [];
+      this.visitRowCells(ctx, rowId, colLo, colHi, (c, cell, colId, o) => {
+        const data = o ? this.overrideCellData(ctx, cell, rowId, colId, c, o) : cell ? this.safeCellData(cell, rowId, colId, ctx) : undefined;
+        if (data) {
+          data.c = c;
+          if (!o && arrays.length && data.f === undefined) this.markArrayMember(data, r, c, arrays, ctx);
+          cells.push(data);
+          if (data.s) used.add(data.s);
+        }
+        return true;
+      });
+      if (cells.length) rows.push({ r, cells });
+    }
+    return { rows, styles: this.styleTable.entries(used) };
+  }
+
+  /**
+   * Visits the cells of one content row that exist (in the base workbook or in the overlay) with logical column in
+   * [colLo, colHi], ascending. `visit(c, base cell, column id, override)` returns false to stop.
+   */
+  private visitRowCells(
+    ctx: SheetContext,
+    rowId: number,
+    colLo: number,
+    colHi: number,
+    visit: (c: number, cell: XCell | undefined, colId: number, o: CellOverride | undefined) => boolean,
+  ): void {
+    const view = ctx.view;
+    const brow = rowId < NEW_ROW_BASE ? ctx.ws._rows[rowId] : undefined;
+    const extra = view.overRows.get(rowId);
+    if (!brow && !extra) return;
+    const cells = brow?._cells ?? [];
+    if (view.colMap.identity) {
+      // Logical column = column id: the base cells in order, the overlay-only cells merged in.
+      const ex = extra ? [...extra].filter((id) => id >= colLo && id <= colHi && !cells[id]).sort((a, b) => a - b) : [];
+      let k = 0;
+      const last = Math.min(cells.length - 1, colHi);
+      for (let c = colLo; c <= last; c++) {
+        while (k < ex.length && ex[k] < c) {
+          if (!visit(ex[k], undefined, ex[k], view.over.get(cellKey(rowId, ex[k])))) return;
+          k++;
+        }
+        const cell = cells[c];
+        if (!cell) continue; // an overlay-only cell is visited through `ex`
+        const o = extra?.has(c) ? view.over.get(cellKey(rowId, c)) : undefined;
+        if (!visit(c, cell, c, o)) return;
+      }
+      for (; k < ex.length; k++) if (!visit(ex[k], undefined, ex[k], view.over.get(cellKey(rowId, ex[k])))) return;
+      return;
+    }
+    // Moved columns: walk the logical columns (P4 may add an inverse map; only edit-model tests get here before that).
+    const lim = Math.min(colHi, view.colMap.len - 1);
+    for (let c = colLo; c <= lim; c++) {
+      const colId = view.colMap.get(c);
+      const cell = colId < NEW_COL_BASE ? cells[colId] : undefined;
+      const o = extra?.has(colId) ? view.over.get(cellKey(rowId, colId)) : undefined;
+      if ((cell || o) && !visit(c, cell, colId, o)) return;
+    }
+  }
+
+  /** Style index a cell has before any override: its own style, else the row's / column's default for a missing cell. */
+  private baseStyleIndex(ctx: SheetContext, cell: XCell | undefined, rowId: number, colId: number): number {
+    if (cell) return this.styleTable.indexOf(cell.style);
+    const row = rowId < NEW_ROW_BASE ? ctx.ws._rows[rowId] : undefined;
+    if (row && !isStyleEmpty(row.style)) return this.styleTable.indexOf(row.style);
+    const column = colId < NEW_COL_BASE ? ctx.ws._columns?.[colId] : undefined;
+    return column && !isStyleEmpty(column.style) ? this.styleTable.indexOf(column.style) : 0;
+  }
+
+  /** A cell the overlay replaces: its content comes from the override, its style / note from the override / the base cell. */
+  private overrideCellData(ctx: SheetContext, cell: XCell | undefined, rowId: number, colId: number, c: number, o: CellOverride): CellData | undefined {
+    const s = o.s ?? this.baseStyleIndex(ctx, cell, rowId, colId);
+    const fmt = this.styleTable.styles[s].numFmt ?? 'General';
+    let out: CellData;
+    if (o.f !== undefined) {
+      out = o.v === undefined || o.v === null ? { c, t: 's', v: '', w: '' } : this.overrideValueCell(c, o, fmt);
+      // Overrides keep the FILE syntax (_xlfn. prefixes); the grid shows the formula without them, as for loaded cells.
+      out.f = displayFormula(o.f);
+      if (o.calc) out.calc = o.calc;
+      const link = this.normalizeLink(hyperlinkFormulaTarget(out.f));
+      if (link) out.link = link;
+    } else if (o.t === 'z' || o.v === undefined || o.v === null) {
+      out = { c, t: 'z' };
+    } else {
+      out = this.overrideValueCell(c, o, fmt);
+      // A hyperlink stays on its cell when the text is replaced (the link is a property of the cell).
+      const link = cell && cell._value.type === VT.Hyperlink ? this.normalizeLink(cell._value.model.hyperlink) : undefined;
+      if (link) out.link = link;
+    }
+    if (s) out.s = s;
+    const note = ctx.threadedNotes?.get(rowId * MAX_COLS + colId) ?? (cell ? noteText(cell) : undefined);
+    if (note) out.note = note;
+    if (out.t === 'z' && !out.s && !out.note) return undefined;
+    return out;
+  }
+
+  private overrideValueCell(c: number, o: CellOverride, fmt: string): CellData {
+    if (o.t === 'e') return { c, t: 'e', v: String(o.v), w: String(o.v) };
+    return this.valueCell(c, o.v, fmt, undefined);
+  }
+
+  /** Stats contribution of an overridden cell (same meaning as statValue). */
+  private overrideStat(o: CellOverride): StatValue {
+    if (o.f !== undefined) {
+      if (o.t === 'e') return 'error';
+      return typeof o.v === 'number' ? (Number.isFinite(o.v) ? o.v : 'error') : null;
+    }
+    if (o.t === 'z' || o.v === undefined || o.v === null) return undefined;
+    if (o.t === 'e') return 'error';
+    return typeof o.v === 'number' ? (Number.isFinite(o.v) ? o.v : 'error') : null;
+  }
+
   /** A cell inside a multi-cell legacy array formula shows the range's formula, as Excel's formula bar does. */
   private markArrayMember(data: CellData, r: number, c: number, arrays: readonly ArrayFormulaInfo[], ctx: SheetContext): void {
     for (const a of arrays) {
@@ -3347,6 +4585,7 @@ export class WorkbookModel implements GridSource {
     if (!ctx) {
       return acc.result();
     }
+    if (!viewIsPlain(ctx.view)) return this.getStatsThroughView(ctx, ranges, acc);
     const xrows = ctx.ws._rows;
     forEachRangeRow(ranges, xrows.length, MAX_COLS, (r, c0, c1) => {
       const row = xrows[r];
@@ -3372,12 +4611,31 @@ export class WorkbookModel implements GridSource {
     return acc.result((fmt, value) => this.formatter.number(fmt, value));
   }
 
+  /** getStats for a sheet with edits (see getRowsThroughView). */
+  private getStatsThroughView(ctx: SheetContext, ranges: Range[], acc: StatsAccumulator): SelectionStats {
+    const view = ctx.view;
+    forEachRangeRow(ranges, viewRowLimit(view), MAX_COLS, (r, c0, c1) => {
+      let go = true;
+      this.visitRowCells(ctx, view.contentMap.get(r), c0, c1, (_c, cell, _colId, o) => {
+        if (!acc.tick()) return (go = false);
+        acc.add(o ? this.overrideStat(o) : cell ? this.statValue(cell) : undefined);
+        return true;
+      });
+      return go;
+    });
+    if (acc.hasNumbers) {
+      acc.numFmt = this.firstNumberFormat(ctx, ranges);
+    }
+    return acc.result((fmt, value) => this.formatter.number(fmt, value));
+  }
+
   /**
    * Number format of the first numeric cell in the selection's own order (range by range, each one row by row), in
    * which Excel 16 shows Sum / Average / Min / Max: 'D1,D4' with a date in D1 sums as a date, 'D4,D1' as D4's General.
    * Undefined when the search passes the stats' work cap.
    */
   private firstNumberFormat(ctx: SheetContext, ranges: readonly Range[]): string | undefined {
+    if (!viewIsPlain(ctx.view)) return this.firstNumberFormatThroughView(ctx, ranges);
     const xrows = ctx.ws._rows;
     let work = 0;
     for (const g of ranges) {
@@ -3410,6 +4668,43 @@ export class WorkbookModel implements GridSource {
     return undefined;
   }
 
+  private firstNumberFormatThroughView(ctx: SheetContext, ranges: readonly Range[]): string | undefined {
+    const view = ctx.view;
+    const limit = viewRowLimit(view);
+    let work = 0;
+    for (const g of ranges) {
+      if (!g || ![g.r0, g.r1, g.c0, g.c1].every((n) => typeof n === 'number' && Number.isFinite(n))) {
+        continue;
+      }
+      const r1 = Math.min(limit - 1, Math.floor(Math.max(g.r0, g.r1)));
+      const c0 = Math.max(0, Math.floor(Math.min(g.c0, g.c1)));
+      const c1 = Math.min(MAX_COLS - 1, Math.floor(Math.max(g.c0, g.c1)));
+      for (let r = Math.max(0, Math.floor(Math.min(g.r0, g.r1))); r <= r1; r++) {
+        if (++work > STATS_CELL_CAP) {
+          return undefined;
+        }
+        const rowId = view.contentMap.get(r);
+        let found: string | undefined;
+        this.visitRowCells(ctx, rowId, c0, c1, (_c, cell, colId, o) => {
+          if (++work > STATS_CELL_CAP) return false;
+          if (o) {
+            if (this.overrideStat(o) !== undefined && typeof this.overrideStat(o) === 'number') {
+              found = this.styleTable.styles[o.s ?? this.baseStyleIndex(ctx, cell, rowId, colId)].numFmt ?? 'General';
+              return false;
+            }
+          } else if (cell && typeof this.statValue(cell) === 'number') {
+            found = this.statNumFmt(cell);
+            return false;
+          }
+          return true;
+        });
+        if (found !== undefined) return found;
+        if (work > STATS_CELL_CAP) return undefined;
+      }
+    }
+    return undefined;
+  }
+
   // ----- sheet meta -----
 
   /** Sheet meta; a sheet with unexpected data degrades to a plain grid instead of failing the workbook. */
@@ -3424,6 +4719,7 @@ export class WorkbookModel implements GridSource {
       });
       return {
         index: ctx.index,
+        id: ctx.id,
         name: String(ws.name ?? `Sheet${ctx.index + 1}`),
         state: ws.state === 'hidden' || ws.state === 'veryHidden' ? ws.state : 'visible',
         rowCount: Math.max(1, ws._rows?.length ?? 0),
@@ -3451,9 +4747,15 @@ export class WorkbookModel implements GridSource {
     const merges = this.sheetMerges(ws);
     const images = this.sheetImages(ws);
     const autoFilter = decodeAutoFilter(ws.autoFilter);
-    const { rowCount, colCount } = this.usedRange(ws, merges, images, autoFilter, defaultColWidth, defaultRowHeight);
+    const used = this.usedRange(ws, merges, images, autoFilter, defaultColWidth, defaultRowHeight);
+    ctx.loadedExtent = used;
+    // Edited cells beyond the loaded used range extend it (the overlay of EDITING).
+    const extent = viewExtent(ctx.view);
+    const rowCount = Math.max(used.rowCount, extent.rows);
+    const colCount = Math.max(used.colCount, extent.cols);
     const meta: SheetMeta = {
       index: ctx.index,
+      id: ctx.id,
       name: ws.name,
       state: ws.state === 'hidden' || ws.state === 'veryHidden' ? ws.state : 'visible',
       rowCount,
@@ -4094,6 +5396,21 @@ export class WorkbookModel implements GridSource {
       return undefined;
     }
     const values: string[] = [];
+    if (!viewIsPlain(target.view)) {
+      // A source sheet with edits: the cells as the grid shows them now.
+      const tv = target.view;
+      const limit = Math.min(range.r1 + 1, viewRowLimit(tv));
+      for (let r = range.r0; r < limit && values.length < LIST_VALUES_CAP; r++) {
+        const rowId = tv.contentMap.get(r);
+        this.visitRowCells(target, rowId, range.c0, range.c1, (c, cell, colId, o) => {
+          const data = o ? this.overrideCellData(target, cell, rowId, colId, c, o) : cell ? this.safeCellData(cell, rowId, colId, target) : undefined;
+          const display = data && data.t !== 'z' ? data.w ?? String(data.v ?? '') : '';
+          if (display !== '') values.push(display);
+          return values.length < LIST_VALUES_CAP;
+        });
+      }
+      return values;
+    }
     const xrows = target.ws._rows;
     const lastRow = Math.min(range.r1, xrows.length - 1);
     for (let r = range.r0; r <= lastRow && values.length < LIST_VALUES_CAP; r++) {
@@ -4249,6 +5566,844 @@ function normalizeCfvo(cfvo: XCfvo | undefined): CfValueObject {
 
 function clampInt(value: unknown, min: number, max: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(min, Math.min(max, Math.round(value))) : min;
+}
+
+// ===== EDITING =====
+// (v0.2.0, P2) Cell editing of xlsx workbooks in the extension host: the model, not the file. An edit is planned
+// (planEdit: checks, one Edit with the file operations it needs), applied to the display model (applyEdit, also redo)
+// and taken back (invertEdit). The ExcelJS model is never changed: every sheet has a VIEW over it - position -> id maps
+// and a cell overlay - so undo restores exactly what an edit replaced (ids and overlay entries), nothing is copied.
+// Sections: ids and index maps, sheet views, cell input (what a typed text means), plan, apply / invert.
+// P4 adds structure, sort, styles and sheet operations as sub-sections at the end; P5 recalculation results.
+// Not built here: SheetView.objects / .formulas and UndoData.formulas / .objects / .sheets (P4 adds them, additive).
+
+// ----- ids and index maps -----
+
+/** Row ids of rows that were not in the loaded sheet (inserted rows) start here; loaded rows keep their index as id. */
+const NEW_ROW_BASE = 2 ** 21;
+/** Column ids of inserted columns start here (a sheet has at most 16,384 columns). */
+const NEW_COL_BASE = MAX_COLS;
+const CELL_KEY_COLS = 2 ** 18;
+
+/** Overlay key of a cell: rowId * 2**18 + colId (below 2**53; for a loaded cell (rowId, colId) is its base position). */
+export function cellKey(rowId: number, colId: number): number {
+  return rowId * CELL_KEY_COLS + colId;
+}
+
+/** A run of consecutive ids ({s, n}: s, s+1, ...) or an explicit list. */
+export type IndexPiece = { s: number; n: number } | { ids: Int32Array };
+
+const pieceLen = (pc: IndexPiece): number => ('ids' in pc ? pc.ids.length : pc.n);
+
+/**
+ * Logical position -> stable id, as pieces (identity runs or explicit id lists): moving rows costs a few pieces, not a
+ * million numbers. splice returns the removed pieces: that is the whole undo data of an insert / delete / sort.
+ */
+export class IndexMap {
+  pieces: IndexPiece[];
+  /** Number of positions. */
+  len: number;
+  private pre: Float64Array | null = null;
+
+  constructor(n: number) {
+    this.pieces = n > 0 ? [{ s: 0, n }] : [];
+    this.len = n;
+  }
+
+  /** Position p holds id p everywhere (nothing moved): readers use their plain loops. */
+  get identity(): boolean {
+    const pc = this.pieces.length === 1 ? this.pieces[0] : undefined;
+    return !!pc && !('ids' in pc) && pc.s === 0 && pc.n === this.len;
+  }
+
+  private prefix(): Float64Array {
+    if (this.pre) return this.pre;
+    const pre = new Float64Array(this.pieces.length + 1);
+    for (let i = 0; i < this.pieces.length; i++) pre[i + 1] = pre[i] + pieceLen(this.pieces[i]);
+    return (this.pre = pre);
+  }
+
+  /** Id at position p. */
+  get(p: number): number {
+    if (!Number.isInteger(p) || p < 0 || p >= this.len) throw new RangeError(`IndexMap: position ${p} outside 0..${this.len - 1}`);
+    if (this.pieces.length === 1) {
+      const only = this.pieces[0];
+      return 'ids' in only ? only.ids[p] : only.s + p;
+    }
+    const pre = this.prefix();
+    let lo = 0;
+    let hi = this.pieces.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (pre[mid] <= p) lo = mid;
+      else hi = mid - 1;
+    }
+    const pc = this.pieces[lo];
+    const off = p - pre[lo];
+    return 'ids' in pc ? pc.ids[off] : pc.s + off;
+  }
+
+  /** Splits so that a piece boundary exists at p; returns the index of the piece starting at p. */
+  private cut(p: number): number {
+    const pre = this.prefix();
+    let i = 0;
+    while (i < this.pieces.length && pre[i + 1] <= p) i++;
+    if (i >= this.pieces.length || pre[i] === p) return i;
+    const pc = this.pieces[i];
+    const off = p - pre[i];
+    const a: IndexPiece = 'ids' in pc ? { ids: pc.ids.subarray(0, off) } : { s: pc.s, n: off };
+    const b: IndexPiece = 'ids' in pc ? { ids: pc.ids.subarray(off) } : { s: pc.s + off, n: pc.n - off };
+    this.pieces.splice(i, 1, a, b);
+    this.pre = null;
+    return i + 1;
+  }
+
+  /** Removes [p, p + count) and puts `insert` there. Returns the removed pieces (the undo data). */
+  splice(p: number, count: number, insert: readonly IndexPiece[]): IndexPiece[] {
+    if (!Number.isInteger(p) || !Number.isInteger(count) || p < 0 || count < 0 || p + count > this.len) throw new RangeError(`IndexMap: splice(${p}, ${count}) outside 0..${this.len}`);
+    const i = this.cut(p);
+    const j = this.cut(p + count);
+    const removed = this.pieces.splice(i, j - i, ...insert);
+    this.len += insert.reduce((n, pc) => n + pieceLen(pc), 0) - count;
+    this.pre = null;
+    this.coalesce(Math.max(0, i - 1), i + insert.length + 1);
+    return removed;
+  }
+
+  /** Joins neighbouring identity runs ({s, n} + {s + n, m}) in [from, to): undoing an insert gives back one piece. */
+  private coalesce(from: number, to: number): void {
+    for (let i = Math.min(to, this.pieces.length - 1); i > from; i--) {
+      const a = this.pieces[i - 1];
+      const b = this.pieces[i];
+      if (!('ids' in a) && !('ids' in b) && a.s + a.n === b.s) {
+        this.pieces.splice(i - 1, 2, { s: a.s, n: a.n + b.n });
+        this.pre = null;
+      } else if (pieceLen(b) === 0) {
+        this.pieces.splice(i, 1);
+        this.pre = null;
+      }
+    }
+  }
+
+  /** Explicit ids of positions [p0, p1]. */
+  ids(p0: number, p1: number): Int32Array {
+    const out = new Int32Array(p1 - p0 + 1);
+    for (let p = p0; p <= p1; p++) out[p - p0] = this.get(p);
+    return out;
+  }
+}
+
+// ----- sheet views -----
+
+/** What the overlay says about one cell: replaces the loaded cell's content (and style, when `s` is set). */
+export interface CellOverride {
+  /** Value (a number, text, boolean; for t 'e' the error text). Absent with `f`: the formula's result is not known. */
+  v?: string | number | boolean | null;
+  /** 'z' = cleared (contents gone, style kept); 'e' = error value; 'n' | 's' | 'b' = the type of `v`. */
+  t?: CellType;
+  /** Formula in FILE syntax (_xlfn. prefixes), without '='. */
+  f?: string;
+  /** Style-table index when the edit changed the style (a number format preset); absent = the cell's own style. */
+  s?: number;
+  /** Recalc state of a formula cell (P5): until a result is calculated a new formula is 'stale'. */
+  calc?: 'stale' | 'unsupported' | 'circular';
+}
+
+/** One sheet of a WorkbookModel: ids of what is where, and the cells the user changed. */
+export interface SheetView {
+  id: SheetId;
+  ws: XWorksheet;
+  /** Row position -> row id (row properties follow this). */
+  rowMap: IndexMap;
+  /** Row position -> content row id (the cells of a row follow this one; a sort changes only this). */
+  contentMap: IndexMap;
+  /** Column position -> column id. */
+  colMap: IndexMap;
+  /** Cells changed by edits, by cellKey(rowId, colId). Entries are replaced, never changed in place. */
+  over: Map<number, CellOverride>;
+  /** rowId -> column ids with an override (derived from `over`; setOverride keeps it in step). */
+  overRows: Map<number, Set<number>>;
+  /** Largest row id ever in `over`: how far reads must look beyond the loaded rows. */
+  maxOverRowId: number;
+}
+
+function newSheetView(id: SheetId, ws: XWorksheet): SheetView {
+  return { id, ws, rowMap: new IndexMap(MAX_ROWS), contentMap: new IndexMap(MAX_ROWS), colMap: new IndexMap(MAX_COLS), over: new Map(), overRows: new Map(), maxOverRowId: -1 };
+}
+
+/** Nothing moved, nothing replaced: the loaded loops are exact (identity fast path of getRows / getStats). */
+function viewIsPlain(view: SheetView): boolean {
+  return view.over.size === 0 && view.rowMap.identity && view.contentMap.identity && view.colMap.identity;
+}
+
+/** Rows a reader has to look at: the loaded rows, and further down the rows of overlay cells. */
+function viewRowLimit(view: SheetView): number {
+  return view.contentMap.identity ? Math.min(MAX_ROWS, Math.max(view.ws._rows.length, view.maxOverRowId + 1)) : MAX_ROWS;
+}
+
+/** The only place that changes `over` (and its row index): set an entry, or remove it (undefined). */
+function setOverride(view: SheetView, rowId: number, colId: number, o: CellOverride | undefined): void {
+  const key = cellKey(rowId, colId);
+  if (o === undefined) {
+    if (!view.over.delete(key)) return;
+    const cols = view.overRows.get(rowId);
+    if (cols) {
+      cols.delete(colId);
+      if (!cols.size) view.overRows.delete(rowId);
+    }
+    return;
+  }
+  view.over.set(key, o);
+  let cols = view.overRows.get(rowId);
+  if (!cols) view.overRows.set(rowId, (cols = new Set()));
+  cols.add(colId);
+  if (rowId > view.maxOverRowId) view.maxOverRowId = rowId;
+}
+
+/** Used range the overlay adds: rows / columns up to the last overlay cell that has content or a style (loaded ids = positions). */
+function viewExtent(view: SheetView): { rows: number; cols: number } {
+  let rows = 0;
+  let cols = 0;
+  if (!view.contentMap.identity || !view.colMap.identity) return { rows, cols };
+  for (const [key, o] of view.over) {
+    const filled = (o.t !== undefined && o.t !== 'z' && o.v !== undefined && o.v !== null) || o.f !== undefined || !!o.s;
+    if (!filled) continue;
+    const rowId = Math.floor(key / CELL_KEY_COLS);
+    const colId = key - rowId * CELL_KEY_COLS;
+    if (rowId + 1 > rows) rows = rowId + 1;
+    if (colId + 1 > cols) cols = colId + 1;
+  }
+  return { rows, cols };
+}
+
+/**
+ * 's' + the sheetId attribute (ExcelJS: worksheet.id). A missing / repeated / invalid id gets a fresh one so every sheet
+ * still has a unique id, and `problem` says why edits are refused.
+ */
+function assignSheetIds(worksheets: readonly XWorksheet[]): { ids: SheetId[]; problem: string | undefined } {
+  const seen = new Set<number>();
+  let max = 0;
+  for (const ws of worksheets) if (typeof ws.id === 'number' && Number.isInteger(ws.id) && ws.id > max) max = ws.id;
+  let problem: string | undefined;
+  const ids = worksheets.map((ws) => {
+    let n = ws.id;
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 1 || seen.has(n)) {
+      problem = 'Two sheets of this workbook have the same internal id, so FileStudio cannot tell them apart safely. The workbook is read-only.';
+      n = ++max;
+    }
+    seen.add(n);
+    return `s${n}`;
+  });
+  return { ids, problem };
+}
+
+/** Rectangles with a lookup by cell (loaded merges): 256-row buckets, rectangles taller than 4,096 rows on a side list. */
+interface RangeIndex {
+  buckets: Map<number, Range[]>;
+  tall: Range[];
+}
+
+function buildRangeIndex(list: readonly Range[]): RangeIndex {
+  const idx: RangeIndex = { buckets: new Map(), tall: [] };
+  for (const g of list) {
+    if (g.r1 - g.r0 > 4096) {
+      idx.tall.push(g);
+      continue;
+    }
+    for (let b = g.r0 >> 8; b <= g.r1 >> 8; b++) {
+      const bucket = idx.buckets.get(b);
+      if (bucket) bucket.push(g);
+      else idx.buckets.set(b, [g]);
+    }
+  }
+  return idx;
+}
+
+function findInRangeIndex(idx: RangeIndex, r: number, c: number): Range | undefined {
+  const inside = (g: Range): boolean => r >= g.r0 && r <= g.r1 && c >= g.c0 && c <= g.c1;
+  return idx.buckets.get(r >> 8)?.find(inside) ?? idx.tall.find(inside);
+}
+
+/** A table of the loaded sheet (ExcelJS keeps its model in `table`). */
+interface LoadedTable {
+  name: string;
+  range: Range;
+  header: boolean;
+  totals: boolean;
+}
+
+function loadedTables(ws: XWorksheet): LoadedTable[] {
+  const out: LoadedTable[] = [];
+  const tables = (ws as { tables?: Record<string, { table?: { name?: string; tableRef?: string; ref?: string; headerRow?: boolean; totalsRow?: boolean } } | undefined> }).tables;
+  for (const name in tables ?? {}) {
+    const t = tables?.[name]?.table;
+    const range = typeof t?.tableRef === 'string' ? decodeRange(t.tableRef) : typeof t?.ref === 'string' ? decodeRange(t.ref) : undefined;
+    // ExcelJS sets headerRow = (headerRowCount === '1'), so a table without the attribute (OOXML default: 1 header row) reads as
+    // "no header". The header row is always treated as there (safe: a header-less table only loses edits of its first row).
+    if (t && range) out.push({ name: t.name ?? name, range, header: true, totals: t.totalsRow === true });
+  }
+  return out;
+}
+
+/** Plain text of an ExcelJS rich-text value. */
+function richTextPlain(value: unknown): string {
+  const runs = (value as { richText?: { text?: unknown }[] } | undefined)?.richText;
+  return Array.isArray(runs) ? runs.map((r) => (typeof r?.text === 'string' ? r.text : '')).join('') : '';
+}
+
+/** Most cells a shared-formula group may span to be separated in one edit (a bigger group is refused). */
+const SHARED_GROUP_CAP = 2_000_000;
+
+// ----- types of edits -----
+
+/** What planEdit knows about one cell (positions are logical; ids are what the overlay uses). */
+export interface CellState {
+  rowId: number;
+  colId: number;
+  key: number;
+  override: CellOverride | undefined;
+  /** Effective content (undefined = empty); a formula cell: its cached result. */
+  value: FileValue | undefined;
+  /** Effective formula in FILE syntax (a shared formula's clones expanded), undefined = no formula. */
+  formula: string | undefined;
+  /** Effective style-table index and its number format ('General' when none) / wrap flag. */
+  style: number;
+  numFmt: string;
+  wrap: boolean;
+  /** The cell is locked (matters on a protected sheet). */
+  locked: boolean;
+  /** The cell is the master of a shared formula that is still shared (no overlay entry yet). */
+  sharedMaster: boolean;
+  hasHyperlink: boolean;
+}
+
+/** One user action = one Edit = one journal entry = one VS Code undo step (contract §2.2). */
+export interface Edit {
+  /** The state id this edit produces; the document assigns it when it commits (planEdit leaves 0). */
+  id: number;
+  kind: EditKind;
+  sheetId: SheetId | null;
+  /** The cells the edit touches (logical positions at edit time). */
+  range: Range | null;
+  /** VS Code undo label, e.g. "Edit B4". */
+  label: string;
+  /** Positions moved (rows / columns / sheets / sort) or merge / unmerge: bumps structureVersion. false for cell edits. */
+  structural: boolean;
+  /**
+   * What the file needs, positions at edit time. Convention for `cells` edits: operations before the last one are
+   * file-only fixes (separating a shared formula); the LAST operation holds the cells the user changed, and the display
+   * (applyEdit) is derived from it.
+   */
+  after: { ops: PackageOp[]; newIds?: { rows?: [number, number]; cols?: [number, number]; sheet?: number } };
+  /** Display-only restore data, filled by the first applyEdit; never written to the file. */
+  before?: UndoData;
+}
+
+/** Only what an edit changed (compact). P4 adds formulas / objects / sheets. */
+export interface UndoData {
+  /** Overlay entries before the edit (undefined = there was none). */
+  cells?: [key: number, prev: CellOverride | undefined][];
+  /** Index map pieces an edit replaced (structure, sort: P4). */
+  maps?: { axis: 'rows' | 'content' | 'cols'; at: number; removed: IndexPiece[]; insertedCount: number }[];
+}
+
+/** The rows whose display changed: logical rows [start, end) of the sheet; `meta`: the sheet's meta changed (used range). */
+export interface RowsChange {
+  sheetId: SheetId | null;
+  rows?: [start: number, end: number];
+  structural: boolean;
+  meta: boolean;
+}
+
+/** What planEdit answers: an Edit, or why there is none. */
+export type PlanResult = Edit | { blocked: BlockReason[] } | { invalid: string } | { noop: true };
+
+export const EDIT_TOO_LARGE_TEXT = 'This change is too large (max 1,000,000 cells).';
+export const EDIT_NOT_AVAILABLE_TEXT = 'This action is not available yet.';
+const EDIT_UNKNOWN_SHEET_TEXT = 'This sheet is no longer in the workbook.';
+const EDIT_BAD_REQUEST_TEXT = 'This change is not valid.';
+const EDIT_BAD_TEXT = 'The text contains a character Excel cannot store.';
+const MAX_EDIT_CELLS = 1_000_000;
+const MAX_CELL_TEXT = 32_767;
+const MAX_EDIT_CHARS = 16 * 1024 * 1024;
+const MAX_CLEAR_RANGES = 1000;
+
+// ----- cell input -----
+// What a typed text means (en-US, contract §5.2). Anything not recognised stays text: a text is never changed into a
+// number by a guess, and a number with more than 15 significant digits stays text (Excel would round it silently).
+
+/** Result of parseCellInput. */
+export type CellInput =
+  | { kind: 'empty' }
+  /** `quotePrefix`: typed with a leading apostrophe (stored text, the apostrophe is not part of it). */
+  | { kind: 'text'; text: string; quotePrefix: boolean }
+  /** `numFmt`: preset applied when the cell is General (percent, currency, grouping, date, time). */
+  | { kind: 'number'; value: number; numFmt?: string }
+  | { kind: 'boolean'; value: boolean }
+  | { kind: 'error'; value: string }
+  /** '=' + more: `body` is what follows the '='; checkFormulaInput decides whether it is acceptable. */
+  | { kind: 'formula'; body: string };
+
+const ERROR_LITERALS: ReadonlySet<string> = new Set(['#NULL!', '#DIV/0!', '#VALUE!', '#REF!', '#NAME?', '#NUM!', '#N/A']);
+const NUMBER_RE = /^(\()?([+-])?(\$)?([+-])?((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)([eE][+-]?\d+)?(%)?(\))?$/;
+const ISO_DATE_RE = /^(\d{4})-(\d{1,2})-(\d{1,2})$/;
+const US_DATE_RE = /^(\d{1,2})\/(\d{1,2})\/(\d{4}|\d{2})$/;
+const TIME_RE = /^(\d{1,2}):(\d{2})(?::(\d{2})(\.\d{1,3})?)?(?:\s?([AaPp][Mm]))?$/;
+
+/** Does the number format show a percent (a % outside quotes, escapes and [..] codes, first section)? */
+export function isPercentFormat(fmt: string | undefined): boolean {
+  if (!fmt) return false;
+  const first = fmt.replace(/"[^"]*"|\\.|\[[^\]]*\]/g, '').split(';')[0];
+  return first.includes('%');
+}
+
+/**
+ * Cell text -> what to store. `cell.numFmt` is the number format of the cell ('General' / undefined = General, '@' = Text).
+ * `cell.autoPercent`: typed into a cell (not pasted); Excel's automatic percent entry then reads a plain number of 1 or
+ * more in a percent-formatted cell as a percent (5 -> 5%, 0.25 stays 25%).
+ * Pure; no knowledge of the workbook beyond that and the date system.
+ */
+export function parseCellInput(text: string, cell: { numFmt?: string; date1904?: boolean; autoPercent?: boolean } = {}): CellInput {
+  if (text === '') return { kind: 'empty' };
+  const fmt = cell.numFmt ?? 'General';
+  if (fmt === '@') return { kind: 'text', text, quotePrefix: false };
+  if (text.startsWith("'")) return text.length === 1 ? { kind: 'empty' } : { kind: 'text', text: text.slice(1), quotePrefix: true };
+  if (text.startsWith('=') && text.length > 1) return { kind: 'formula', body: text.slice(1) };
+  const t = text.trim();
+  if (t === '') return { kind: 'text', text, quotePrefix: false };
+  if (/^(true|false)$/i.test(t)) return { kind: 'boolean', value: t.toLowerCase() === 'true' };
+  const upper = t.toUpperCase();
+  if (upper.startsWith('#') && ERROR_LITERALS.has(upper)) return { kind: 'error', value: upper };
+  const num = parseNumberText(t);
+  if (num && cell.autoPercent && isPercentFormat(fmt) && (!num.numFmt || num.numFmt.startsWith('#,##0')) && Math.abs(num.value) >= 1) {
+    const scaled = Number(`${num.value}e-2`);
+    return { kind: 'number', value: Number.isFinite(scaled) ? scaled : num.value / 100 };
+  }
+  if (num) return { kind: 'number', value: num.value, ...(num.numFmt ? { numFmt: num.numFmt } : {}) };
+  const when = parseDateTimeText(t, !!cell.date1904);
+  if (when) return { kind: 'number', value: when.value, numFmt: when.numFmt };
+  return { kind: 'text', text, quotePrefix: false };
+}
+
+function parseNumberText(t: string): { value: number; numFmt?: string } | undefined {
+  const m = NUMBER_RE.exec(t);
+  if (!m) return undefined;
+  const [, open, sign1, currency, sign2, body, exp, percent, close] = m;
+  if (!!open !== !!close || (sign1 && sign2) || (open && (sign1 || sign2))) return undefined;
+  if (currency && exp) return undefined;
+  const grouped = body.includes(',');
+  if (grouped && exp) return undefined;
+  const mantissa = body.replace(/,/g, '');
+  // Excel keeps 15 significant digits and writes zeros for the rest: such a number stays text here, so no digit is lost.
+  if (mantissa.replace('.', '').replace(/^0+/, '').replace(/0+$/, '').length > 15) return undefined;
+  const power = exp ? parseInt(exp.slice(1), 10) : 0;
+  let value = Number(`${mantissa}e${power - (percent ? 2 : 0)}`);
+  if (!Number.isFinite(value)) return undefined;
+  if (open || sign1 === '-' || sign2 === '-') value = -value;
+  if (value === 0) value = 0; // no negative zero
+  const decimals = body.includes('.') ? body.length - body.indexOf('.') - 1 : 0;
+  let numFmt: string | undefined;
+  if (percent) numFmt = decimals ? '0.00%' : '0%';
+  else if (currency) numFmt = decimals ? '"$"#,##0.00' : '"$"#,##0';
+  else if (grouped) numFmt = decimals ? '#,##0.00' : '#,##0';
+  return { value, ...(numFmt ? { numFmt } : {}) };
+}
+
+/** Days from 1899-12-30 for a valid calendar date; undefined when the date does not exist. 1900-02-29 is Excel's fake day 60. */
+function excelDateSerial(y: number, mo: number, d: number, date1904: boolean): number | undefined {
+  if (y < 1900 || y > 9999 || mo < 1 || mo > 12 || d < 1 || d > 31) return undefined;
+  if (y === 1900 && mo === 2 && d === 29) return date1904 ? undefined : 60;
+  const ms = Date.UTC(2000, mo - 1, d);
+  const date = new Date(ms);
+  date.setUTCFullYear(y);
+  if (date.getUTCFullYear() !== y || date.getUTCMonth() !== mo - 1 || date.getUTCDate() !== d) return undefined;
+  const days = Math.round(date.getTime() / MS_PER_DAY) + 25569; // 1970-01-01 = 25569
+  const serial = days < 61 ? days - 1 : days; // before 1900-03-01 Excel's 1900 system skips the fake Feb 29
+  if (date1904) return serial - DATE1904_OFFSET >= 0 ? serial - DATE1904_OFFSET : undefined;
+  return serial;
+}
+
+function parseDateTimeText(t: string, date1904: boolean): { value: number; numFmt: string } | undefined {
+  let datePart = t;
+  let timePart: string | undefined;
+  const split = /^(\S+?)(?:[ T](\d{1,2}:\d{2}.*))?$/.exec(t);
+  if (split) {
+    datePart = split[1];
+    timePart = split[2];
+  }
+  let serial: number | undefined;
+  if (timePart === undefined && TIME_RE.test(t)) {
+    const time = parseTimeText(t);
+    return time ? { value: time.fraction, numFmt: time.numFmt } : undefined;
+  }
+  const iso = ISO_DATE_RE.exec(datePart);
+  const us = iso ? null : US_DATE_RE.exec(datePart);
+  if (iso) serial = excelDateSerial(+iso[1], +iso[2], +iso[3], date1904);
+  else if (us) {
+    let y = +us[3];
+    if (us[3].length === 2) y += y < 30 ? 2000 : 1900;
+    serial = excelDateSerial(y, +us[1], +us[2], date1904);
+  }
+  if (serial === undefined) return undefined;
+  if (timePart === undefined) return { value: serial, numFmt: BUILTIN_NUMFMTS[14] };
+  const time = parseTimeText(timePart);
+  return time ? { value: serial + time.fraction, numFmt: BUILTIN_NUMFMTS[22] } : undefined;
+}
+
+function parseTimeText(t: string): { fraction: number; numFmt: string } | undefined {
+  const m = TIME_RE.exec(t);
+  if (!m) return undefined;
+  let hour = +m[1];
+  const minute = +m[2];
+  const second = m[3] === undefined ? 0 : +m[3] + (m[4] ? Number(m[4]) : 0);
+  const ampm = m[5]?.toUpperCase();
+  if (ampm) {
+    if (hour < 1 || hour > 12) return undefined;
+    hour = (hour % 12) + (ampm === 'PM' ? 12 : 0);
+  }
+  if (hour > 23 || minute > 59 || second >= 60) return undefined;
+  const numFmt = ampm ? (m[3] === undefined ? BUILTIN_NUMFMTS[18] : BUILTIN_NUMFMTS[19]) : m[3] === undefined ? BUILTIN_NUMFMTS[20] : BUILTIN_NUMFMTS[21];
+  return { fraction: (hour * 3600 + minute * 60 + second) / 86400, numFmt };
+}
+
+// ----- plan -----
+
+/** Where the blocks of one edit are collected: one BlockReason per code and message, `where` capped at 12 (+ "+N more"). */
+class BlockCollector {
+  private readonly byKey = new Map<string, { code: BlockReason['code']; message: string; where: string[]; more: number }>();
+
+  add(code: BlockReason['code'], message: string, where: string): void {
+    const key = `${code}\n${message}`;
+    let entry = this.byKey.get(key);
+    if (!entry) this.byKey.set(key, (entry = { code, message, where: [], more: 0 }));
+    if (entry.where.length < 12) entry.where.push(where);
+    else entry.more++;
+  }
+
+  get any(): boolean {
+    return this.byKey.size > 0;
+  }
+
+  result(): BlockReason[] {
+    return [...this.byKey.values()].map((e) => ({ code: e.code, message: e.message, where: e.more ? [...e.where, `+${e.more} more`] : e.where }));
+  }
+}
+
+const rangeText = (g: Range): string => (g.r0 === g.r1 && g.c0 === g.c1 ? `${indexToCol(g.c0)}${g.r0 + 1}` : `${indexToCol(g.c0)}${g.r0 + 1}:${indexToCol(g.c1)}${g.r1 + 1}`);
+
+/** Plans one edit; changes nothing (except that the style table may learn a derived style). See PlanResult. */
+export function planEdit(m: WorkbookModel, i: EditIntent): PlanResult {
+  if (i.kind !== 'setCells' && i.kind !== 'clear') return { blocked: [{ code: 'unsupported', message: EDIT_NOT_AVAILABLE_TEXT, where: [] }] };
+  if (m.sheetIndexOf(i.sheetId) < 0) return { invalid: EDIT_UNKNOWN_SHEET_TEXT };
+  if (m.idProblem) return { blocked: [{ code: 'unsupported', message: m.idProblem, where: [] }] };
+  return i.kind === 'setCells' ? planSetCells(m, i) : planClear(m, i);
+}
+
+/** The blocks that apply to a value edit of one cell (array, table, protected sheet, host facts), added to `blocks`; true = the cell is blocked. */
+function blockCell(m: WorkbookModel, sheetId: SheetId, sheetName: string, protectedSheet: boolean, r: number, c: number, st: CellState, blocks: BlockCollector): boolean {
+  let hit = false;
+  const where = (): string => `${quoteSheetForRef(sheetName)}!${indexToCol(c)}${r + 1}`;
+  const array = m.arrayRangeAt(sheetId, st.rowId, st.colId);
+  if (array) {
+    blocks.add('array', `This cell is part of an array formula (${rangeText(array)}). Edit it in Excel.`, where());
+    hit = true;
+  }
+  const table = m.tableCellAt(sheetId, r, c);
+  if (table) {
+    blocks.add('table', `${indexToCol(c)}${r + 1} is part of the ${table.part === 'header' ? 'header row' : 'totals row'} of table “${table.name}”. Change it in Excel.`, where());
+    hit = true;
+  }
+  if (protectedSheet && st.locked) {
+    blocks.add('protected', 'The sheet is protected in Excel.', where());
+    hit = true;
+  }
+  const extra = m.extraCellBlock?.(sheetId, r, c);
+  if (extra) {
+    blocks.add('unsupported', extra, where());
+    hit = true;
+  }
+  return hit;
+}
+
+/** File operations that separate a shared formula whose master is about to change: every other cell gets its own <f>. */
+function separateSharedFormula(m: WorkbookModel, sheetId: SheetId, st: CellState, r: number, c: number, blocks: BlockCollector, into: Map<number, [number, number, CellPatch]>): void {
+  const clones = m.sharedClones(sheetId, st.rowId, st.colId);
+  if (clones === undefined) return;
+  if (clones === 'large') {
+    blocks.add('unsupported', 'This shared formula covers too many cells to change safely here. Edit it in Excel.', `${indexToCol(c)}${r + 1}`);
+    return;
+  }
+  for (const k of clones) {
+    // A translation that leaves the grid (#REF!) is not what Excel computes for the clone: refuse instead of writing it.
+    if (k.formula.includes('#REF!')) {
+      blocks.add('unsupported', 'A formula copied from this one cannot be separated safely here. Edit it in Excel.', `${indexToCol(k.c)}${k.r + 1}`);
+      return;
+    }
+    into.set(cellKey(k.r, k.c), [k.r, k.c, { formula: k.formula, cached: k.cached }]);
+  }
+}
+
+function sheetNumber(id: SheetId): number {
+  return Number(id.slice(1));
+}
+
+function boxOf(cells: readonly [number, number, unknown][]): Range {
+  let r0 = Infinity;
+  let r1 = -1;
+  let c0 = Infinity;
+  let c1 = -1;
+  for (const [r, c] of cells) {
+    if (r < r0) r0 = r;
+    if (r > r1) r1 = r;
+    if (c < c0) c0 = c;
+    if (c > c1) c1 = c;
+  }
+  return { r0, c0, r1, c1 };
+}
+
+function sortedCells<T extends [number, number, unknown]>(cells: Iterable<T>): T[] {
+  return [...cells].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+}
+
+function planSetCells(m: WorkbookModel, i: Extract<EditIntent, { kind: 'setCells' }>): PlanResult {
+  const sheetId = i.sheetId;
+  const cells = i.cells;
+  if (!Array.isArray(cells)) return { invalid: EDIT_BAD_REQUEST_TEXT };
+  if (cells.length === 0) return { noop: true };
+  if (cells.length > MAX_EDIT_CELLS) return { invalid: EDIT_TOO_LARGE_TEXT };
+  const multi = cells.length > 1;
+  const date1904 = m.usesDate1904;
+  const names = m.sheetNames();
+  const sheetName = names[m.sheetIndexOf(sheetId)];
+  const protectedSheet = m.sheetProtected(sheetId);
+  const blocks = new BlockCollector();
+  const planned = new Map<number, [number, number, CellPatch]>();
+  const separated = new Map<number, [number, number, CellPatch]>();
+  const separatedMasters = new Set<number>();
+  const formulas = new Map<string, FormulaCheck>();
+  let chars = 0;
+  for (const entry of multi ? lastWriteWins(cells) : cells) {
+    if (!Array.isArray(entry) || entry.length !== 3 || typeof entry[2] !== 'string') return { invalid: EDIT_BAD_REQUEST_TEXT };
+    let [r, c] = entry;
+    const text = entry[2].includes('\r') ? entry[2].replace(/\r\n?/g, '\n') : entry[2];
+    if (!Number.isInteger(r) || !Number.isInteger(c) || r < 0 || c < 0 || r >= MAX_ROWS || c >= MAX_COLS) return { invalid: EDIT_BAD_REQUEST_TEXT };
+    if (text.length > MAX_CELL_TEXT) return { invalid: `This text is too long for a cell (max ${MAX_CELL_TEXT.toLocaleString('en-US')} characters).` };
+    if ((chars += text.length) > MAX_EDIT_CHARS) return { invalid: EDIT_TOO_LARGE_TEXT };
+    if (hasLoneSurrogate(text)) return { invalid: EDIT_BAD_TEXT };
+    // A merged cell holds its value in the top-left cell: a single edit goes there (Excel); in a block the other cells of the merge are skipped when empty and refuse the edit otherwise.
+    const merge = m.mergeAt(sheetId, r, c);
+    if (merge && (r !== merge.r0 || c !== merge.c0)) {
+      if (!multi) {
+        r = merge.r0;
+        c = merge.c0;
+      } else {
+        if (text !== '') blocks.add('merge', `${rangeText(merge)} is a merged cell. Paste a block that matches the merged cells, or unmerge first.`, `${quoteSheetForRef(sheetName)}!${indexToCol(c)}${r + 1}`);
+        continue;
+      }
+    }
+    const st = m.cellState(sheetId, r, c);
+    if (!st) return { invalid: EDIT_UNKNOWN_SHEET_TEXT };
+    const input = parseCellInput(text, { numFmt: st.numFmt, date1904, autoPercent: !multi });
+    const patch: CellPatch = {};
+    const deltas: StyleDelta[] = [];
+    switch (input.kind) {
+      case 'empty':
+        if (st.value === undefined && st.formula === undefined) continue;
+        patch.value = null;
+        break;
+      case 'text': {
+        const wantWrap = input.text.includes('\n') && !st.wrap;
+        if (st.formula === undefined && st.value?.t === 's' && st.value.v === input.text && !wantWrap) continue;
+        patch.value = { t: 's', v: input.text };
+        if (wantWrap) deltas.push({ wrap: true });
+        if (input.quotePrefix) deltas.push({ quotePrefix: true });
+        break;
+      }
+      case 'number': {
+        const preset = st.numFmt === 'General' && input.numFmt ? input.numFmt : undefined;
+        if (st.formula === undefined && st.value?.t === 'n' && st.value.v === input.value && !preset) continue;
+        patch.value = { t: 'n', v: input.value };
+        if (preset) deltas.push({ numFmt: preset });
+        break;
+      }
+      case 'boolean':
+        if (st.formula === undefined && st.value?.t === 'b' && st.value.v === input.value) continue;
+        patch.value = { t: 'b', v: input.value };
+        break;
+      case 'error':
+        if (st.formula === undefined && st.value?.t === 'e' && st.value.v === input.value) continue;
+        patch.value = { t: 'e', v: input.value };
+        break;
+      case 'formula': {
+        let check = formulas.get(input.body);
+        if (!check) formulas.set(input.body, (check = checkFormulaInput(input.body, names)));
+        if (!check.ok) {
+          if (check.reason === 'invalid') return { invalid: check.message };
+          blocks.add(check.block.code, check.block.message, `${quoteSheetForRef(sheetName)}!${indexToCol(c)}${r + 1}`);
+          continue;
+        }
+        if (st.formula === check.file) continue;
+        patch.formula = check.file;
+        patch.cached = null; // no <v> until the formula is calculated (P5): the cell shows 'stale'
+        break;
+      }
+    }
+    blockCell(m, sheetId, sheetName, protectedSheet, r, c, st, blocks);
+    if (deltas.length) patch.style = deltas;
+    if (st.sharedMaster && !separatedMasters.has(st.key)) {
+      separatedMasters.add(st.key);
+      separateSharedFormula(m, sheetId, st, r, c, blocks, separated);
+    }
+    planned.set(st.key, [r, c, patch]);
+  }
+  if (blocks.any) return { blocked: blocks.result() };
+  if (!planned.size) return { noop: true };
+  return buildCellsEdit(sheetId, 'setCells', planned, separated, planned.size === 1 ? `Edit ${rangeText(boxOf([...planned.values()]))}` : `Edit ${planned.size.toLocaleString('en-US')} cells`);
+}
+
+/** One entry per cell, the last one sent for it (the order of the rest is kept); malformed entries stay for the checks. */
+function lastWriteWins<T>(cells: readonly T[]): T[] {
+  const seen = new Set<number>();
+  const out: T[] = [];
+  for (let k = cells.length - 1; k >= 0; k--) {
+    const e = cells[k] as unknown;
+    if (Array.isArray(e) && Number.isInteger(e[0]) && Number.isInteger(e[1])) {
+      const key = (e[0] as number) * MAX_COLS + (e[1] as number);
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+    out.push(cells[k]);
+  }
+  return out.reverse();
+}
+
+function planClear(m: WorkbookModel, i: Extract<EditIntent, { kind: 'clear' }>): PlanResult {
+  const sheetId = i.sheetId;
+  if (i.what !== 'contents') return { blocked: [{ code: 'unsupported', message: EDIT_NOT_AVAILABLE_TEXT, where: [] }] };
+  if (!Array.isArray(i.ranges)) return { invalid: EDIT_BAD_REQUEST_TEXT };
+  if (i.ranges.length > MAX_CLEAR_RANGES) return { invalid: EDIT_TOO_LARGE_TEXT };
+  const sheetName = m.sheetNames()[m.sheetIndexOf(sheetId)];
+  const protectedSheet = m.sheetProtected(sheetId);
+  const blocks = new BlockCollector();
+  const planned = new Map<number, [number, number, CellPatch]>();
+  const separated = new Map<number, [number, number, CellPatch]>();
+  const separatedMasters = new Set<number>();
+  for (const g of i.ranges) {
+    if (!g || ![g.r0, g.c0, g.r1, g.c1].every((n) => Number.isInteger(n) && n >= 0) || g.r0 > g.r1 || g.c0 > g.c1 || g.r1 >= MAX_ROWS || g.c1 >= MAX_COLS) return { invalid: EDIT_BAD_REQUEST_TEXT };
+    m.forEachExistingCell(sheetId, g, (r, c) => {
+      if (m.filterHidesRow(sheetId, r)) return; // Excel: rows hidden by a filter keep their data
+      const st = m.cellState(sheetId, r, c);
+      if (!st || (st.value === undefined && st.formula === undefined) || planned.has(st.key)) return;
+      if (blockCell(m, sheetId, sheetName, protectedSheet, r, c, st, blocks)) return;
+      if (st.sharedMaster && !separatedMasters.has(st.key)) {
+        separatedMasters.add(st.key);
+        separateSharedFormula(m, sheetId, st, r, c, blocks, separated);
+      }
+      planned.set(st.key, [r, c, { value: null }]);
+      if (planned.size > MAX_EDIT_CELLS) blocks.add('limit', EDIT_TOO_LARGE_TEXT, `${quoteSheetForRef(sheetName)}!${indexToCol(c)}${r + 1}`);
+    });
+  }
+  if (blocks.any) return { blocked: blocks.result() };
+  if (!planned.size) return { noop: true };
+  const box = boxOf([...planned.values()]);
+  const label = i.ranges.length === 1 ? `Clear ${rangeText(i.ranges[0])}` : 'Clear contents';
+  return buildCellsEdit(sheetId, 'clear', planned, separated, planned.size === 1 ? `Clear ${rangeText(box)}` : label);
+}
+
+function buildCellsEdit(
+  sheetId: SheetId,
+  kind: 'setCells' | 'clear',
+  planned: Map<number, [number, number, CellPatch]>,
+  separated: Map<number, [number, number, CellPatch]>,
+  label: string,
+): Edit {
+  // A cell the user changes needs no separate fix.
+  for (const key of planned.keys()) separated.delete(key);
+  const sheet = sheetNumber(sheetId);
+  const ops: PackageOp[] = [];
+  if (separated.size) ops.push({ kind: 'cells', sheet, cells: sortedCells(separated.values()) });
+  ops.push({ kind: 'cells', sheet, cells: sortedCells(planned.values()) });
+  return { id: 0, kind, sheetId, range: boxOf([...planned.values()]), label, structural: false, after: { ops } };
+}
+
+// ----- apply / invert -----
+
+/** The overlay entry a cell patch stands for (the display side of the file operation), given the cell as it is now. */
+function overrideOfPatch(m: WorkbookModel, st: CellState, patch: CellPatch): CellOverride {
+  const o: CellOverride = {};
+  const set = (v: FileValue): void => {
+    o.t = v.t === 'n' ? 'n' : v.t === 's' ? 's' : v.t === 'b' ? 'b' : 'e';
+    o.v = v.v;
+  };
+  if (patch.formula !== undefined) {
+    o.f = patch.formula;
+    if (patch.cached) set(patch.cached);
+    else o.calc = 'stale';
+  } else if (patch.value === null) {
+    o.t = 'z';
+  } else if (patch.value) {
+    set(patch.value);
+  } else {
+    throw new Error('applyEdit: a cell patch without a value or formula is not supported yet');
+  }
+  if (patch.style?.length) {
+    const s = m.deriveStyle(st.style, patch.style);
+    if (s !== st.style || st.override?.s !== undefined) o.s = s;
+  } else if (st.override?.s !== undefined) {
+    o.s = st.override.s;
+  }
+  return o;
+}
+
+function cellsOpOf(e: Edit): Extract<PackageOp, { kind: 'cells' }> {
+  const op = e.after.ops[e.after.ops.length - 1];
+  if (!op || op.kind !== 'cells') throw new Error('applyEdit: the edit has no cell operation');
+  return op;
+}
+
+function changeOf(m: WorkbookModel, e: Edit): RowsChange {
+  const meta = e.sheetId ? m.updateExtent(e.sheetId) : false;
+  m.dropListCaches();
+  return { sheetId: e.sheetId, rows: e.range ? [e.range.r0, e.range.r1 + 1] : undefined, structural: false, meta };
+}
+
+/**
+ * Applies an edit to the display model (the first time and for redo). Everything is validated before the first change:
+ * a throw leaves the model as it was. The first run records the overlay entries it replaced in `e.before`.
+ */
+export function applyEdit(m: WorkbookModel, e: Edit): RowsChange {
+  if (e.kind !== 'setCells' && e.kind !== 'clear') throw new Error(`applyEdit: unsupported edit kind '${e.kind}'`);
+  const view = e.sheetId ? m.viewOf(e.sheetId) : undefined;
+  if (!e.sheetId || !view) throw new Error('applyEdit: unknown sheet');
+  const op = cellsOpOf(e);
+  const writes: [rowId: number, colId: number, o: CellOverride][] = [];
+  for (const [r, c, patch] of op.cells) {
+    const st = m.cellState(e.sheetId, r, c);
+    if (!st) throw new Error('applyEdit: unknown cell');
+    writes.push([st.rowId, st.colId, overrideOfPatch(m, st, patch)]);
+  }
+  const record = e.before === undefined;
+  const before: [number, CellOverride | undefined][] = [];
+  for (const [rowId, colId, o] of writes) {
+    if (record) before.push([cellKey(rowId, colId), view.over.get(cellKey(rowId, colId))]);
+    setOverride(view, rowId, colId, o);
+  }
+  if (record) e.before = { cells: before };
+  return changeOf(m, e);
+}
+
+/** Takes an applied edit back: the overlay entries it replaced come back exactly (e.before). */
+export function invertEdit(m: WorkbookModel, e: Edit): RowsChange {
+  const view = e.sheetId ? m.viewOf(e.sheetId) : undefined;
+  if (!e.sheetId || !view) throw new Error('invertEdit: unknown sheet');
+  const cells = e.before?.cells;
+  if (!cells) throw new Error('invertEdit: the edit was never applied');
+  for (let k = cells.length - 1; k >= 0; k--) {
+    const [key, prev] = cells[k];
+    const rowId = Math.floor(key / CELL_KEY_COLS);
+    setOverride(view, rowId, key - rowId * CELL_KEY_COLS, prev);
+  }
+  return changeOf(m, e);
 }
 
 // ===== SELECTION STATS =====
@@ -5140,13 +7295,21 @@ const LOSSY = {
   sparklines: 'Sparklines',
   x14Cf: 'Extended conditional formats (x14)',
   controls: 'Form controls / ActiveX',
+  // lossy v2 (D-012): kept byte for byte by the surgical save, but their results go stale when cells change
+  oleObjects: 'Embedded objects (OLE)',
+  dataTables: 'What-if data tables',
+  queryTables: 'Query tables / data connections',
+  dataModel: 'Data model (Power Pivot)',
+  richValues: 'Pictures in cells / linked data types',
 } as const;
 
 const LOSSY_ORDER: string[] = Object.values(LOSSY);
 
 /**
- * Features ExcelJS cannot round-trip (they would be lost or degraded on save).
- * Reads the raw zip: part names first, then drawings and (streamed) sheet XML.
+ * Content FileStudio does not show and cannot update (lossy v2, contract §4.7, D-012): a workbook with any of it
+ * opens read-only until the user accepts "Edit anyway". Nothing of it is removed on save (the surgical save copies
+ * every part it does not edit byte for byte), but charts, pivots, links, data tables ... keep stale results.
+ * Reads the raw zip: part names first, then drawings and (streamed) sheet XML. Returns the labels in a fixed order.
  */
 export async function detectLossyFeatures(data: Uint8Array): Promise<string[]> {
   try {
@@ -5174,6 +7337,11 @@ async function scanLossyFeatures(data: Uint8Array): Promise<string[]> {
     found.add(LOSSY.threadedComments);
   }
   if (has(/^xl\/(ctrlProps|activeX)\//i)) found.add(LOSSY.controls);
+  if (has(/^xl\/embeddings\//i)) found.add(LOSSY.oleObjects);
+  if (has(/^xl\/(queryTables\/|connections\.xml$)/i)) found.add(LOSSY.queryTables);
+  if (has(/^xl\/model\//i)) found.add(LOSSY.dataModel);
+  if (has(/^xl\/richData\//i)) found.add(LOSSY.richValues);
+  const sheetFlags = [LOSSY.sparklines, LOSSY.x14Cf, LOSSY.controls, LOSSY.oleObjects, LOSSY.dataTables, LOSSY.richValues];
 
   for (const name of names) {
     const path = name.replace(/^\//, '');
@@ -5188,7 +7356,11 @@ async function scanLossyFeatures(data: Uint8Array): Promise<string[]> {
           }
         }
         if (/<(?:\w+:)?controls[\s>]/.test(text)) found.add(LOSSY.controls);
-        return found.has(LOSSY.sparklines) && found.has(LOSSY.x14Cf) && found.has(LOSSY.controls);
+        if (/<(?:\w+:)?oleObjects[\s>]/.test(text)) found.add(LOSSY.oleObjects);
+        if (text.includes('dataTable') && /<(?:\w+:)?f\s[^>]*?\bt\s*=\s*["']dataTable["']/.test(text)) found.add(LOSSY.dataTables);
+        // vm = value metadata: a picture in a cell or a linked data type (rich value)
+        if (text.includes('vm=') && /<(?:\w+:)?c\s[^>]*?\bvm\s*=/.test(text)) found.add(LOSSY.richValues);
+        return sheetFlags.every((label) => found.has(label));
       });
     }
   }
@@ -5252,4 +7424,2677 @@ function scanZipEntry(file: JSZip.JSZipObject, inspect: (text: string) => boolea
       })
       .resume();
   });
+}
+
+// ----- lossy v2 texts -----
+
+/** What happens to each kind of lossy content when cells change (the "Edit anyway" details, contract §4.7). */
+const LOSSY_GROUPS: { labels: readonly string[]; effect: string }[] = [
+  { labels: [LOSSY.charts, LOSSY.sparklines], effect: 'show the old numbers until the file is opened in Excel' },
+  { labels: [LOSSY.pivots, LOSSY.slicers], effect: 'show the old numbers until you refresh them in Excel' },
+  { labels: [LOSSY.externalLinks], effect: 'linked values stay as they were last saved until Excel updates the links' },
+  { labels: [LOSSY.dataTables, LOSSY.queryTables, LOSSY.dataModel], effect: 'results stay old until Excel recalculates or refreshes them' },
+  { labels: [LOSSY.richValues], effect: 'kept as they are; the cells that hold them cannot be changed in FileStudio' },
+];
+
+/** Banner of a workbook with lossy content (undefined: none). Replaces the 0.1.x "does not display" text. */
+export function lossyBannerText(features: readonly string[]): string | undefined {
+  if (features.length === 0) return undefined;
+  return `Nothing in this file will be removed. FileStudio does not show these objects and cannot update them: ${features.join(', ')}.`;
+}
+
+/**
+ * The "Edit anyway" question for a workbook with lossy content (EditState.canEditAnyway; the host shows `title` as a
+ * modal with `details` as its detail text): what goes stale, per kind of content, and what stays blocked (§4.7, §5.5).
+ */
+export function lossyEditAnyway(features: readonly string[]): { title: string; details: string[] } {
+  const details: string[] = [];
+  const grouped = new Set<string>();
+  for (const group of LOSSY_GROUPS) {
+    const present = group.labels.filter((label) => features.includes(label));
+    for (const label of present) grouped.add(label);
+    if (present.length) details.push(`${present.join(', ')}: ${group.effect}.`);
+  }
+  const rest = features.filter((label) => !grouped.has(label));
+  if (rest.length) details.push(`${rest.join(', ')}: kept as they are; FileStudio does not update them.`);
+  details.push('Inserting or deleting rows and columns, sorting and sheet changes stay blocked for this file.');
+  details.push('Nothing in this file will be removed.');
+  return { title: 'This workbook has content that FileStudio cannot update. Edit it anyway?', details };
+}
+
+/**
+ * Size limit for editing xlsx (0.2.0, user decision 2026-10-30). A save in the real extension host stays inside its
+ * budget (save < 5 s, longest block < 250 ms) up to about 150,000 cells (measured: 150,000 cells 0.6 s / 157 ms;
+ * 200,000: 0.7 s / 217-228 ms; 250,000: 1.0 s / 284 ms; 500,000: block 785 ms). The limit is set lower, to 100,000 cells or
+ * 25 MB of unpacked XML in the parts a save rewrites (worksheets, shared strings, styles; see xlsxEditCostBytes), for margin
+ * (see p1-save/decisions.md). Pictures and other parts a save copies raw do not count, and a small zip that unpacks to
+ * hundreds of MB of text does. Above the limit the workbook is hard read-only; the lazy / streaming save is a 0.2.1 item.
+ */
+export const XLSX_EDIT_LIMITS = { cells: 100_000, bytes: 25 * 1024 * 1024 } as const;
+
+/** Unpacked size of the parts a save rewrites (worksheets, shared strings, styles). A zip that cannot be read counts as its own size. */
+export function xlsxEditCostBytes(base: Uint8Array): number {
+  try {
+    let n = 0;
+    for (const e of parseZip(base).entries) if (/^xl\/(worksheets\/|sharedStrings|styles)/i.test(e.name)) n += e.usize;
+    return n;
+  } catch {
+    return base.length;
+  }
+}
+
+export const XLSX_TOO_LARGE_TEXT =
+  'This file is too large to edit safely in this version. You can view, scroll and copy, but not edit. Editing large files comes in a later version. It is open read-only.';
+
+/** Reason text when the workbook is over XLSX_EDIT_LIMITS, or undefined. `cells` = sum of used rows x columns of all sheets. */
+export function xlsxTooLargeReason(meta: WorkbookMeta, bytes: number): string | undefined {
+  let cells = 0;
+  for (const sheet of meta.sheets) cells += sheet.rowCount * sheet.colCount;
+  if (cells <= XLSX_EDIT_LIMITS.cells && bytes <= XLSX_EDIT_LIMITS.bytes) return undefined;
+  return XLSX_TOO_LARGE_TEXT;
+}
+
+export const XLSX_EDIT_GROWS_TOO_LARGE_TEXT =
+  'This change would make the workbook too large to edit safely in this version (more than 100,000 cells in use). It was not applied.';
+
+/**
+ * The size rule of xlsxTooLargeReason, checked for a planned edit: undefined when the workbook stays within
+ * XLSX_EDIT_LIMITS.cells after the edit (or the edit does not grow the used range), else the reason to refuse it.
+ * Without it one paste could grow a small workbook past the limit (slow saves, a file that reopens read-only).
+ */
+export function editGrowsTooLarge(m: WorkbookModel, plan: Edit): string | undefined {
+  const sheet = plan.sheetId === null ? undefined : m.sheetMeta(plan.sheetId);
+  if (!sheet || !plan.range || plan.kind === 'clear') return undefined;
+  const rows = Math.max(sheet.rowCount, plan.range.r1 + 1);
+  const cols = Math.max(sheet.colCount, plan.range.c1 + 1);
+  if (rows === sheet.rowCount && cols === sheet.colCount) return undefined;
+  let cells = rows * cols;
+  for (let i = 0, id = m.sheetIdAt(0); id !== undefined; id = m.sheetIdAt(++i)) {
+    const other = id === plan.sheetId ? undefined : m.sheetMeta(id);
+    if (other) cells += other.rowCount * other.colCount;
+  }
+  return cells > XLSX_EDIT_LIMITS.cells ? XLSX_EDIT_GROWS_TOO_LARGE_TEXT : undefined;
+}
+
+/** Text for a workbook the save path cannot patch (`reason` from checkPatchable); there is no "Edit anyway". */
+export function hardReadOnlyText(reason: string): string {
+  if (reason === XLSX_TOO_LARGE_TEXT) return reason;
+  return `FileStudio cannot edit this file safely: ${reason}. It is open read-only.`;
+}
+
+// ===== XLSX PACKAGE =====
+//
+// Surgical xlsx save, zip layer (P1, D-006; contract §2.3, §4.2). The bytes a document loaded stay the base of every
+// save: parseZip reads the central directory, readEntry unpacks one part (size and CRC checked), and writeZip writes a
+// new package in which every unchanged entry is a raw copy of its original bytes (local header, data, data
+// descriptor; same order, same zip comment) and only rewritten parts are deflated again (zlib runs on the libuv
+// thread pool; CRCs of big buffers are computed in 8 MB slices with yields). Anything that could not be written back
+// byte-exactly (ZIP64, encryption, compression other than store/deflate, duplicate names, damage) is a ZipError:
+// such a file is hard read-only (§4.7). The imports below belong to the save sections only.
+
+import * as zlib from 'zlib';
+import { SaxesParser } from 'saxes';
+
+const ZIP_LOCAL_SIG = 0x04034b50;
+const ZIP_CENTRAL_SIG = 0x02014b50;
+const ZIP_END_SIG = 0x06054b50;
+const ZIP64_LOCATOR_SIG = 0x07064b50;
+/** Parts larger than this are deflated with level 1 (about 10x faster; the size Excel writes), others with level 6. */
+const ZIP_FAST_DEFLATE_BYTES = 4 << 20;
+/** CRCs of big buffers are computed in slices of this size, with a yield to the event loop between slices. */
+const ZIP_CRC_SLICE = 8 << 20;
+/** DOS date 1980-01-01 for parts a save adds (deterministic output). */
+const ZIP_DOS_DATE_1980 = 0x21;
+
+/** Called at every cooperative yield of the save code; it may throw to cancel (for example a cancelled backup). */
+export type SaveYieldHook = () => void;
+
+/** The package cannot be written back byte-exactly (→ hard read-only). The message is a short reason in plain English. */
+/** A part that declares more than this unpacked is refused (a small file must not allocate gigabytes). */
+const ZIP_MAX_PART_BYTES = 512 * 1024 * 1024;
+
+export class ZipError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ZipError';
+  }
+}
+
+/** One entry of the central directory. Offsets point into ZipPackage.buf. */
+export interface ZipEntry {
+  /** Part name (UTF-8 when flag bit 11 is set, else read as Latin-1; used for lookups only). */
+  name: string;
+  /** The name bytes as stored (a rewritten entry keeps them, so non-UTF-8 names stay byte-exact). */
+  nameBytes: Buffer;
+  flags: number;
+  method: number;
+  crc: number;
+  csize: number;
+  usize: number;
+  /** Offset of the local header. */
+  lho: number;
+  /** Offset of the compressed data. */
+  dataStart: number;
+  /** End of the entry's raw span: the next local header or the central directory (data descriptor included). */
+  spanEnd: number;
+  /** The whole central-directory record (46 bytes + name + extra field + comment). */
+  rec: Buffer;
+}
+
+export interface ZipPackage {
+  buf: Buffer;
+  /** Central-directory order. */
+  entries: ZipEntry[];
+  /** Local-header (file) order. */
+  byOffset: ZipEntry[];
+  cdOffset: number;
+  /** Bytes before the first local header (normally none). */
+  prefixEnd: number;
+  comment: Buffer;
+  /** Entry by part name, ignoring case (OPC part names are case-insensitive). */
+  get(name: string): ZipEntry | undefined;
+}
+
+/** A Node Buffer view of the same bytes (no copy). */
+function asNodeBuffer(data: Uint8Array): Buffer {
+  return Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+}
+
+/** Short text of any thrown value (for messages and logs). */
+function saveErrorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+const saveTick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+/** Lets the event loop run once, then calls the hook (which may throw to cancel). */
+async function saveYield(onYield?: SaveYieldHook): Promise<void> {
+  await saveTick();
+  onYield?.();
+}
+
+/** Longest stretch of save work between two yields (the budget is a 250 ms block at most, contract §4.8). */
+const SAVE_SLICE_MS = 30;
+
+/**
+ * A step counter for long loops: `step()` returns a promise to await when the loop should yield — every `every`
+ * steps, or earlier when SAVE_SLICE_MS passed since the last yield (the clock is read every 64 steps) — else undefined.
+ */
+function saveSlicer(onYield: SaveYieldHook | undefined, every: number): () => Promise<void> | undefined {
+  let n = 0;
+  let last = performance.now();
+  const pause = async (): Promise<void> => {
+    await saveYield(onYield);
+    last = performance.now();
+  };
+  return (): Promise<void> | undefined => {
+    n++;
+    if (n % every === 0) return pause();
+    if ((n & 63) === 0 && performance.now() - last >= SAVE_SLICE_MS) return pause();
+    return undefined;
+  };
+}
+
+let crcTable: Int32Array | undefined;
+
+/**
+ * CRC-32 of `data`, continuing from `prev`. Uses zlib.crc32 when the runtime has it (Node ≥ 20.15 / 22.2), else a
+ * table (o.table forces the table, for tests).
+ */
+export function crc32(data: Uint8Array, prev = 0, o?: { table?: boolean }): number {
+  if (!o?.table && typeof zlib.crc32 === 'function') {
+    return zlib.crc32(data, prev) >>> 0;
+  }
+  if (!crcTable) {
+    crcTable = new Int32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      crcTable[n] = c;
+    }
+  }
+  let c = ~prev;
+  for (let i = 0; i < data.length; i++) c = crcTable[(c ^ data[i]) & 0xff] ^ (c >>> 8);
+  return ~c >>> 0;
+}
+
+/** crc32 over a big buffer in 8 MB slices, yielding to the event loop between slices. */
+async function crc32Cooperative(data: Uint8Array, prev: number, onYield?: SaveYieldHook): Promise<number> {
+  if (data.length <= ZIP_CRC_SLICE) {
+    return crc32(data, prev);
+  }
+  for (let i = 0; i < data.length; i += ZIP_CRC_SLICE) {
+    prev = crc32(data.subarray(i, Math.min(data.length, i + ZIP_CRC_SLICE)), prev);
+    await saveYield(onYield);
+  }
+  return prev;
+}
+
+/**
+ * Reads the central directory of an xlsx package. Throws ZipError for everything a save could not copy back
+ * byte-exactly: ZIP64, multi-part zips, encrypted entries, compression other than store (0) / deflate (8),
+ * duplicate part names (ignoring case), local headers that do not match the directory, overlapping entries.
+ */
+export function parseZip(data: Uint8Array): ZipPackage {
+  const buf = asNodeBuffer(data);
+  if (buf.length < 22) {
+    throw new ZipError('it is not a zip package');
+  }
+  let eocd = -1;
+  for (let i = buf.length - 22, min = Math.max(0, buf.length - 22 - 0xffff); i >= min; i--) {
+    if (buf.readUInt32LE(i) === ZIP_END_SIG && i + 22 + buf.readUInt16LE(i + 20) === buf.length) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd < 0) {
+    throw new ZipError('it is not a zip package (no end record)');
+  }
+  if (eocd >= 20 && buf.readUInt32LE(eocd - 20) === ZIP64_LOCATOR_SIG) {
+    throw new ZipError('it is a ZIP64 package');
+  }
+  const disk = buf.readUInt16LE(eocd + 4);
+  const cdDisk = buf.readUInt16LE(eocd + 6);
+  const onDisk = buf.readUInt16LE(eocd + 8);
+  const total = buf.readUInt16LE(eocd + 10);
+  const cdSize = buf.readUInt32LE(eocd + 12);
+  const cdOffset = buf.readUInt32LE(eocd + 16);
+  if (total === 0xffff || onDisk === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff) {
+    throw new ZipError('it is a ZIP64 package');
+  }
+  if (disk !== 0 || cdDisk !== 0 || onDisk !== total) {
+    throw new ZipError('it is a multi-part zip package');
+  }
+  const cdEnd = cdOffset + cdSize;
+  if (cdEnd > eocd) {
+    throw new ZipError('its zip directory is damaged');
+  }
+  const entries: ZipEntry[] = [];
+  const byName = new Map<string, ZipEntry>();
+  let p = cdOffset;
+  for (let i = 0; i < total; i++) {
+    if (p + 46 > cdEnd || buf.readUInt32LE(p) !== ZIP_CENTRAL_SIG) {
+      throw new ZipError('its zip directory is damaged');
+    }
+    const flags = buf.readUInt16LE(p + 8);
+    const method = buf.readUInt16LE(p + 10);
+    const crc = buf.readUInt32LE(p + 16);
+    const csize = buf.readUInt32LE(p + 20);
+    const usize = buf.readUInt32LE(p + 24);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    const lho = buf.readUInt32LE(p + 42);
+    const recEnd = p + 46 + nameLen + extraLen + commentLen;
+    if (recEnd > cdEnd) {
+      throw new ZipError('its zip directory is damaged');
+    }
+    const nameBytes = buf.subarray(p + 46, p + 46 + nameLen);
+    const name = nameBytes.toString(flags & 0x800 ? 'utf8' : 'latin1');
+    if (usize > ZIP_MAX_PART_BYTES && usize !== 0xffffffff) {
+      throw new ZipError(`the part ${name} is too large to read safely (${Math.round(usize / 1048576)} MB unpacked)`);
+    }
+    if (flags & 0x41) {
+      throw new ZipError(`the part ${name} is encrypted`);
+    }
+    if (csize === 0xffffffff || usize === 0xffffffff || lho === 0xffffffff) {
+      throw new ZipError('it is a ZIP64 package');
+    }
+    if (method !== 0 && method !== 8) {
+      throw new ZipError(`the part ${name} uses zip compression method ${method}`);
+    }
+    const key = name.toLowerCase();
+    if (byName.has(key)) {
+      throw new ZipError(`the part ${name} is in the package twice`);
+    }
+    if (lho + 30 > cdOffset || buf.readUInt32LE(lho) !== ZIP_LOCAL_SIG) {
+      throw new ZipError(`the zip header of ${name} is damaged`);
+    }
+    const localNameLen = buf.readUInt16LE(lho + 26);
+    const localExtraLen = buf.readUInt16LE(lho + 28);
+    if (localNameLen !== nameLen || buf.compare(nameBytes, 0, nameLen, lho + 30, lho + 30 + nameLen) !== 0) {
+      throw new ZipError(`the zip header of ${name} does not match the zip directory`);
+    }
+    const entry: ZipEntry = {
+      name, nameBytes, flags, method, crc, csize, usize, lho,
+      dataStart: lho + 30 + localNameLen + localExtraLen,
+      spanEnd: cdOffset,
+      rec: buf.subarray(p, recEnd),
+    };
+    entries.push(entry);
+    byName.set(key, entry);
+    p = recEnd;
+  }
+  const byOffset = entries.slice().sort((a, b) => a.lho - b.lho);
+  for (let i = 0; i < byOffset.length; i++) {
+    const entry = byOffset[i];
+    entry.spanEnd = i + 1 < byOffset.length ? byOffset[i + 1].lho : cdOffset;
+    if (entry.dataStart + entry.csize > entry.spanEnd) {
+      throw new ZipError(`the part ${entry.name} overlaps the next part`);
+    }
+  }
+  return {
+    buf,
+    entries,
+    byOffset,
+    cdOffset,
+    prefixEnd: byOffset.length ? byOffset[0].lho : cdOffset,
+    comment: buf.subarray(eocd + 22),
+    get: (name: string) => byName.get(name.toLowerCase()),
+  };
+}
+
+/**
+ * Inflates one entry (thread pool) straight into a buffer of its declared size, computing the CRC per output chunk:
+ * no big copy on the JS thread (a 200 MB sheet part would block it for a long time with a single concat).
+ */
+function inflateEntry(raw: Uint8Array, entry: ZipEntry): Promise<{ data: Buffer; crc: number }> {
+  return new Promise((resolve, reject) => {
+    // Unpacked into one buffer of the size the central directory gives (no 2x peak and no big Buffer.concat on the
+    // event loop, as zlib.inflateRaw would do); more or fewer bytes than that size → ZipError.
+    let out: Buffer;
+    try {
+      out = Buffer.allocUnsafe(entry.usize);
+    } catch {
+      reject(new ZipError(`the part ${entry.name} is too big`));
+      return;
+    }
+    const inflate = zlib.createInflateRaw({ chunkSize: 1 << 16 });
+    let filled = 0;
+    let crc = 0;
+    let done = false;
+    const fail = (message: string): void => {
+      if (done) return;
+      done = true;
+      inflate.destroy();
+      reject(new ZipError(`the part ${entry.name} ${message}`));
+    };
+    inflate.on('data', (chunk: Buffer) => {
+      if (done) return;
+      if (filled + chunk.length > out.length) {
+        fail('has the wrong size');
+        return;
+      }
+      chunk.copy(out, filled);
+      filled += chunk.length;
+      crc = crc32(chunk, crc);
+    });
+    inflate.on('error', (err: Error) => fail(`cannot be unpacked (${err.message})`));
+    inflate.on('end', () => {
+      if (done) return;
+      if (filled !== out.length) {
+        fail('has the wrong size');
+        return;
+      }
+      done = true;
+      resolve({ data: out, crc });
+    });
+    const SLICE = 1 << 20;
+    let pos = 0;
+    const pump = (): void => {
+      while (pos < raw.length && !done) {
+        const slice = raw.subarray(pos, Math.min(raw.length, pos + SLICE));
+        pos += slice.length;
+        if (!inflate.write(slice)) {
+          inflate.once('drain', pump);
+          return;
+        }
+      }
+      if (!done) inflate.end();
+    };
+    pump();
+  });
+}
+
+/**
+ * The unpacked bytes of one entry (inflate runs on the thread pool); size and CRC are checked (ZipError on a
+ * mismatch). A stored entry is returned as a view of the package bytes: callers never modify what they read.
+ */
+export async function readEntry(zip: ZipPackage, entry: ZipEntry, onYield?: SaveYieldHook): Promise<Buffer> {
+  const raw = zip.buf.subarray(entry.dataStart, entry.dataStart + entry.csize);
+  let out: Buffer;
+  let crc: number;
+  if (entry.method === 0) {
+    out = raw;
+    if (out.length !== entry.usize) {
+      throw new ZipError(`the part ${entry.name} has the wrong size`);
+    }
+    crc = await crc32Cooperative(out, 0, onYield);
+  } else {
+    ({ data: out, crc } = await inflateEntry(raw, entry));
+    if (out.length > ZIP_CRC_SLICE) await saveYield(onYield);
+  }
+  if (crc !== entry.crc) {
+    throw new ZipError(`the part ${entry.name} is damaged (CRC)`);
+  }
+  return out;
+}
+
+/** Deflates a list of buffers as one part (streaming, thread pool). Level 6 up to 4 MB, level 1 above. */
+function deflateParts(parts: readonly Uint8Array[], onYield?: SaveYieldHook): Promise<{ data: Buffer; crc: number; usize: number }> {
+  const usize = parts.reduce((n, part) => n + part.length, 0);
+  const level = usize > ZIP_FAST_DEFLATE_BYTES ? 1 : 6;
+  return new Promise((resolve, reject) => {
+    const deflate = zlib.createDeflateRaw({ level, memLevel: 8 });
+    const chunks: Buffer[] = [];
+    let crc = 0;
+    deflate.on('data', (chunk: Buffer) => chunks.push(chunk));
+    deflate.on('error', reject);
+    deflate.on('end', () => resolve({ data: Buffer.concat(chunks), crc, usize }));
+    (async () => {
+      for (const part of parts) {
+        crc = await crc32Cooperative(part, crc, onYield);
+        if (!deflate.write(part)) {
+          await new Promise<void>((done) => deflate.once('drain', () => done()));
+        }
+      }
+      deflate.end();
+    })().catch((err: unknown) => {
+      deflate.destroy();
+      reject(err);
+    });
+  });
+}
+
+export interface ZipWriteResult {
+  bytes: Buffer;
+  /** Rewritten and added part names. */
+  changed: string[];
+  removed: string[];
+  /** Entries copied as raw bytes. */
+  identical: number;
+}
+
+/**
+ * Writes a new package from `zip`. `changes`: part name → new content (a list of buffers, concatenated) or null
+ * (remove the part). `o.added`: new parts, appended at the end. Every other entry is copied byte for byte (its local
+ * header, data and data descriptor), in the original order; the central directory keeps its order and the zip
+ * comment is kept. A rewritten entry keeps its name bytes, time, attributes and comment; it loses its data
+ * descriptor and extra field (sizes and CRC are in the headers).
+ */
+export async function writeZip(
+  zip: ZipPackage,
+  changes: ReadonlyMap<string, readonly Uint8Array[] | null>,
+  o?: { added?: readonly { name: string; parts: readonly Uint8Array[] }[]; onYield?: SaveYieldHook },
+): Promise<ZipWriteResult> {
+  const out: Buffer[] = [];
+  let offset = 0;
+  const push = (chunk: Buffer): void => {
+    out.push(chunk);
+    offset += chunk.length;
+  };
+  const changeOf = new Map<ZipEntry, readonly Uint8Array[] | null>();
+  for (const [name, parts] of changes) {
+    const entry = zip.get(name);
+    if (!entry) throw new Error(`writeZip: the package has no part ${name}`);
+    changeOf.set(entry, parts);
+  }
+  const writeNew = async (nameBytes: Buffer, parts: readonly Uint8Array[], base: ZipEntry | undefined): Promise<Buffer> => {
+    const { data, crc, usize } = await deflateParts(parts, o?.onYield);
+    const utf8 = base ? base.flags & 0x800 : /[^\x00-\x7f]/.test(nameBytes.toString('latin1')) ? 0x800 : 0;
+    const flags = utf8 | (base ? base.flags & 0x0006 : 0); // keep the deflate-option bits; no data descriptor
+    const local = Buffer.alloc(30 + nameBytes.length);
+    local.writeUInt32LE(ZIP_LOCAL_SIG, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt16LE(flags, 6);
+    local.writeUInt16LE(8, 8);
+    local.writeUInt16LE(base ? base.rec.readUInt16LE(12) : 0, 10);
+    local.writeUInt16LE(base ? base.rec.readUInt16LE(14) : ZIP_DOS_DATE_1980, 12);
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(data.length, 18);
+    local.writeUInt32LE(usize, 22);
+    local.writeUInt16LE(nameBytes.length, 26);
+    local.writeUInt16LE(0, 28);
+    nameBytes.copy(local, 30);
+    const lho = offset;
+    push(local);
+    push(data);
+    const comment = base ? base.rec.subarray(46 + base.rec.readUInt16LE(28) + base.rec.readUInt16LE(30)) : Buffer.alloc(0);
+    const rec = Buffer.alloc(46 + nameBytes.length + comment.length);
+    rec.writeUInt32LE(ZIP_CENTRAL_SIG, 0);
+    rec.writeUInt16LE(base ? base.rec.readUInt16LE(4) : 20, 4); // version made by
+    rec.writeUInt16LE(20, 6);
+    local.copy(rec, 8, 6, 28); // flags, method, time, date, crc, sizes, name length
+    rec.writeUInt16LE(0, 30);
+    rec.writeUInt16LE(comment.length, 32);
+    rec.writeUInt16LE(0, 34);
+    rec.writeUInt16LE(base ? base.rec.readUInt16LE(36) : 0, 36);
+    rec.writeUInt32LE(base ? base.rec.readUInt32LE(38) : 0, 38);
+    rec.writeUInt32LE(lho, 42);
+    nameBytes.copy(rec, 46);
+    comment.copy(rec, 46 + nameBytes.length);
+    return rec;
+  };
+  const changed: string[] = [];
+  const removed: string[] = [];
+  let identical = 0;
+  if (zip.prefixEnd > 0) push(zip.buf.subarray(0, zip.prefixEnd));
+  const central = new Map<ZipEntry, Buffer>();
+  for (const entry of zip.byOffset) {
+    const parts = changeOf.get(entry);
+    if (parts === null) {
+      removed.push(entry.name);
+    } else if (parts) {
+      central.set(entry, await writeNew(entry.nameBytes, parts, entry));
+      changed.push(entry.name);
+    } else {
+      const lho = offset;
+      push(zip.buf.subarray(entry.lho, entry.spanEnd));
+      const rec = Buffer.from(entry.rec);
+      rec.writeUInt32LE(lho, 42);
+      central.set(entry, rec);
+      identical++;
+    }
+    if (offset > 0xffffffff) throw new ZipError('the saved package would need ZIP64');
+  }
+  const addedRecs: Buffer[] = [];
+  const addedNames = new Set<string>();
+  for (const add of o?.added ?? []) {
+    const key = add.name.toLowerCase();
+    if (zip.get(add.name) || addedNames.has(key)) throw new Error(`writeZip: the part ${add.name} exists already`);
+    addedNames.add(key);
+    addedRecs.push(await writeNew(Buffer.from(add.name, 'utf8'), add.parts, undefined));
+    changed.push(add.name);
+  }
+  const count = central.size + addedRecs.length;
+  const cdStart = offset;
+  for (const entry of zip.entries) {
+    const rec = central.get(entry);
+    if (rec) push(rec);
+  }
+  for (const rec of addedRecs) push(rec);
+  const cdSize = offset - cdStart;
+  if (count >= 0xffff || offset > 0xffffffff) {
+    throw new ZipError('the saved package would need ZIP64');
+  }
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(ZIP_END_SIG, 0);
+  end.writeUInt16LE(count, 8);
+  end.writeUInt16LE(count, 10);
+  end.writeUInt32LE(cdSize, 12);
+  end.writeUInt32LE(cdStart, 16);
+  end.writeUInt16LE(zip.comment.length, 20);
+  push(end);
+  push(zip.comment);
+  return { bytes: Buffer.concat(out, offset), changed, removed, identical };
+}
+
+// ===== XLSX PATCH =====
+//
+// Byte-level patchers for the parts an edit touches (P1, D-006; rules in contract §4.3). Every byte outside the edited
+// elements stays as it was: sheet XML is walked as a Buffer (an ASCII tag search is safe on UTF-8) and only the
+// patched rows are decoded and re-emitted; sharedStrings and styles.xml are append-only (existing items never
+// change); workbook.xml only gets calcPr fullCalcOnLoad="1"; calcChain is dropped with its relationship and content
+// type. Whatever a patcher cannot do safely throws PatchError: the save fails and nothing is written.
+
+/** A patcher refuses a change (unsafe or not supported). The save fails and nothing is written. */
+export class PatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PatchError';
+  }
+}
+
+// ----- xml helpers -----
+
+/** One attribute as written in the file: the value is still XML-escaped. */
+interface XmlAttr {
+  value: string;
+  quote: '"' | "'";
+}
+
+/** A child element: local name, its start tag and its whole text. */
+interface XmlChild {
+  local: string;
+  open: string;
+  xml: string;
+}
+
+interface XmlElement {
+  qname: string;
+  attrs: Map<string, XmlAttr>;
+  children: XmlChild[];
+}
+
+const XML_ATTR_RE = /([A-Za-z_][\w:.-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
+const XML_ENTITY_RE = /&(?:(lt|gt|amp|quot|apos)|#(\d+)|#x([0-9A-Fa-f]+));/g;
+const XML_NAMED_ENTITIES: Record<string, string> = { lt: '<', gt: '>', amp: '&', quot: '"', apos: "'" };
+/** Characters XML 1.0 does not allow (C0 controls except tab, LF, CR; U+FFFE; U+FFFF) and lone surrogates. */
+const XML_INVALID_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]|[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+const LONE_SURROGATE_RE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+const UTF8_STRICT = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+function regexEscape(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Attributes of a start tag (`<name a="1" b='2'>`), in file order. */
+function parseXmlAttrs(tag: string): Map<string, XmlAttr> {
+  const attrs = new Map<string, XmlAttr>();
+  const nameEnd = tag.search(/[\s/>]/);
+  for (const m of tag.slice(nameEnd < 0 ? tag.length : nameEnd).matchAll(XML_ATTR_RE)) {
+    attrs.set(m[1], m[2] !== undefined ? { value: m[2], quote: '"' } : { value: m[3] ?? '', quote: "'" });
+  }
+  return attrs;
+}
+
+/** Index of the ">" that ends the start tag at the beginning of `xml` (a ">" inside a quoted attribute value is skipped). */
+function startTagEnd(xml: string): number {
+  let quote = '';
+  for (let i = 0; i < xml.length; i++) {
+    const ch = xml[i];
+    if (quote) {
+      if (ch === quote) quote = '';
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === '>') {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function emitXmlAttrs(attrs: ReadonlyMap<string, XmlAttr>): string {
+  let out = '';
+  for (const [name, attr] of attrs) out += ` ${name}=${attr.quote}${attr.value}${attr.quote}`;
+  return out;
+}
+
+/** Sets an attribute (`value` already escaped); an existing attribute keeps its place and quote style. */
+function setXmlAttr(attrs: Map<string, XmlAttr>, name: string, value: string): void {
+  const quote = attrs.get(name)?.quote ?? '"';
+  attrs.set(name, { value: quote === "'" ? value.replace(/'/g, '&apos;') : value, quote });
+}
+
+function xmlAttrText(attrs: ReadonlyMap<string, XmlAttr>, name: string): string | undefined {
+  const attr = attrs.get(name);
+  return attr === undefined ? undefined : xmlUnescape(attr.value);
+}
+
+function xmlUnescape(text: string): string {
+  if (!text.includes('&')) return text;
+  return text.replace(XML_ENTITY_RE, (match: string, named?: string, dec?: string, hex?: string): string => {
+    if (named) return XML_NAMED_ENTITIES[named];
+    const code = dec !== undefined ? parseInt(dec, 10) : parseInt(hex ?? '', 16);
+    try {
+      return String.fromCodePoint(code);
+    } catch {
+      return match;
+    }
+  });
+}
+
+/** Text content: `& < >`, and CR as a character reference (a raw CR would be read back as LF). */
+function xmlEscapeText(text: string): string {
+  return text.replace(/[&<>\r]/g, (ch) => (ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '>' ? '&gt;' : '&#13;'));
+}
+
+/** Attribute value in double quotes (tab, LF, CR as character references: attribute values are normalised). */
+function xmlEscapeAttr(text: string): string {
+  return text.replace(/[&<>"\t\n\r]/g, (ch) =>
+    ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '>' ? '&gt;' : ch === '"' ? '&quot;' : `&#${ch.charCodeAt(0)};`);
+}
+
+/**
+ * Cell text as an OOXML ST_Xstring, XML-escaped: a literal `_xHHHH_` is protected as `_x005F_xHHHH_`, control
+ * characters (all C0 except tab and LF, so CR too) and U+FFFE / U+FFFF become `_xHHHH_` (upper-case hex, as Excel
+ * writes and as decodeXstring reads them back). A lone surrogate is refused (it cannot be stored).
+ */
+function escapeXstring(text: string, where: string): string {
+  if (LONE_SURROGATE_RE.test(text)) {
+    throw new PatchError(`${where}: the text contains an invalid character`);
+  }
+  const escaped = text
+    .replace(/_(?=x[0-9A-Fa-f]{4}_)/g, '_x005F_') // lookahead: '_x005F_x0041_' must not lose its shared underscore
+    .replace(/[\x00-\x08\x0b-\x1f\ufffe\uffff]/g, (ch) => `_x${ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')}_`);
+  return xmlEscapeText(escaped);
+}
+
+/** xml:space="preserve" is needed for leading/trailing white space, tabs and line breaks. */
+function needsSpacePreserve(text: string): boolean {
+  return /^\s|\s$|[\n\t]/.test(text);
+}
+
+function isXmlNameEnd(code: number): boolean {
+  return code === 0x20 || code === 0x3e || code === 0x2f || code === 0x09 || code === 0x0a || code === 0x0d;
+}
+
+/** Root element prefix ('' or 'x:') of a part. */
+function xmlRootPrefix(head: string, local: string, where: string): string {
+  const m = new RegExp(`<([A-Za-z_][\\w.-]*:)?${local}[\\s>/]`).exec(head);
+  if (!m) throw new PatchError(`${where} has no <${local}> element`);
+  return m[1] ?? '';
+}
+
+/** Throws when a part is not UTF-8 (UTF-16 byte order mark or another declared encoding). */
+function assertUtf8Head(data: Uint8Array, where: string): void {
+  if (data.length >= 2 && ((data[0] === 0xff && data[1] === 0xfe) || (data[0] === 0xfe && data[1] === 0xff))) {
+    throw new PatchError(`${where} is not UTF-8`);
+  }
+  const head = asNodeBuffer(data).toString('latin1', 0, Math.min(data.length, 256));
+  const decl = /^(?:\xef\xbb\xbf)?<\?xml[^>]*\bencoding\s*=\s*["']([^"']+)["']/.exec(head);
+  if (decl && !/^utf-?8$/i.test(decl[1])) {
+    throw new PatchError(`${where} is not UTF-8 (${decl[1]})`);
+  }
+}
+
+/** A whole small part as text (strict UTF-8; a byte order mark is kept so it is written back). */
+function partText(data: Uint8Array, where: string): string {
+  assertUtf8Head(data, where);
+  try {
+    return UTF8_STRICT.decode(data);
+  } catch {
+    throw new PatchError(`${where} is not valid UTF-8`);
+  }
+}
+
+/** The child elements of an element body. Text between children must be white space. */
+function splitXmlChildren(inner: string, where: string): XmlChild[] {
+  const out: XmlChild[] = [];
+  let p = 0;
+  while (p < inner.length) {
+    const lt = inner.indexOf('<', p);
+    if (lt < 0 || inner.slice(p, lt).trim()) {
+      if (inner.slice(p, lt < 0 ? inner.length : lt).trim()) throw new PatchError(`${where} has unexpected text`);
+      if (lt < 0) break;
+    }
+    const gt = inner.indexOf('>', lt);
+    const name = /^<([A-Za-z_][\w.-]*:)?([A-Za-z_][\w.-]*)/.exec(inner.slice(lt, gt + 1));
+    if (gt < 0 || !name) throw new PatchError(`${where} is damaged`);
+    let end = gt + 1;
+    if (inner[gt - 1] !== '/') {
+      const close = `</${name[1] ?? ''}${name[2]}>`;
+      const at = inner.indexOf(close, gt);
+      if (at < 0) throw new PatchError(`${where} is damaged`);
+      end = at + close.length;
+    }
+    out.push({ local: name[2], open: inner.slice(lt, gt + 1), xml: inner.slice(lt, end) });
+    p = end;
+  }
+  return out;
+}
+
+function parseXmlElement(xml: string, where: string): XmlElement {
+  const gt = xml.indexOf('>');
+  const open = xml.slice(0, gt + 1);
+  const qname = /^<([^\s/>]+)/.exec(open)?.[1];
+  if (gt < 0 || !qname) throw new PatchError(`${where} is damaged`);
+  const inner = xml[gt - 1] === '/' ? '' : xml.slice(gt + 1, xml.lastIndexOf('</'));
+  return { qname, attrs: parseXmlAttrs(open), children: splitXmlChildren(inner, where) };
+}
+
+function buildXmlElement(el: XmlElement): string {
+  const body = el.children.map((child) => child.xml).join('');
+  return body ? `<${el.qname}${emitXmlAttrs(el.attrs)}>${body}</${el.qname}>` : `<${el.qname}${emitXmlAttrs(el.attrs)}/>`;
+}
+
+/** Replaces (or removes, xml = null) the child `local`; a new child goes to its place in the schema order. */
+function setXmlChild(el: XmlElement, local: string, xml: string | null, order: readonly string[]): void {
+  const at = el.children.findIndex((child) => child.local === local);
+  el.children = el.children.filter((child) => child.local !== local);
+  if (xml === null) return;
+  const child: XmlChild = { local, open: xml, xml };
+  if (at >= 0) {
+    el.children.splice(Math.min(at, el.children.length), 0, child);
+    return;
+  }
+  const rank = order.indexOf(local);
+  const before = el.children.findIndex((other) => order.indexOf(other.local) > rank);
+  el.children.splice(before < 0 ? el.children.length : before, 0, child);
+}
+
+/**
+ * Calls `found` for every occurrence of `needle` in buf[from, to), searching 8 MB windows with a yield between them
+ * (one Buffer.indexOf over a 200 MB part would block the event loop too long).
+ */
+async function forEachOccurrence(buf: Buffer, needle: Buffer, from: number, to: number, onYield: SaveYieldHook | undefined, found: (at: number) => void): Promise<void> {
+  const WINDOW = 8 << 20;
+  for (let pos = from; pos < to; pos += WINDOW) {
+    const window = buf.subarray(pos, Math.min(to, pos + WINDOW + needle.length - 1));
+    for (let i = window.indexOf(needle); i >= 0 && i < WINDOW; i = window.indexOf(needle, i + 1)) found(pos + i);
+    if (to - from > WINDOW) await saveYield(onYield);
+  }
+}
+
+// ----- package map -----
+
+interface XlsxRel {
+  id: string;
+  type: string;
+  target: string;
+  external: boolean;
+}
+
+interface XlsxSheetRef {
+  name: string;
+  /** The <sheet sheetId> attribute (SheetId = 's' + sheetId). */
+  sheetId: number;
+  /** Zip entry name of the sheet part (undefined when the relationship or the part is missing). */
+  part?: string;
+  /** Relationship type (…/worksheet, …/chartsheet, …). */
+  type: string;
+}
+
+interface XlsxPackage {
+  zip: ZipPackage;
+  wbPath: string;
+  wbXml: string;
+  wbRelsPath: string;
+  wbRelsXml: string;
+  ctXml: string;
+  sheets: XlsxSheetRef[];
+  sstPath?: string;
+  stylesPath?: string;
+  /** calcChain parts: the workbook relationship target and any part with the calcChain content type. */
+  calcChainPaths: string[];
+  /** Strict Open XML (purl.oclc.org namespaces): not patchable. */
+  strict: boolean;
+}
+
+const CALC_CHAIN_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.calcChain+xml';
+
+function relsPartOf(part: string): string {
+  const i = part.lastIndexOf('/');
+  return `${part.slice(0, i + 1)}_rels/${part.slice(i + 1)}.rels`;
+}
+
+/** Zip entry name of a relationship target (relative to `fromPart`, or absolute). */
+function resolvePartTarget(fromPart: string, target: string): string {
+  const joined = target.startsWith('/') ? target.slice(1) : fromPart.slice(0, fromPart.lastIndexOf('/') + 1) + target;
+  const out: string[] = [];
+  for (const seg of joined.split('/')) {
+    if (seg === '..') out.pop();
+    else if (seg !== '.' && seg !== '') out.push(seg);
+  }
+  return out.join('/');
+}
+
+/** The exact entry name for a part name (case-insensitive; percent-encoded names tried decoded too). */
+function entryNameOf(zip: ZipPackage, name: string): string | undefined {
+  const entry = zip.get(name);
+  if (entry) return entry.name;
+  try {
+    return zip.get(decodeURIComponent(name))?.name;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseRels(text: string): XlsxRel[] {
+  const rels: XlsxRel[] = [];
+  for (const m of text.matchAll(/<(?:[\w.-]+:)?Relationship\b[^>]*>/g)) {
+    const attrs = parseXmlAttrs(m[0]);
+    rels.push({
+      id: xmlAttrText(attrs, 'Id') ?? '',
+      type: xmlAttrText(attrs, 'Type') ?? '',
+      target: xmlAttrText(attrs, 'Target') ?? '',
+      external: xmlAttrText(attrs, 'TargetMode') === 'External',
+    });
+  }
+  return rels;
+}
+
+async function readPartText(zip: ZipPackage, name: string, onYield?: SaveYieldHook): Promise<string | undefined> {
+  const entry = zip.get(name);
+  return entry ? partText(await readEntry(zip, entry, onYield), name) : undefined;
+}
+
+/** Reads the package map: workbook, its relationships, sheets (sheetId → part), sharedStrings, styles, calcChain. */
+async function openXlsxPackage(zip: ZipPackage, onYield?: SaveYieldHook): Promise<XlsxPackage> {
+  const rootRels = await readPartText(zip, '_rels/.rels', onYield);
+  if (rootRels === undefined) throw new PatchError('it has no package relationships (_rels/.rels)');
+  const office = parseRels(rootRels).find((rel) => !rel.external && /\/officeDocument$/.test(rel.type));
+  const wbPath = office && entryNameOf(zip, resolvePartTarget('', office.target));
+  const wbXml = wbPath && (await readPartText(zip, wbPath, onYield));
+  if (!wbPath || !wbXml) throw new PatchError('it has no workbook part');
+  const wbRelsPath = entryNameOf(zip, relsPartOf(wbPath));
+  const wbRelsXml = wbRelsPath && (await readPartText(zip, wbRelsPath, onYield));
+  if (!wbRelsPath || !wbRelsXml) throw new PatchError('it has no workbook relationships');
+  const ctXml = await readPartText(zip, '[Content_Types].xml', onYield);
+  if (ctXml === undefined) throw new PatchError('it has no content types part');
+  const P = xmlRootPrefix(wbXml, 'workbook', wbPath);
+  const rootTag = new RegExp(`<${regexEscape(P)}workbook\\b[^>]*>`).exec(wbXml)?.[0] ?? '';
+  const rels = parseRels(wbRelsXml).filter((rel) => !rel.external);
+  const sheets: XlsxSheetRef[] = [];
+  for (const m of wbXml.matchAll(new RegExp(`<${regexEscape(P)}sheet\\b[^>]*>`, 'g'))) {
+    const attrs = parseXmlAttrs(m[0]);
+    const ridName = [...attrs.keys()].find((key) => /(^|:)id$/.test(key));
+    const rid = ridName ? xmlAttrText(attrs, ridName) : undefined;
+    const rel = rid !== undefined ? rels.find((x) => x.id === rid) : undefined;
+    sheets.push({
+      name: xmlAttrText(attrs, 'name') ?? '',
+      sheetId: Number(xmlAttrText(attrs, 'sheetId')),
+      part: rel ? entryNameOf(zip, resolvePartTarget(wbPath, rel.target)) : undefined,
+      type: rel?.type ?? '',
+    });
+  }
+  const relPart = (suffix: string): string | undefined => {
+    const rel = rels.find((x) => x.type.endsWith(suffix));
+    return rel ? entryNameOf(zip, resolvePartTarget(wbPath, rel.target)) : undefined;
+  };
+  const calcChainPaths = new Set<string>();
+  const chainRel = relPart('/calcChain');
+  if (chainRel) calcChainPaths.add(chainRel);
+  for (const m of ctXml.matchAll(/<(?:[\w.-]+:)?Override\b[^>]*>/g)) {
+    const attrs = parseXmlAttrs(m[0]);
+    const name = xmlAttrText(attrs, 'PartName');
+    const entry = name && xmlAttrText(attrs, 'ContentType') === CALC_CHAIN_CONTENT_TYPE ? entryNameOf(zip, resolvePartTarget('', name)) : undefined;
+    if (entry) calcChainPaths.add(entry);
+  }
+  return {
+    zip, wbPath, wbXml, wbRelsPath, wbRelsXml, ctXml, sheets,
+    sstPath: relPart('/sharedStrings'),
+    stylesPath: relPart('/styles'),
+    calcChainPaths: [...calcChainPaths],
+    strict: /purl\.oclc\.org\/ooxml\/spreadsheetml\/main/.test(rootTag),
+  };
+}
+
+// ----- sheet cells -----
+
+/** Where <sheetData> is in a sheet part, plus the tag bytes used to walk it. */
+interface SheetXmlLayout {
+  P: string;
+  where: string;
+  sdOpen: number;
+  sdOpenEnd: number;
+  sdSelfClosing: boolean;
+  /** Offset of </sheetData> (= sdOpenEnd when self-closing). */
+  sdClose: number;
+  rowTag: Buffer;
+  rowEndTag: Buffer;
+}
+
+interface RowSpan {
+  start: number;
+  /** Offset just after the start tag. */
+  openEnd: number;
+  end: number;
+  /** 0-based row index. */
+  r: number;
+  selfClosing: boolean;
+  /** The start tag (ASCII). */
+  tag: string;
+}
+
+interface CellSpan {
+  c: number;
+  start: number;
+  end: number;
+}
+
+const ROW_NUMBER_RE = /\sr\s*=\s*["'](\d+)["']/;
+const CELL_REF_ATTR_RE = /\sr\s*=\s*["']([A-Za-z]{1,3})(\d{1,7})["']/;
+
+/** Offset of the next start tag `tag` (bytes of `<P:name`) in buf[from, end), or -1. */
+function findStartTag(buf: Buffer, tag: Buffer, from: number, end: number): number {
+  for (let pos = from; ;) {
+    const window = buf.subarray(pos, end);
+    const i = window.indexOf(tag);
+    if (i < 0 || pos + i + tag.length >= end) return -1;
+    if (isXmlNameEnd(buf[pos + i + tag.length])) return pos + i;
+    pos += i + tag.length;
+  }
+}
+
+/** Offset of the first `needle` in buf[from, end), or -1; big ranges are searched in 8 MB windows with a yield between. */
+async function indexOfCooperative(buf: Buffer, needle: Buffer, from: number, onYield?: SaveYieldHook): Promise<number> {
+  const WINDOW = 8 << 20;
+  for (let pos = from; pos < buf.length; pos += WINDOW) {
+    const i = buf.subarray(pos, Math.min(buf.length, pos + WINDOW + needle.length - 1)).indexOf(needle);
+    if (i >= 0) return pos + i;
+    if (buf.length - from > WINDOW) await saveYield(onYield);
+  }
+  return -1;
+}
+
+/**
+ * Where <sheetData> is in a sheet part. The search for </sheetData> runs in windows with yields (one indexOf over a
+ * 200 MB part blocks the event loop for 100-200 ms).
+ */
+async function sheetLayout(buf: Buffer, where: string, onYield?: SaveYieldHook): Promise<SheetXmlLayout> {
+  assertUtf8Head(buf, where);
+  const P = xmlRootPrefix(buf.toString('latin1', 0, Math.min(buf.length, 16384)), 'worksheet', where);
+  const sdOpen = findStartTag(buf, Buffer.from(`<${P}sheetData`), 0, buf.length);
+  if (sdOpen < 0) throw new PatchError(`${where} has no cell data (<sheetData>)`);
+  const gt = buf.indexOf(0x3e, sdOpen);
+  if (gt < 0) throw new PatchError(`${where} is damaged`);
+  const sdSelfClosing = buf[gt - 1] === 0x2f;
+  const sdClose = sdSelfClosing ? gt + 1 : await indexOfCooperative(buf, Buffer.from(`</${P}sheetData>`), gt, onYield);
+  if (sdClose < 0) throw new PatchError(`${where} is damaged (no </sheetData>)`);
+  return { P, where, sdOpen, sdOpenEnd: gt + 1, sdSelfClosing, sdClose, rowTag: Buffer.from(`<${P}row`), rowEndTag: Buffer.from(`</${P}row>`) };
+}
+
+/** The row starting at `rs`. Rows without a row number are refused (§4.7: hard read-only). */
+function readRowAt(buf: Buffer, L: SheetXmlLayout, rs: number): RowSpan {
+  const gt = buf.indexOf(0x3e, rs);
+  if (gt < 0 || gt >= L.sdClose) throw new PatchError(`${L.where} is damaged`);
+  const selfClosing = buf[gt - 1] === 0x2f;
+  let end = gt + 1;
+  if (!selfClosing) {
+    const close = buf.indexOf(L.rowEndTag, gt);
+    if (close < 0 || close >= L.sdClose) throw new PatchError(`${L.where} is damaged (a row is not closed)`);
+    end = close + L.rowEndTag.length;
+  }
+  const tag = buf.toString('latin1', rs, gt + 1);
+  const m = ROW_NUMBER_RE.exec(tag);
+  if (!m) throw new PatchError(`${L.where} has rows without a row number`);
+  const r = parseInt(m[1], 10) - 1;
+  if (!(r >= 0 && r < MAX_ROWS)) throw new PatchError(`${L.where} has an invalid row number (${m[1]})`);
+  return { start: rs, openEnd: gt + 1, end, r, selfClosing, tag };
+}
+
+/** The cells of a row body (text between the row tags): column, offsets. Checks order and row numbers. */
+function parseRowCells(body: string, P: string, r: number, where: string): CellSpan[] {
+  const cells: CellSpan[] = [];
+  const cTag = `<${P}c`;
+  const cEnd = `</${P}c>`;
+  let p = 0;
+  let prevC = -1;
+  for (;;) {
+    const i = body.indexOf(cTag, p);
+    if (i < 0) break;
+    if (!isXmlNameEnd(body.charCodeAt(i + cTag.length))) {
+      p = i + cTag.length;
+      continue;
+    }
+    const gt = body.indexOf('>', i);
+    if (gt < 0) throw new PatchError(`${where} is damaged (row ${r + 1})`);
+    let end = gt + 1;
+    if (body[gt - 1] !== '/') {
+      const close = body.indexOf(cEnd, gt);
+      if (close < 0) throw new PatchError(`${where} is damaged (row ${r + 1})`);
+      end = close + cEnd.length;
+    }
+    const ref = CELL_REF_ATTR_RE.exec(body.slice(i, gt + 1));
+    let c = prevC + 1;
+    if (ref) {
+      c = colToIndex(ref[1]);
+      if (parseInt(ref[2], 10) - 1 !== r) throw new PatchError(`${where} has cell ${ref[1]}${ref[2]} inside row ${r + 1}`);
+      if (c < 0 || c >= MAX_COLS) throw new PatchError(`${where} has an invalid cell reference (${ref[1]}${ref[2]})`);
+    }
+    if (c <= prevC || c >= MAX_COLS) throw new PatchError(`${where} has cells out of order in row ${r + 1}`);
+    prevC = c;
+    cells.push({ c, start: i, end });
+    p = end;
+  }
+  return cells;
+}
+
+/** Style index of each column from <cols> (0 = none). */
+function columnStyles(buf: Buffer, L: SheetXmlLayout): (c: number) => number {
+  const head = buf.toString('latin1', 0, L.sdOpen);
+  const cols: { min: number; max: number; style: number }[] = [];
+  for (const m of head.matchAll(new RegExp(`<${regexEscape(L.P)}col\\b[^>]*>`, 'g'))) {
+    const attrs = parseXmlAttrs(m[0]);
+    const style = Number(xmlAttrText(attrs, 'style') ?? 0);
+    if (style > 0) cols.push({ min: Number(xmlAttrText(attrs, 'min')), max: Number(xmlAttrText(attrs, 'max')), style });
+  }
+  return (c: number): number => cols.find((col) => c + 1 >= col.min && c + 1 <= col.max)?.style ?? 0;
+}
+
+function decodeRowText(buf: Buffer, row: RowSpan, where: string): string {
+  try {
+    return UTF8_STRICT.decode(buf.subarray(row.start, row.end));
+  } catch {
+    throw new PatchError(`${where} row ${row.r + 1} is not valid UTF-8`);
+  }
+}
+
+/**
+ * Builds the new XML of one cell from its old XML (undefined = no cell yet) and the cell's style inherited from its
+ * row or column (used for a new cell). null = the cell is removed.
+ */
+type CellPatchFn = (oldXml: string | undefined, r: number, c: number, inheritS: number) => string | null;
+
+/**
+ * Patches the cells of one sheet part. `rows`: 0-based row → (0-based column → patch function). Returns the new
+ * part as slices (unchanged regions are views of `buf`, no copy). All rows are walked (yielding every `yieldEvery`
+ * rows or SAVE_SLICE_MS) so rows out of order anywhere in the part are refused.
+ */
+async function patchSheetCells(
+  buf: Buffer,
+  L: SheetXmlLayout,
+  rows: ReadonlyMap<number, ReadonlyMap<number, CellPatchFn>>,
+  o: { yieldEvery: number; onYield?: SaveYieldHook },
+): Promise<{ parts: Buffer[]; changed: boolean }> {
+  const P = L.P;
+  const colStyle = columnStyles(buf, L);
+  const wanted = [...rows.keys()].sort((a, b) => a - b);
+  const newCells = (r: number, inherit: (c: number) => number): string => {
+    const fns = rows.get(r);
+    if (!fns) return '';
+    let cells = '';
+    for (const c of [...fns.keys()].sort((a, b) => a - b)) cells += fns.get(c)?.(undefined, r, c, inherit(c)) ?? '';
+    return cells;
+  };
+  const newRow = (r: number): string => {
+    const cells = newCells(r, colStyle);
+    return cells ? `<${P}row r="${r + 1}">${cells}</${P}row>` : '';
+  };
+  if (L.sdSelfClosing) {
+    const rowsXml = wanted.map(newRow).join('');
+    if (!rowsXml) return { parts: [buf], changed: false };
+    return { parts: [buf.subarray(0, L.sdOpen), Buffer.from(`<${P}sheetData>${rowsXml}</${P}sheetData>`, 'utf8'), buf.subarray(L.sdOpenEnd)], changed: true };
+  }
+  const out: Buffer[] = [];
+  let changed = false;
+  let copyFrom = 0;
+  let pos = L.sdOpenEnd;
+  let prevR = -1;
+  let wi = 0;
+  const step = saveSlicer(o.onYield, o.yieldEvery);
+  const emitNew = (r: number, at: number): void => {
+    const xml = newRow(r);
+    if (!xml) return;
+    out.push(buf.subarray(copyFrom, at));
+    copyFrom = at;
+    out.push(Buffer.from(xml, 'utf8'));
+    changed = true;
+  };
+  for (;;) {
+    const rs = findStartTag(buf, L.rowTag, pos, L.sdClose);
+    if (rs < 0) break;
+    const row = readRowAt(buf, L, rs);
+    if (row.r <= prevR) throw new PatchError(`${L.where} has rows out of order (row ${row.r + 1})`);
+    prevR = row.r;
+    while (wi < wanted.length && wanted[wi] < row.r) emitNew(wanted[wi++], rs);
+    if (wi < wanted.length && wanted[wi] === row.r) {
+      const fns = rows.get(row.r);
+      const oldXml = decodeRowText(buf, row, L.where);
+      const newXml = fns ? patchRowXml(oldXml, row, fns, P, colStyle, L.where) : oldXml;
+      if (newXml !== oldXml) {
+        out.push(buf.subarray(copyFrom, rs));
+        out.push(Buffer.from(newXml, 'utf8'));
+        copyFrom = row.end;
+        changed = true;
+      }
+      wi++;
+    }
+    pos = row.end;
+    const pause = step();
+    if (pause) await pause;
+  }
+  while (wi < wanted.length) emitNew(wanted[wi++], L.sdClose);
+  if (!changed) return { parts: [buf], changed: false };
+  out.push(buf.subarray(copyFrom));
+  return { parts: out, changed };
+}
+
+/** Re-emits one row: unchanged cells keep their exact text; patched cells are replaced or inserted in column order. */
+function patchRowXml(rowXml: string, row: RowSpan, fns: ReadonlyMap<number, CellPatchFn>, P: string, colStyle: (c: number) => number, where: string): string {
+  const rowAttrs = parseXmlAttrs(row.tag);
+  const custom = xmlAttrText(rowAttrs, 'customFormat');
+  const rowStyle = custom === '1' || custom === 'true' ? Number(xmlAttrText(rowAttrs, 's') ?? 0) : undefined;
+  const inherit = (c: number): number => rowStyle ?? colStyle(c);
+  const pending = [...fns.keys()].sort((a, b) => a - b);
+  const run = (c: number, oldXml: string | undefined): string => fns.get(c)?.(oldXml, row.r, c, inherit(c)) ?? '';
+  if (row.selfClosing) {
+    const cells = pending.map((c) => run(c, undefined)).join('');
+    return cells ? `${row.tag.slice(0, -2).replace(/\s+$/, '')}>${cells}</${P}row>` : rowXml;
+  }
+  const open = row.tag.length;
+  const close = rowXml.lastIndexOf(`</${P}row>`);
+  const body = rowXml.slice(open, close);
+  const cells = parseRowCells(body, P, row.r, where);
+  let res = rowXml.slice(0, open);
+  let from = 0;
+  let k = 0;
+  for (const cell of cells) {
+    while (k < pending.length && pending[k] < cell.c) {
+      res += body.slice(from, cell.start) + run(pending[k++], undefined);
+      from = cell.start;
+    }
+    if (k < pending.length && pending[k] === cell.c) {
+      res += body.slice(from, cell.start) + run(pending[k++], body.slice(cell.start, cell.end));
+      from = cell.end;
+    }
+  }
+  if (k < pending.length) {
+    const tail = Math.max(from, cells.length ? cells[cells.length - 1].end : 0);
+    res += body.slice(from, tail);
+    from = tail;
+    while (k < pending.length) res += run(pending[k++], undefined);
+  }
+  return res + body.slice(from) + rowXml.slice(close);
+}
+
+/** Multi-cell array or data-table formula ranges of a sheet part (their cells cannot be changed one by one). */
+async function findArrayRanges(buf: Buffer, L: SheetXmlLayout, onYield?: SaveYieldHook): Promise<{ range: Range; ref: string }[]> {
+  const out: { range: Range; ref: string }[] = [];
+  const fTag = new RegExp(`^<${regexEscape(L.P)}f[\\s/>]`);
+  for (const word of ['array', 'dataTable']) {
+    await forEachOccurrence(buf, Buffer.from(word), L.sdOpenEnd, L.sdClose, onYield, (at) => {
+      const lt = buf.lastIndexOf(0x3c, at);
+      const gt = buf.indexOf(0x3e, at);
+      if (lt < 0 || gt < 0 || gt - lt > 4096) return;
+      const tag = buf.toString('utf8', lt, gt + 1);
+      if (!fTag.test(tag)) return;
+      const attrs = parseXmlAttrs(tag);
+      const ref = xmlAttrText(attrs, 'ref');
+      if (xmlAttrText(attrs, 't') !== word || !ref) return;
+      const range = decodeRange(ref);
+      if (!range) throw new PatchError(`${L.where} has an array formula with an invalid range (${ref})`);
+      if (range.r0 !== range.r1 || range.c0 !== range.c1) out.push({ range, ref });
+    });
+  }
+  return out;
+}
+
+/** Cells of the shared formula `si`: the master (has `ref`) and its clones. */
+async function findSharedFormulaCells(buf: Buffer, L: SheetXmlLayout, si: string, onYield?: SaveYieldHook): Promise<{ r: number; c: number; master: boolean; formula: string }[]> {
+  const out: { r: number; c: number; master: boolean; formula: string }[] = [];
+  const fTag = new RegExp(`^<${regexEscape(L.P)}f[\\s/>]`);
+  const cTag = Buffer.from(`<${L.P}c`);
+  const seen = new Set<number>();
+  // The needle is the attribute NAME only: XML allows spaces around '=' (`si = "0"`), parseXmlAttrs reads the value.
+  for (const needle of ['si']) {
+    await forEachOccurrence(buf, Buffer.from(needle), L.sdOpenEnd, L.sdClose, onYield, (at) => {
+      const lt = buf.lastIndexOf(0x3c, at);
+      if (seen.has(lt)) return;
+      const gt = buf.indexOf(0x3e, at);
+      if (lt < 0 || gt < 0 || !isXmlNameEnd(buf[at - 1])) return;
+      const tag = buf.toString('utf8', lt, gt + 1);
+      if (!fTag.test(tag)) return;
+      const attrs = parseXmlAttrs(tag);
+      if (xmlAttrText(attrs, 't') !== 'shared' || xmlAttrText(attrs, 'si') !== si) return;
+      seen.add(lt);
+      let cs = buf.lastIndexOf(cTag, lt);
+      while (cs >= 0 && !isXmlNameEnd(buf[cs + cTag.length])) cs = buf.lastIndexOf(cTag, cs - 1);
+      const cellTag = cs >= 0 ? buf.toString('latin1', cs, buf.indexOf(0x3e, cs) + 1) : '';
+      const ref = CELL_REF_ATTR_RE.exec(cellTag);
+      if (!ref) throw new PatchError(`${L.where} has a shared formula in a cell without a reference`);
+      let formula = '';
+      if (buf[gt - 1] !== 0x2f) {
+        const close = buf.indexOf(`</${L.P}f>`, gt);
+        formula = xmlUnescape(buf.toString('utf8', gt + 1, close));
+      }
+      out.push({ r: parseInt(ref[2], 10) - 1, c: colToIndex(ref[1]), master: attrs.has('ref'), formula });
+    });
+  }
+  return out;
+}
+
+const VALUE_ERRORS = new Set(['#NULL!', '#DIV/0!', '#VALUE!', '#REF!', '#NAME?', '#NUM!', '#N/A', '#GETTING_DATA']);
+const CACHED_ERRORS = new Set([...VALUE_ERRORS, '#SPILL!', '#CALC!', '#FIELD!', '#BLOCKED!', '#CONNECT!', '#BUSY!', '#UNKNOWN!', '#EXTERNAL!', '#PYTHON!']);
+
+/** What the cell patchers of one sheet share: prefix, lazy sharedStrings / styles, array ranges, de-share bookkeeping. */
+interface CellPatchContext {
+  P: string;
+  where: string;
+  /** undefined = the file has no sharedStrings part: strings are written inline. */
+  sst(): SharedStringsPatch | undefined;
+  styles(): StylesPatch;
+  arrays: readonly { range: Range; ref: string }[];
+  /** Shared-formula masters whose content a patch replaced (checked against their clones after the walk). */
+  masters: { si: string; addr: string }[];
+}
+
+function numberText(value: number, where: string): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw new PatchError(`${where}: not a finite number`);
+  // Excel stores 0 for anything below its smallest normal number: refuse instead of changing the value silently.
+  if (value !== 0 && Math.abs(value) < 2.2250738585072014e-308) throw new PatchError(`${where}: the number is too small for Excel`);
+  return String(value);
+}
+
+/** Longest text of one Excel cell. */
+const XLSX_MAX_TEXT_CHARS = 32_767;
+
+/**
+ * Why Excel would remove or repair this formula (file syntax), or undefined. Checks only what is certain: the length
+ * limit, an unterminated quote and unbalanced parentheses (quotes and [brackets] are skipped).
+ */
+function formulaSyntaxProblem(formula: string): string | undefined {
+  if (formula.length > FX_MAX_FORMULA_CHARS) return `the formula is longer than ${FX_MAX_FORMULA_CHARS} characters, the limit of Excel`;
+  let depth = 0;
+  for (let i = 0; i < formula.length; i++) {
+    const ch = formula[i];
+    if (ch === '"' || ch === "'") {
+      let j = i + 1;
+      for (; j < formula.length; j++) {
+        if (formula[j] !== ch) continue;
+        if (formula[j + 1] === ch) j++; // a doubled quote is a quote character
+        else break;
+      }
+      if (j >= formula.length) return 'the formula has a quote that is not closed';
+      i = j;
+    } else if (ch === '[') {
+      let level = 1;
+      i++;
+      for (; i < formula.length && level > 0; i++) {
+        if (formula[i] === '[') level++;
+        else if (formula[i] === ']') level--;
+      }
+      i--;
+    } else if (ch === '(') {
+      depth++;
+    } else if (ch === ')' && --depth < 0) {
+      return 'the formula has a closing parenthesis without an opening one';
+    }
+  }
+  return depth > 0 ? 'the formula has an opening parenthesis that is not closed' : undefined;
+}
+
+/** <v> (and the t attribute) for a value, or for the cached result of a formula (`cached` = true). */
+function valueXml(value: FileValue, attrs: Map<string, XmlAttr>, ctx: CellPatchContext, where: string, cached: boolean): string {
+  const P = ctx.P;
+  switch (value.t) {
+    case 'n':
+      return `<${P}v>${numberText(value.v, where)}</${P}v>`;
+    case 'b':
+      if (typeof value.v !== 'boolean') throw new PatchError(`${where}: not a boolean`);
+      setXmlAttr(attrs, 't', 'b');
+      return `<${P}v>${value.v ? 1 : 0}</${P}v>`;
+    case 'e':
+      if (!(cached ? CACHED_ERRORS : VALUE_ERRORS).has(value.v)) throw new PatchError(`${where}: unknown error value ${String(value.v)}`);
+      setXmlAttr(attrs, 't', 'e');
+      return `<${P}v>${xmlEscapeText(value.v)}</${P}v>`;
+    case 's': {
+      if (typeof value.v !== 'string') throw new PatchError(`${where}: not a text`);
+      if (value.v.length > XLSX_MAX_TEXT_CHARS) throw new PatchError(`${where}: the text is longer than ${XLSX_MAX_TEXT_CHARS} characters, the limit of one Excel cell`);
+      if (cached) {
+        setXmlAttr(attrs, 't', 'str');
+        return `<${P}v>${escapeXstring(value.v, where)}</${P}v>`;
+      }
+      const sst = ctx.sst();
+      if (sst) {
+        setXmlAttr(attrs, 't', 's');
+        return `<${P}v>${sst.add(value.v, where)}</${P}v>`;
+      }
+      setXmlAttr(attrs, 't', 'inlineStr');
+      return `<${P}is><${P}t${needsSpacePreserve(value.v) ? ' xml:space="preserve"' : ''}>${escapeXstring(value.v, where)}</${P}t></${P}is>`;
+    }
+  }
+  throw new PatchError(`${where}: unknown value type`);
+}
+
+/**
+ * Applies one CellPatch to a cell (§4.3): value / clear keep `s`; a formula is written in file syntax with its
+ * cached <v>; a cached-only patch keeps the <f> element bytes; style deltas derive a new xf from the cell's xf (a
+ * new cell starts from its row/column style). Refused: content changes of a cell with `vm` (picture / linked data
+ * type) or inside a multi-cell array / data-table range. A shared-formula master is recorded for the de-share check.
+ */
+function applyCellPatch(oldXml: string | undefined, patch: CellPatch, r: number, c: number, inheritS: number, ctx: CellPatchContext): string | null {
+  const P = ctx.P;
+  const addr = indexToCol(c) + (r + 1);
+  const where = `${ctx.where}!${addr}`;
+  if (patch.value !== undefined && patch.formula !== undefined) throw new PatchError(`${where}: a value and a formula in one change`);
+  const content = patch.value !== undefined || patch.formula !== undefined;
+  let attrs = new Map<string, XmlAttr>();
+  let inner = '';
+  let children: XmlChild[] = [];
+  if (oldXml !== undefined) {
+    const gt = startTagEnd(oldXml);
+    attrs = parseXmlAttrs(oldXml.slice(0, gt + 1));
+    if (oldXml[gt - 1] !== '/') {
+      inner = oldXml.slice(gt + 1, oldXml.length - `</${P}c>`.length);
+      children = splitXmlChildren(inner, where);
+    }
+  }
+  setXmlAttr(attrs, 'r', addr);
+  const setStyle = (xf: number): void => {
+    if (xf === 0) attrs.delete('s');
+    else setXmlAttr(attrs, 's', String(xf));
+  };
+  if (patch.style?.length) {
+    const base = oldXml !== undefined ? Number(xmlAttrText(attrs, 's') ?? 0) : inheritS;
+    setStyle(ctx.styles().deriveXf(base, patch.style, where));
+  } else if (oldXml === undefined && inheritS > 0) {
+    setStyle(inheritS);
+  }
+  const formulaChild = children.find((child) => child.local === 'f');
+  const others = children.filter((child) => child.local !== 'f' && child.local !== 'v' && child.local !== 'is').map((child) => child.xml).join('');
+  let body: string;
+  if (content) {
+    if (attrs.has('vm')) throw new PatchError(`${where} holds a picture or linked data type. Edit it in Excel.`);
+    const array = ctx.arrays.find((a) => r >= a.range.r0 && r <= a.range.r1 && c >= a.range.c0 && c <= a.range.c1);
+    if (array) throw new PatchError(`${where} is part of an array formula (${array.ref}). Edit it in Excel.`);
+    if (formulaChild) {
+      const fAttrs = parseXmlAttrs(formulaChild.open);
+      if (xmlAttrText(fAttrs, 't') === 'shared' && fAttrs.has('ref')) ctx.masters.push({ si: xmlAttrText(fAttrs, 'si') ?? '', addr });
+    }
+    attrs.delete('t');
+    attrs.delete('cm');
+    attrs.delete('vm');
+    if (patch.formula !== undefined) {
+      const formula = patch.formula;
+      if (typeof formula !== 'string' || !formula || formula.startsWith('=') || XML_INVALID_CHAR_RE.test(formula)) {
+        throw new PatchError(`${where}: the formula must be in file syntax, without "=", and without control characters`);
+      }
+      const formulaProblem = formulaSyntaxProblem(formula);
+      if (formulaProblem) throw new PatchError(`${where}: ${formulaProblem}`);
+      body = `<${P}f>${xmlEscapeText(formula)}</${P}f>` + (patch.cached ? valueXml(patch.cached, attrs, ctx, where, true) : '');
+    } else {
+      body = patch.value ? valueXml(patch.value, attrs, ctx, where, false) : '';
+    }
+    body += others;
+  } else if (patch.cached !== undefined) {
+    if (!formulaChild) throw new PatchError(`${where} has no formula, so it cannot take a calculated value`);
+    attrs.delete('t');
+    body = formulaChild.xml + (patch.cached ? valueXml(patch.cached, attrs, ctx, where, true) : '') + others;
+  } else {
+    body = inner;
+  }
+  if (!body && !attrs.has('s') && inheritS === 0) return null; // an empty, unstyled cell is dropped
+  const tag = `<${P}c${emitXmlAttrs(attrs)}`;
+  return body ? `${tag}>${body}</${P}c>` : `${tag}/>`;
+}
+
+// ----- shared strings -----
+
+/** sharedStrings.xml, append-only: new strings get new indexes; count / uniqueCount are updated. */
+class SharedStringsPatch {
+  private readonly P: string;
+  private readonly baseCount: number;
+  private readonly added: string[] = [];
+  private readonly index = new Map<string, number>();
+
+  constructor(private readonly text: string, private readonly where: string) {
+    this.P = xmlRootPrefix(text, 'sst', where);
+    let n = 0;
+    const tag = `<${this.P}si`;
+    for (let p = text.indexOf(tag); p >= 0; p = text.indexOf(tag, p + tag.length)) {
+      if (isXmlNameEnd(text.charCodeAt(p + tag.length))) n++;
+    }
+    this.baseCount = n;
+  }
+
+  add(value: string, where: string): number {
+    const known = this.index.get(value);
+    if (known !== undefined) return known;
+    const P = this.P;
+    const i = this.baseCount + this.added.length;
+    this.added.push(`<${P}si><${P}t${needsSpacePreserve(value) ? ' xml:space="preserve"' : ''}>${escapeXstring(value, where)}</${P}t></${P}si>`);
+    this.index.set(value, i);
+    return i;
+  }
+
+  get changed(): boolean {
+    return this.added.length > 0;
+  }
+
+  toString(): string {
+    const P = this.P;
+    const m = new RegExp(`<${regexEscape(P)}sst\\b[^>]*>`).exec(this.text);
+    if (!m) throw new PatchError(`${this.where} is damaged`);
+    let open = m[0];
+    open = open.replace(/(\suniqueCount\s*=\s*)(["'])\d*\2/, (_, pre: string, q: string) => `${pre}${q}${this.baseCount + this.added.length}${q}`);
+    open = open.replace(/(\scount\s*=\s*)(["'])(\d*)\2/, (_, pre: string, q: string, n: string) => `${pre}${q}${Number(n) + this.added.length}${q}`);
+    const after = m.index + m[0].length;
+    if (open.endsWith('/>')) {
+      return this.text.slice(0, m.index) + open.slice(0, -2).replace(/\s+$/, '') + '>' + this.added.join('') + `</${P}sst>` + this.text.slice(after);
+    }
+    const close = this.text.lastIndexOf(`</${P}sst>`);
+    if (close < after) throw new PatchError(`${this.where} is damaged`);
+    // New <si> go after the last existing <si>: the schema puts <extLst> last.
+    const ext = this.text.slice(after, close).search(new RegExp(`<${regexEscape(P)}extLst\\b`));
+    const at = ext >= 0 ? after + ext : close;
+    return this.text.slice(0, m.index) + open + this.text.slice(after, at) + this.added.join('') + this.text.slice(at);
+  }
+}
+
+// ----- styles -----
+
+type StyleSectionName = 'numFmts' | 'fonts' | 'fills' | 'borders' | 'cellXfs';
+
+interface StyleSection {
+  start: number;
+  openEnd: number;
+  closeStart: number;
+  end: number;
+  open: string;
+  items: string[];
+  selfClosing: boolean;
+}
+
+const FONT_CHILD_ORDER = ['b', 'i', 'strike', 'condense', 'extend', 'outline', 'shadow', 'u', 'vertAlign', 'sz', 'color', 'name', 'family', 'charset', 'scheme'];
+const BORDER_CHILD_ORDER = ['start', 'end', 'left', 'right', 'top', 'bottom', 'diagonal', 'vertical', 'horizontal'];
+const XF_CHILD_ORDER = ['alignment', 'protection', 'extLst'];
+const DELTA_BORDER_STYLES: ReadonlySet<string> = new Set(['thin', 'medium', 'thick', 'dashed', 'dotted', 'double', 'hair']);
+const ARGB_RE = /^[0-9A-Fa-f]{8}$/;
+/** Built-in number formats that may be used by id (locale-independent ones only). */
+const BUILTIN_NUMFMT_IDS: Record<string, number> = { General: 0, '0': 1, '0.00': 2, '#,##0': 3, '#,##0.00': 4, '0%': 9, '0.00%': 10, '0.00E+00': 11, '# ?/?': 12, '# ??/??': 13, '@': 49 };
+/** Excel refuses more cell formats than this. */
+const MAX_CELL_XFS = 64000;
+
+/** The children of a container element of styles.xml (for example the <font> items of <fonts>). */
+function styleSection(text: string, P: string, container: StyleSectionName, child: string, where: string): StyleSection | undefined {
+  const m = new RegExp(`<${regexEscape(P)}${container}(?:\\s[^>]*?)?(/?)>`).exec(text);
+  if (!m) return undefined;
+  const start = m.index;
+  const openEnd = start + m[0].length;
+  if (m[1] === '/') return { start, openEnd, closeStart: openEnd, end: openEnd, open: m[0], items: [], selfClosing: true };
+  const closeTag = `</${P}${container}>`;
+  const closeStart = text.indexOf(closeTag, openEnd);
+  if (closeStart < 0) throw new PatchError(`${where} is damaged (<${container}>)`);
+  const body = text.slice(openEnd, closeStart);
+  const items: string[] = [];
+  const tag = `<${P}${child}`;
+  const endTag = `</${P}${child}>`;
+  for (let p = 0; ;) {
+    const i = body.indexOf(tag, p);
+    if (i < 0) break;
+    if (!isXmlNameEnd(body.charCodeAt(i + tag.length))) {
+      p = i + tag.length;
+      continue;
+    }
+    const gt = body.indexOf('>', i);
+    const end = body[gt - 1] === '/' ? gt + 1 : body.indexOf(endTag, gt) + endTag.length;
+    if (gt < 0 || end < gt) throw new PatchError(`${where} is damaged (<${child}>)`);
+    items.push(body.slice(i, end));
+    p = end;
+  }
+  return { start, openEnd, closeStart, end: closeStart + closeTag.length, open: m[0], items, selfClosing: false };
+}
+
+/** Later deltas override earlier ones property by property (every StyleDelta property is an absolute "set"). */
+function mergeStyleDeltas(deltas: readonly StyleDelta[]): StyleDelta {
+  const out: StyleDelta = {};
+  for (const delta of deltas) {
+    const border = delta.border ? { ...out.border, ...delta.border } : out.border;
+    Object.assign(out, delta);
+    if (border) out.border = border;
+  }
+  return out;
+}
+
+/** styles.xml, append-only: derived fonts / fills / borders / number formats / cell xfs are added (deduplicated). */
+class StylesPatch {
+  private readonly P: string;
+  private readonly sec: Record<StyleSectionName, StyleSection | undefined>;
+  private readonly added: Record<StyleSectionName, string[]> = { numFmts: [], fonts: [], fills: [], borders: [], cellXfs: [] };
+  private readonly memo = new Map<string, number>();
+  /** Highest numFmtId used anywhere in the part (numFmts, xfs, dxfs): a new custom format gets a higher id. */
+  private readonly maxNumFmtId: number;
+
+  constructor(private readonly text: string, private readonly where: string) {
+    let maxId = 163;
+    for (const m of text.matchAll(/\snumFmtId\s*=\s*["'](\d+)["']/g)) maxId = Math.max(maxId, Number(m[1]));
+    this.maxNumFmtId = maxId;
+    const P = (this.P = xmlRootPrefix(text, 'styleSheet', where));
+    this.sec = {
+      numFmts: styleSection(text, P, 'numFmts', 'numFmt', where),
+      fonts: styleSection(text, P, 'fonts', 'font', where),
+      fills: styleSection(text, P, 'fills', 'fill', where),
+      borders: styleSection(text, P, 'borders', 'border', where),
+      cellXfs: styleSection(text, P, 'cellXfs', 'xf', where),
+    };
+    if (!this.sec.fonts || !this.sec.fills || !this.sec.cellXfs) throw new PatchError(`${where} has no fonts, fills or cell formats`);
+  }
+
+  private count(name: StyleSectionName): number {
+    return (this.sec[name]?.items.length ?? 0) + this.added[name].length;
+  }
+
+  private item(name: StyleSectionName, i: number): string | undefined {
+    const base = this.sec[name]?.items ?? [];
+    return i < base.length ? base[i] : this.added[name][i - base.length];
+  }
+
+  /** Index of an item with exactly this XML, appending it when there is none. */
+  private push(name: StyleSectionName, xml: string): number {
+    const base = this.sec[name]?.items ?? [];
+    const found = base.indexOf(xml);
+    if (found >= 0) return found;
+    const added = this.added[name].indexOf(xml);
+    if (added >= 0) return base.length + added;
+    this.added[name].push(xml);
+    return this.count(name) - 1;
+  }
+
+  /** The xf that is xf `base` with the deltas applied (in order). Existing xfs never change. */
+  deriveXf(base: number, deltas: readonly StyleDelta[], where: string): number {
+    const key = `${base}|${JSON.stringify(deltas)}`;
+    const memo = this.memo.get(key);
+    if (memo !== undefined) return memo;
+    const P = this.P;
+    const xfXml = Number.isInteger(base) && base >= 0 ? this.item('cellXfs', base) : undefined;
+    if (xfXml === undefined) throw new PatchError(`${where}: the cell format ${base} does not exist`);
+    const d = mergeStyleDeltas(deltas);
+    const xf = parseXmlElement(xfXml, this.where);
+    const idOf = (name: string): number => Number(xmlAttrText(xf.attrs, name) ?? 0);
+    if (d.bold !== undefined || d.italic !== undefined || d.underline !== undefined || d.strike !== undefined || d.fontColor !== undefined) {
+      const fontXml = this.item('fonts', idOf('fontId'));
+      if (fontXml === undefined) throw new PatchError(`${where}: the font ${idOf('fontId')} does not exist`);
+      const font = parseXmlElement(fontXml, this.where);
+      const flag = (local: string, on: boolean | undefined): void => {
+        if (on !== undefined) setXmlChild(font, local, on ? `<${P}${local}/>` : null, FONT_CHILD_ORDER);
+      };
+      flag('b', d.bold);
+      flag('i', d.italic);
+      flag('strike', d.strike);
+      if (d.underline !== undefined) {
+        if (d.underline !== null && d.underline !== 'single' && d.underline !== 'double') throw new PatchError(`${where}: unknown underline`);
+        setXmlChild(font, 'u', d.underline === null ? null : d.underline === 'double' ? `<${P}u val="double"/>` : `<${P}u/>`, FONT_CHILD_ORDER);
+      }
+      if (d.fontColor !== undefined) {
+        if (d.fontColor !== null && !ARGB_RE.test(d.fontColor)) throw new PatchError(`${where}: invalid font colour`);
+        setXmlChild(font, 'color', d.fontColor === null ? null : `<${P}color rgb="${d.fontColor.toUpperCase()}"/>`, FONT_CHILD_ORDER);
+      }
+      setXmlAttr(xf.attrs, 'fontId', String(this.push('fonts', buildXmlElement(font))));
+      setXmlAttr(xf.attrs, 'applyFont', '1');
+    }
+    if (d.fill !== undefined) {
+      if (d.fill !== null && !ARGB_RE.test(d.fill)) throw new PatchError(`${where}: invalid fill colour`);
+      let fillId: number;
+      if (d.fill === null) {
+        const first = this.item('fills', 0) ?? '';
+        fillId = /patternType\s*=\s*["']none["']/.test(first) ? 0 : this.push('fills', `<${P}fill><${P}patternFill patternType="none"/></${P}fill>`);
+      } else {
+        fillId = this.push('fills', `<${P}fill><${P}patternFill patternType="solid"><${P}fgColor rgb="${d.fill.toUpperCase()}"/><${P}bgColor indexed="64"/></${P}patternFill></${P}fill>`);
+      }
+      setXmlAttr(xf.attrs, 'fillId', String(fillId));
+      setXmlAttr(xf.attrs, 'applyFill', '1');
+    }
+    if (d.border) {
+      const borderXml = this.item('borders', idOf('borderId'));
+      if (borderXml === undefined) throw new PatchError(`${where}: the border ${idOf('borderId')} does not exist`);
+      const border = parseXmlElement(borderXml, this.where);
+      for (const side of ['left', 'right', 'top', 'bottom'] as const) {
+        const value = d.border[side];
+        if (value === undefined) continue;
+        if (value !== null && (!DELTA_BORDER_STYLES.has(value.style) || (value.color !== undefined && !ARGB_RE.test(value.color)))) {
+          throw new PatchError(`${where}: invalid border`);
+        }
+        const xml = value === null
+          ? `<${P}${side}/>`
+          : value.color
+            ? `<${P}${side} style="${value.style}"><${P}color rgb="${value.color.toUpperCase()}"/></${P}${side}>`
+            : `<${P}${side} style="${value.style}"/>`;
+        setXmlChild(border, side, xml, BORDER_CHILD_ORDER);
+      }
+      setXmlAttr(xf.attrs, 'borderId', String(this.push('borders', buildXmlElement(border))));
+      setXmlAttr(xf.attrs, 'applyBorder', '1');
+    }
+    if (d.hAlign !== undefined || d.vAlign !== undefined || d.wrap !== undefined) {
+      const current = xf.children.find((child) => child.local === 'alignment');
+      const align = current ? parseXmlAttrs(current.open) : new Map<string, XmlAttr>();
+      if (d.hAlign !== undefined) {
+        if (d.hAlign !== null && !['left', 'center', 'right', 'justify'].includes(d.hAlign)) throw new PatchError(`${where}: invalid alignment`);
+        if (d.hAlign === null) align.delete('horizontal');
+        else setXmlAttr(align, 'horizontal', d.hAlign);
+      }
+      if (d.vAlign !== undefined) {
+        if (d.vAlign !== null && !['top', 'center', 'bottom'].includes(d.vAlign)) throw new PatchError(`${where}: invalid alignment`);
+        if (d.vAlign === null) align.delete('vertical');
+        else setXmlAttr(align, 'vertical', d.vAlign);
+      }
+      if (d.wrap !== undefined) {
+        if (d.wrap) setXmlAttr(align, 'wrapText', '1');
+        else align.delete('wrapText');
+      }
+      setXmlChild(xf, 'alignment', align.size ? `<${P}alignment${emitXmlAttrs(align)}/>` : null, XF_CHILD_ORDER);
+      setXmlAttr(xf.attrs, 'applyAlignment', '1');
+    }
+    if (d.numFmt !== undefined) {
+      setXmlAttr(xf.attrs, 'numFmtId', String(this.numFmtId(d.numFmt, where)));
+      setXmlAttr(xf.attrs, 'applyNumberFormat', '1');
+    }
+    if (d.quotePrefix !== undefined) {
+      if (d.quotePrefix) setXmlAttr(xf.attrs, 'quotePrefix', '1');
+      else xf.attrs.delete('quotePrefix');
+    }
+    const index = this.push('cellXfs', buildXmlElement(xf));
+    if (index >= MAX_CELL_XFS) throw new PatchError(`${where}: the file has too many cell formats`);
+    this.memo.set(key, index);
+    return index;
+  }
+
+  /**
+   * Id of a number format code: an existing <numFmt> with that code, a built-in id, or a new id ≥ 164 that no part of
+   * styles.xml uses yet (an xf may name a custom id that has no <numFmt>; reusing it would change those cells).
+   */
+  private numFmtId(code: string, where: string): number {
+    if (typeof code !== 'string' || !code || code.length > 255 || XML_INVALID_CHAR_RE.test(code)) throw new PatchError(`${where}: invalid number format`);
+    const items = (this.sec.numFmts?.items ?? []).concat(this.added.numFmts);
+    const ids = new Set<number>();
+    for (const item of items) {
+      const attrs = parseXmlAttrs(item);
+      const id = Number(xmlAttrText(attrs, 'numFmtId'));
+      if (xmlAttrText(attrs, 'formatCode') === code && Number.isInteger(id)) return id;
+      if (Number.isInteger(id)) ids.add(id);
+    }
+    const builtin = Object.hasOwn(BUILTIN_NUMFMT_IDS, code) ? BUILTIN_NUMFMT_IDS[code] : undefined;
+    if (builtin !== undefined && !ids.has(builtin)) return builtin;
+    const id = Math.max(this.maxNumFmtId, ...ids) + 1;
+    this.added.numFmts.push(`<${this.P}numFmt numFmtId="${id}" formatCode="${xmlEscapeAttr(code)}"/>`);
+    return id;
+  }
+
+  get changed(): boolean {
+    return Object.values(this.added).some((list) => list.length > 0);
+  }
+
+  toString(): string {
+    const P = this.P;
+    let text = this.text;
+    const withCount = (open: string, total: number): string =>
+      /\scount\s*=/.test(open) ? open.replace(/(\scount\s*=\s*)(["'])\d*\2/, (_, pre: string, q: string) => `${pre}${q}${total}${q}`) : open.replace(/\s*(\/?)>$/, ` count="${total}"$1>`);
+    // Apply from the end of the text backwards, so the offsets of earlier sections stay valid.
+    const names = (Object.keys(this.sec) as StyleSectionName[]).filter((name) => this.sec[name] && this.added[name].length);
+    names.sort((a, b) => (this.sec[b]?.start ?? 0) - (this.sec[a]?.start ?? 0));
+    for (const name of names) {
+      const s = this.sec[name];
+      if (!s) continue;
+      const open = withCount(s.open, s.items.length + this.added[name].length);
+      const items = this.added[name].join('');
+      text = s.selfClosing
+        ? text.slice(0, s.start) + open.slice(0, -2).replace(/\s+$/, '') + '>' + items + `</${P}${name}>` + text.slice(s.end)
+        : text.slice(0, s.start) + open + text.slice(s.openEnd, s.closeStart) + items + text.slice(s.closeStart);
+    }
+    if (!this.sec.numFmts && this.added.numFmts.length) {
+      const m = new RegExp(`<${regexEscape(P)}styleSheet\\b[^>]*>`).exec(text);
+      if (!m) throw new PatchError(`${this.where} is damaged`);
+      const at = m.index + m[0].length;
+      text = text.slice(0, at) + `<${P}numFmts count="${this.added.numFmts.length}">${this.added.numFmts.join('')}</${P}numFmts>` + text.slice(at);
+    }
+    return text;
+  }
+}
+
+// ----- workbook -----
+
+/** CT_Workbook children that come after <calcPr> (where a missing calcPr is inserted). */
+const AFTER_CALC_PR = ['oleSize', 'customWorkbookViews', 'pivotCaches', 'smartTagPr', 'smartTagTypes', 'webPublishing', 'fileRecoveryPr', 'webPublishObjects', 'extLst'];
+
+/** <calcPr fullCalcOnLoad="1"> with every other calc setting kept; calcPr is inserted in schema order when missing. */
+function setFullCalcOnLoad(text: string, where: string): string {
+  const P = xmlRootPrefix(text, 'workbook', where);
+  const m = new RegExp(`<${regexEscape(P)}calcPr\\b[^>]*>`).exec(text);
+  if (m) {
+    const tag = m[0];
+    const flag = /(\sfullCalcOnLoad\s*=\s*)(["'])([^"']*)\2/.exec(tag);
+    if (flag && (flag[3] === '1' || flag[3] === 'true')) return text;
+    const next = flag ? tag.replace(flag[0], `${flag[1]}${flag[2]}1${flag[2]}`) : tag.replace(/\s*(\/?)>$/, ' fullCalcOnLoad="1"$1>');
+    return text.slice(0, m.index) + next + text.slice(m.index + tag.length);
+  }
+  let at = text.lastIndexOf(`</${P}workbook>`);
+  if (at < 0) throw new PatchError(`${where} is damaged`);
+  for (const name of AFTER_CALC_PR) {
+    const i = text.search(new RegExp(`<${regexEscape(P)}${name}[\\s/>]`));
+    if (i >= 0 && i < at) at = i;
+  }
+  return text.slice(0, at) + `<${P}calcPr fullCalcOnLoad="1"/>` + text.slice(at);
+}
+
+/** Removes the elements `<Name …/>` / `<Name …>…</Name>` (any prefix) for which `drop(attrs)` is true. */
+function removeXmlElements(text: string, name: string, drop: (attrs: Map<string, XmlAttr>) => boolean): string {
+  const re = new RegExp(`<((?:[\\w.-]+:)?)${name}\\b[^>]*?(?:/>|>[\\s\\S]*?</\\1${name}>)`, 'g');
+  return text.replace(re, (element: string) => (drop(parseXmlAttrs(element.slice(0, element.indexOf('>') + 1))) ? '' : element));
+}
+
+/** [Content_Types].xml and workbook rels without the calcChain parts. */
+function dropCalcChainRefs(ctXml: string, wbRelsXml: string, wbPath: string, chainPaths: readonly string[]): { ctXml: string; wbRelsXml: string } {
+  const names = new Set(chainPaths.map((path) => path.toLowerCase()));
+  return {
+    ctXml: removeXmlElements(ctXml, 'Override', (attrs) => names.has(resolvePartTarget('', xmlAttrText(attrs, 'PartName') ?? '').toLowerCase())),
+    wbRelsXml: removeXmlElements(wbRelsXml, 'Relationship', (attrs) =>
+      xmlAttrText(attrs, 'TargetMode') !== 'External' && names.has(resolvePartTarget(wbPath, xmlAttrText(attrs, 'Target') ?? '').toLowerCase())),
+  };
+}
+
+// ===== XLSX SAVE =====
+//
+// Surgical xlsx save (P1, D-006; contract §2.3, §4.2). buildXlsx = the loaded bytes (`base`) + the PackageOps of the
+// journal: only the touched parts are rewritten, every other zip entry is copied byte for byte. verifyXlsx checks the
+// new bytes before anything is written (V1 zip, V2 XML, V3 read-back, V4 reload with the loader); checkPatchable tells
+// at load whether a file can be saved this way at all (else it is hard read-only, §4.7). ExcelJS never writes a file.
+
+
+export interface SaveReport {
+  changedParts: string[];
+  removedParts: string[];
+  identicalParts: number;
+  timings: Record<string, number>;
+}
+
+/**
+ * What one saved cell must hold (V3/V4). The expected value and formula come from the display model (§4.2 step 4).
+ * Content is checked when `value` or `formula` is given: `formula` absent = the cell has no formula; `value` with a
+ * formula = its cached value (absent = not checked); `value: null` = no value. `styleIndex` = the xf index (s).
+ */
+export interface CellExpectation {
+  sheet: number;
+  r: number;
+  c: number;
+  value?: FileValue | null;
+  formula?: string;
+  styleIndex?: number;
+}
+
+/** A check of the new bytes failed (§4.2 step 4): nothing is written, the edits are kept. */
+export class SaveVerifyError extends Error {
+  constructor(readonly step: 'V1' | 'V2' | 'V3' | 'V4', message: string) {
+    super(`${step}: ${message}`);
+    this.name = 'SaveVerifyError';
+  }
+}
+
+/** Rewritten parts up to this size are parsed whole in V2; bigger cell-patched sheet parts are checked row by row. (An object so tests can lower it.) */
+export const verifyTuning = { fullParseBytes: 32 << 20 };
+/** V4 (reload with the loader) runs for files up to this size unless the caller says otherwise (D-008). */
+export const VERIFY_DEEP_MAX_BYTES = 10 << 20;
+/** V4 also needs a modest sharedStrings part: text-heavy workbooks compress 25:1, a 3.7 MB file can hold 95 MB of strings. */
+export const VERIFY_DEEP_MAX_SST_BYTES = 32 << 20;
+
+/** Whether V4 (a synchronous ExcelJS reload) may run: the zip is small AND its parts are small once unpacked. */
+export function deepVerifyAllowed(bytes: Uint8Array): boolean {
+  if (bytes.length > VERIFY_DEEP_MAX_BYTES) return false;
+  try {
+    return !parseZip(bytes).entries.some((e) => /sharedStrings[^/]*$/i.test(e.name) && e.usize > VERIFY_DEEP_MAX_SST_BYTES);
+  } catch {
+    return false; // V1 reports a damaged zip
+  }
+}
+/** Most rows walked between two yields to the event loop (a walk also yields after SAVE_SLICE_MS, see saveSlicer). */
+const SAVE_YIELD_ROWS = 10_000;
+/** Text decoded and parsed between two yields in V2. */
+const VERIFY_PARSE_CHUNK = 256 << 10;
+
+const WORKSHEET_REL_RE = /\/worksheet$/;
+
+function saveNow(): number {
+  return performance.now();
+}
+
+/** Cell content patch (value or formula), as opposed to style-only or cached-only patches. */
+function isContentPatch(patch: CellPatch): boolean {
+  return patch.value !== undefined || patch.formula !== undefined;
+}
+
+/**
+ * Header cells of the tables of a sheet as {r0, r1, c0, c1} boxes (0-based, inclusive). Excel needs the header text to
+ * equal the tableColumn name and repairs the file otherwise, so a content patch there is refused (defense in depth,
+ * the edit layer blocks these cells too).
+ */
+async function tableHeaderBoxes(pkg: XlsxPackage, sheetPart: string, onYield?: SaveYieldHook): Promise<{ r0: number; r1: number; c0: number; c1: number }[]> {
+  const out: { r0: number; r1: number; c0: number; c1: number }[] = [];
+  const relsPath = entryNameOf(pkg.zip, relsPartOf(sheetPart));
+  const relsXml = relsPath ? await readPartText(pkg.zip, relsPath, onYield) : undefined;
+  if (!relsXml) return out;
+  for (const rel of parseRels(relsXml)) {
+    if (rel.external || !/\/table$/.test(rel.type)) continue;
+    const tablePath = entryNameOf(pkg.zip, resolvePartTarget(sheetPart, rel.target));
+    const xml = tablePath ? await readPartText(pkg.zip, tablePath, onYield) : undefined;
+    const tag = xml ? /<(?:[\w.-]+:)?table\b[^>]*>/.exec(xml)?.[0] : undefined;
+    if (!tag) continue;
+    const attrs = parseXmlAttrs(tag);
+    const m = /^\$?([A-Za-z]{1,3})\$?(\d+)(?::\$?([A-Za-z]{1,3})\$?(\d+))?$/.exec((xmlAttrText(attrs, 'ref') ?? '').trim());
+    if (!m) continue;
+    const headerRows = xmlAttrText(attrs, 'headerRowCount') === undefined ? 1 : Number(xmlAttrText(attrs, 'headerRowCount'));
+    if (!(headerRows > 0)) continue;
+    const r0 = parseInt(m[2], 10) - 1;
+    out.push({ r0, r1: r0 + headerRows - 1, c0: colToIndex(m[1].toUpperCase()), c1: colToIndex((m[3] ?? m[1]).toUpperCase()) });
+  }
+  return out;
+}
+
+/**
+ * Cells written outside the old <dimension ref>: widen it (Excel does not care, readers that trust the dimension do).
+ * The head of the part (everything before <sheetData>) is always inside parts[0].
+ */
+function widenDimension(parts: Buffer[], L: SheetXmlLayout, rows: Map<number, Map<number, CellPatch[]>>): void {
+  let r0 = Infinity;
+  let r1 = -1;
+  let c0 = Infinity;
+  let c1 = -1;
+  for (const [r, cols] of rows) {
+    for (const [c, list] of cols) {
+      if (!list.some((p) => isContentPatch(p) && p.value !== null)) continue;
+      r0 = Math.min(r0, r);
+      r1 = Math.max(r1, r);
+      c0 = Math.min(c0, c);
+      c1 = Math.max(c1, c);
+    }
+  }
+  if (r1 < 0 || parts[0].length < L.sdOpen) return;
+  const head = parts[0].toString('utf8', 0, L.sdOpen);
+  const re = new RegExp(`<${regexEscape(L.P)}dimension\\b[^>]*>`);
+  const tag = re.exec(head)?.[0];
+  if (!tag) return;
+  const attrs = parseXmlAttrs(tag);
+  const m = /^\$?([A-Za-z]{1,3})\$?(\d+)(?::\$?([A-Za-z]{1,3})\$?(\d+))?$/.exec((xmlAttrText(attrs, 'ref') ?? '').trim());
+  if (!m) return;
+  const a0 = colToIndex(m[1].toUpperCase());
+  const a1 = colToIndex((m[3] ?? m[1]).toUpperCase());
+  const b0 = parseInt(m[2], 10) - 1;
+  const b1 = parseInt(m[4] ?? m[2], 10) - 1;
+  const n0 = Math.min(a0, c0);
+  const n1 = Math.max(a1, c1);
+  const q0 = Math.min(b0, r0);
+  const q1 = Math.max(b1, r1);
+  if (n0 === a0 && n1 === a1 && q0 === b0 && q1 === b1) return;
+  const ref = `${indexToCol(n0)}${q0 + 1}:${indexToCol(n1)}${q1 + 1}`;
+  const newTag = tag.replace(/(\sref\s*=\s*)("[^"]*"|'[^']*')/, `$1"${ref}"`);
+  parts[0] = Buffer.concat([Buffer.from(head.replace(tag, () => newTag), 'utf8'), parts[0].subarray(L.sdOpen)]);
+}
+
+function sheetLabel(sheet: XlsxSheetRef): string {
+  return sheet.name || `sheet ${sheet.sheetId}`;
+}
+
+/** The worksheet with this sheetId (PatchError when there is none or it is not a worksheet, e.g. a chart sheet). */
+function worksheetOf(pkg: XlsxPackage, sheetId: number): XlsxSheetRef & { part: string } {
+  const sheet = pkg.sheets.find((s) => s.sheetId === sheetId);
+  if (!sheet) throw new PatchError(`the workbook has no sheet with id ${sheetId}`);
+  if (!WORKSHEET_REL_RE.test(sheet.type)) throw new PatchError(`the sheet "${sheetLabel(sheet)}" is not a worksheet`);
+  if (!sheet.part || !pkg.zip.get(sheet.part)) throw new PatchError(`the part of the sheet "${sheetLabel(sheet)}" is missing`);
+  return sheet as XlsxSheetRef & { part: string };
+}
+
+/**
+ * The new package for `base` with `ops` applied (§4.2 step 3). Only `cells` ops exist in P1 (others throw PatchError
+ * until P4). No ops, or ops that change nothing, return `base` itself: an unmodified workbook is never re-serialized.
+ * Throws ZipError / PatchError when the package cannot be patched safely (nothing is written). Cooperative: yields
+ * every `yieldEvery` rows, 8 MB of CRC and between parts; `onYield` runs at every yield and may throw to cancel.
+ */
+export async function buildXlsx(
+  base: Uint8Array,
+  ops: readonly PackageOp[],
+  o?: { yieldEvery?: number; onYield?: SaveYieldHook },
+): Promise<{ bytes: Uint8Array; report: SaveReport }> {
+  const t0 = saveNow();
+  const timings: Record<string, number> = {};
+  const lap = (name: string, from: number): number => {
+    const now = saveNow();
+    timings[name] = (timings[name] ?? 0) + (now - from);
+    return now;
+  };
+  const unchanged = (identical: number): { bytes: Uint8Array; report: SaveReport } => {
+    timings.total = saveNow() - t0;
+    return { bytes: base, report: { changedParts: [], removedParts: [], identicalParts: identical, timings } };
+  };
+  if (!ops.length) {
+    let identical = 0;
+    try {
+      identical = parseZip(base).entries.length;
+    } catch {
+      // Save As of a clean, unpatchable (hard read-only) file: base is written as it is.
+    }
+    return unchanged(identical);
+  }
+  const onYield = o?.onYield;
+  const yieldEvery = Math.max(1, Math.floor(o?.yieldEvery ?? SAVE_YIELD_ROWS));
+  let t = t0;
+  const zip = parseZip(base);
+  const pkg = await openXlsxPackage(zip, onYield);
+  if (pkg.strict) throw new PatchError('it uses Strict Open XML');
+  // Group the cell patches per sheet and cell, in op order (later patches apply on top of earlier ones).
+  const bySheet = new Map<number, Map<number, Map<number, CellPatch[]>>>();
+  let needSst = false;
+  let needStyles = false;
+  for (const op of ops) {
+    if (op.kind !== 'cells') throw new PatchError(`saving "${op.kind}" changes is not supported yet`);
+    let rows = bySheet.get(op.sheet);
+    if (!rows) bySheet.set(op.sheet, (rows = new Map()));
+    for (const [r, c, patch] of op.cells) {
+      if (!Number.isInteger(r) || !Number.isInteger(c) || r < 0 || r >= MAX_ROWS || c < 0 || c >= MAX_COLS) {
+        throw new PatchError(`a change has an invalid cell position (${r}, ${c})`);
+      }
+      let cols = rows.get(r);
+      if (!cols) rows.set(r, (cols = new Map()));
+      let list = cols.get(c);
+      if (!list) cols.set(c, (list = []));
+      list.push(patch);
+      if (patch.value && patch.value.t === 's') needSst = true;
+      if (patch.style?.length) needStyles = true;
+    }
+  }
+  let sst: SharedStringsPatch | undefined;
+  if (needSst && pkg.sstPath) {
+    sst = new SharedStringsPatch((await readPartText(zip, pkg.sstPath, onYield)) ?? '', pkg.sstPath);
+  }
+  let styles: StylesPatch | undefined;
+  if (needStyles) {
+    if (!pkg.stylesPath) throw new PatchError('it has no styles part');
+    styles = new StylesPatch((await readPartText(zip, pkg.stylesPath, onYield)) ?? '', pkg.stylesPath);
+  }
+  t = lap('open', t);
+  const changes = new Map<string, readonly Uint8Array[] | null>();
+  for (const [sheetId, rows] of bySheet) {
+    const sheet = worksheetOf(pkg, sheetId);
+    const entry = zip.get(sheet.part);
+    if (!entry) throw new PatchError(`the part of the sheet "${sheetLabel(sheet)}" is missing`);
+    const buf = await readEntry(zip, entry, onYield);
+    t = lap('inflate', t);
+    const L = await sheetLayout(buf, `the sheet "${sheetLabel(sheet)}"`, onYield);
+    const contentCells = new Set<number>();
+    for (const [r, cols] of rows) {
+      for (const [c, list] of cols) if (list.some(isContentPatch)) contentCells.add(r * MAX_COLS + c);
+    }
+    if (contentCells.size) {
+      for (const box of await tableHeaderBoxes(pkg, sheet.part, onYield)) {
+        for (const key of contentCells) {
+          const r = Math.floor(key / MAX_COLS);
+          const c = key % MAX_COLS;
+          if (r >= box.r0 && r <= box.r1 && c >= box.c0 && c <= box.c1) {
+            throw new PatchError(`${sheetLabel(sheet)}!${indexToCol(c)}${r + 1} is a table header cell (Excel needs it to match the table column name)`);
+          }
+        }
+      }
+    }
+    const ctx: CellPatchContext = {
+      P: L.P,
+      where: sheetLabel(sheet),
+      sst: () => sst,
+      styles: () => {
+        if (!styles) throw new PatchError('the style table was not loaded');
+        return styles;
+      },
+      arrays: contentCells.size ? await findArrayRanges(buf, L, onYield) : [],
+      masters: [],
+    };
+    const fns = new Map<number, Map<number, CellPatchFn>>();
+    for (const [r, cols] of rows) {
+      const rowFns = new Map<number, CellPatchFn>();
+      for (const [c, list] of cols) {
+        rowFns.set(c, (oldXml, rr, cc, inheritS) => {
+          let xml = oldXml;
+          for (const patch of list) xml = applyCellPatch(xml, patch, rr, cc, inheritS, ctx) ?? undefined;
+          return xml ?? null;
+        });
+      }
+      fns.set(r, rowFns);
+    }
+    const res = await patchSheetCells(buf, L, fns, { yieldEvery, onYield });
+    // Defense in depth (D-068): a shared-formula master whose content changed must have no clone left that still
+    // points at it (P2 de-shares at plan time; a clone without its own new content would lose its formula).
+    for (const master of ctx.masters) {
+      for (const cell of await findSharedFormulaCells(buf, L, master.si, onYield)) {
+        if (!cell.master && !contentCells.has(cell.r * MAX_COLS + cell.c)) {
+          throw new PatchError(
+            `${ctx.where}!${master.addr} is the first cell of a shared formula that ${indexToCol(cell.c)}${cell.r + 1} still uses`,
+          );
+        }
+      }
+    }
+    if (res.changed) {
+      widenDimension(res.parts, L, rows);
+      changes.set(entry.name, res.parts);
+    }
+    t = lap('sheets', t);
+    await saveYield(onYield);
+  }
+  if (!changes.size) return unchanged(zip.entries.length);
+  if (sst?.changed && pkg.sstPath) changes.set(pkg.sstPath, [Buffer.from(sst.toString(), 'utf8')]);
+  if (styles?.changed && pkg.stylesPath) changes.set(pkg.stylesPath, [Buffer.from(styles.toString(), 'utf8')]);
+  t = lap('sharedStringsStyles', t);
+  // workbook: full calculation on load (cached values may be stale); the calc chain is dropped with its relationship
+  // and content type (a stale chain makes Excel repair the file; s2-save negative control).
+  const wbXml = setFullCalcOnLoad(pkg.wbXml, pkg.wbPath);
+  if (wbXml !== pkg.wbXml) changes.set(pkg.wbPath, [Buffer.from(wbXml, 'utf8')]);
+  if (pkg.calcChainPaths.length) {
+    const dropped = dropCalcChainRefs(pkg.ctXml, pkg.wbRelsXml, pkg.wbPath, pkg.calcChainPaths);
+    if (dropped.ctXml !== pkg.ctXml) changes.set('[Content_Types].xml', [Buffer.from(dropped.ctXml, 'utf8')]);
+    if (dropped.wbRelsXml !== pkg.wbRelsXml) changes.set(pkg.wbRelsPath, [Buffer.from(dropped.wbRelsXml, 'utf8')]);
+    for (const path of pkg.calcChainPaths) changes.set(path, null);
+  }
+  t = lap('workbook', t);
+  const written = await writeZip(zip, changes, { onYield });
+  lap('zip', t);
+  timings.total = saveNow() - t0;
+  return {
+    bytes: written.bytes,
+    report: { changedParts: written.changed, removedParts: written.removed, identicalParts: written.identical, timings },
+  };
+}
+
+// ----- verify -----
+
+/** V2: the whole part is well-formed UTF-8 XML (saxes, fed in 256 KB pieces with yields in between). */
+async function verifyXmlWellFormed(data: Uint8Array, where: string, onYield?: SaveYieldHook): Promise<void> {
+  const parser = new SaxesParser({ xmlns: false });
+  let error: string | undefined;
+  parser.on('error', (err: Error) => {
+    error ??= err.message;
+  });
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  for (let i = 0; i < data.length && error === undefined; i += VERIFY_PARSE_CHUNK) {
+    try {
+      parser.write(decoder.decode(data.subarray(i, Math.min(data.length, i + VERIFY_PARSE_CHUNK)), { stream: true }));
+    } catch (err) {
+      error ??= saveErrorText(err);
+    }
+    if (data.length > VERIFY_PARSE_CHUNK) await saveYield(onYield);
+  }
+  if (error === undefined) {
+    try {
+      const rest = decoder.decode();
+      if (rest) parser.write(rest);
+      parser.close();
+    } catch (err) {
+      error ??= saveErrorText(err);
+    }
+  }
+  if (error !== undefined) throw new SaveVerifyError('V2', `${where} is not well-formed XML (${error})`);
+}
+
+/** Row spans of a sheet part's <sheetData> (walks the whole part; yields every SAVE_YIELD_ROWS rows or SAVE_SLICE_MS). */
+async function sheetRowSpans(buf: Buffer, L: SheetXmlLayout, onYield?: SaveYieldHook): Promise<RowSpan[]> {
+  const rows: RowSpan[] = [];
+  if (L.sdSelfClosing) return rows;
+  const step = saveSlicer(onYield, SAVE_YIELD_ROWS);
+  for (let pos = L.sdOpenEnd; ;) {
+    const rs = findStartTag(buf, L.rowTag, pos, L.sdClose);
+    if (rs < 0) break;
+    const row = readRowAt(buf, L, rs);
+    rows.push(row);
+    pos = row.end;
+    const pause = step();
+    if (pause) await pause;
+  }
+  return rows;
+}
+
+/**
+ * V2 for a big sheet part that only had cell patches: every patched row is parsed alone (well-formed), the rows are
+ * in order, and the part without the patched rows is byte-identical to the base part without them (so every splice
+ * point is a row element boundary and nothing else moved). Self-closing <sheetData/> in the base → full parse.
+ */
+async function verifySheetRows(baseBuf: Buffer, newBuf: Buffer, patchedRows: ReadonlySet<number>, where: string, onYield?: SaveYieldHook): Promise<void> {
+  let baseRows: RowSpan[];
+  let newRows: RowSpan[];
+  let LB: SheetXmlLayout;
+  let LN: SheetXmlLayout;
+  try {
+    LB = await sheetLayout(baseBuf, where, onYield);
+    if (LB.sdSelfClosing) {
+      await verifyXmlWellFormed(newBuf, where, onYield);
+      return;
+    }
+    baseRows = await sheetRowSpans(baseBuf, LB, onYield);
+    LN = await sheetLayout(newBuf, where, onYield);
+    newRows = await sheetRowSpans(newBuf, LN, onYield);
+  } catch (err) {
+    if (err instanceof PatchError) throw new SaveVerifyError('V2', saveErrorText(err));
+    throw err;
+  }
+  // The <dimension ref> in the head may be widened by the patch (widenDimension): only its ref may differ, and the new
+  // ref must be a plain range. Everything else of the head is compared byte by byte below.
+  const dimOf = (buf: Buffer, L: SheetXmlLayout): { start: number; end: number; tag: string } | undefined => {
+    const head = buf.toString('latin1', 0, L.sdOpen);
+    const m = new RegExp(`<${regexEscape(L.P)}dimension\\b[^>]*>`).exec(head);
+    return m ? { start: m.index, end: m.index + m[0].length, tag: m[0] } : undefined;
+  };
+  const dimB = dimOf(baseBuf, LB);
+  const dimN = dimOf(newBuf, LN);
+  let dimSkip = false;
+  if (dimB && dimN && dimB.tag !== dimN.tag) {
+    const withoutRef = (tag: string): string => tag.replace(/(\sref\s*=\s*)("[^"]*"|'[^']*')/, '$1""');
+    const ref = /\sref\s*=\s*"([^"]*)"/.exec(dimN.tag)?.[1] ?? '';
+    if (withoutRef(dimB.tag) !== withoutRef(dimN.tag) || !/^[A-Z]{1,3}\d{1,7}(?::[A-Z]{1,3}\d{1,7})?$/.test(ref)) {
+      throw new SaveVerifyError('V2', `${where} changed outside the edited rows`);
+    }
+    dimSkip = true;
+  }
+  let prevR = -1;
+  for (const row of newRows) {
+    if (row.r <= prevR) throw new SaveVerifyError('V2', `${where} has rows out of order (row ${row.r + 1})`);
+    prevR = row.r;
+    if (patchedRows.has(row.r)) await verifyXmlWellFormed(newBuf.subarray(row.start, row.end), `${where} row ${row.r + 1}`, onYield);
+  }
+  /** The part as a list of [start, end) spans without the patched rows. */
+  const kept = (rows: readonly RowSpan[], size: number, dim: { start: number; end: number } | undefined): [number, number][] => {
+    const out: [number, number][] = [];
+    let from = 0;
+    if (dimSkip && dim) {
+      out.push([0, dim.start]);
+      from = dim.end;
+    }
+    for (const row of rows) {
+      if (!patchedRows.has(row.r)) continue;
+      out.push([from, row.start]);
+      from = row.end;
+    }
+    out.push([from, size]);
+    return out;
+  };
+  const a = kept(baseRows, baseBuf.length, dimB);
+  const b = kept(newRows, newBuf.length, dimN);
+  // Compare the two span lists as one byte stream each.
+  let ia = 0;
+  let ib = 0;
+  let pa = a[0][0];
+  let pb = b[0][0];
+  let compared = 0;
+  for (;;) {
+    while (ia < a.length && pa >= a[ia][1]) pa = ++ia < a.length ? a[ia][0] : 0;
+    while (ib < b.length && pb >= b[ib][1]) pb = ++ib < b.length ? b[ib][0] : 0;
+    if (ia >= a.length || ib >= b.length) {
+      if (ia < a.length || ib < b.length) throw new SaveVerifyError('V2', `${where} changed outside the edited rows`);
+      return;
+    }
+    const n = Math.min(a[ia][1] - pa, b[ib][1] - pb, 8 << 20);
+    if (baseBuf.compare(newBuf, pb, pb + n, pa, pa + n) !== 0) throw new SaveVerifyError('V2', `${where} changed outside the edited rows`);
+    pa += n;
+    pb += n;
+    compared += n;
+    if (compared >= 8 << 20) {
+      compared = 0;
+      await saveYield(onYield);
+    }
+  }
+}
+
+/** The text of an <si> / <is> body: all <t> runs, without phonetic (<rPh>) text, unescaped and _xHHHH_-decoded. */
+function xstringItemText(xml: string, P: string): string {
+  const body = xml.replace(new RegExp(`<${regexEscape(P)}rPh\\b[\\s\\S]*?</${regexEscape(P)}rPh>`, 'g'), '');
+  let text = '';
+  for (const m of body.matchAll(new RegExp(`<${regexEscape(P)}t(?:\\s[^>]*)?(?:/>|>([\\s\\S]*?)</${regexEscape(P)}t>)`, 'g'))) {
+    text += m[1] ?? '';
+  }
+  return decodeXstring(xmlUnescape(text));
+}
+
+/** One cell as found in the saved XML (V3). */
+interface SavedCell {
+  s: number;
+  formula?: string;
+  /** The <f> is a clone of a shared formula (<f t="shared" si="n"/>, no text of its own; kept byte for byte). */
+  sharedClone?: boolean;
+  /** undefined = no value. */
+  value?: FileValue;
+}
+
+/** Reads the <c> element text of a saved cell (strings through `sstText`). */
+function readSavedCell(xml: string, P: string, where: string, sstText: (i: number) => string): SavedCell {
+  const gt = xml.indexOf('>');
+  const attrs = parseXmlAttrs(xml.slice(0, gt + 1));
+  const out: SavedCell = { s: Number(xmlAttrText(attrs, 's') ?? 0) };
+  if (xml[gt - 1] === '/') return out;
+  const children = splitXmlChildren(xml.slice(gt + 1, xml.length - `</${P}c>`.length), where);
+  const t = xmlAttrText(attrs, 't') ?? 'n';
+  const f = children.find((child) => child.local === 'f');
+  if (f) {
+    const fAttrs = parseXmlAttrs(f.open);
+    out.formula = f.open.endsWith('/>') ? '' : xmlUnescape(f.xml.slice(f.open.length, f.xml.length - `</${P}f>`.length));
+    if (xmlAttrText(fAttrs, 't') === 'shared' && !fAttrs.has('ref')) out.sharedClone = true;
+  }
+  const is = children.find((child) => child.local === 'is');
+  const v = children.find((child) => child.local === 'v');
+  if (t === 'inlineStr' && is) {
+    out.value = { t: 's', v: xstringItemText(is.xml, P) };
+  } else if (v) {
+    const raw = v.open.endsWith('/>') ? '' : xmlUnescape(v.xml.slice(v.open.length, v.xml.length - `</${P}v>`.length));
+    switch (t) {
+      case 's':
+        out.value = { t: 's', v: sstText(Number(raw)) };
+        break;
+      case 'str':
+        out.value = { t: 's', v: decodeXstring(raw) };
+        break;
+      case 'b':
+        out.value = { t: 'b', v: raw.trim() === '1' || raw.trim() === 'true' };
+        break;
+      case 'e':
+        out.value = { t: 'e', v: raw };
+        break;
+      case 'n':
+        out.value = { t: 'n', v: raw.trim() === '' ? NaN : Number(raw) };
+        break;
+      default:
+        throw new SaveVerifyError('V3', `${where} has the unexpected cell type "${t}"`);
+    }
+  }
+  return out;
+}
+
+function fileValueText(value: FileValue | null | undefined): string {
+  return value === undefined ? 'nothing' : value === null ? 'no value' : `${value.t}:${JSON.stringify(value.v)}`;
+}
+
+function sameFileValue(a: FileValue | null | undefined, b: FileValue | null | undefined): boolean {
+  if (!a || !b) return !a && !b;
+  return a.t === b.t && (a.t === 'n' ? a.v === b.v || (Number.isNaN(a.v) && Number.isNaN(b.v as number)) : a.v === b.v);
+}
+
+/** Shared strings of the saved package, read once and indexed lazily (V3). */
+function sharedStringReader(text: string | undefined, where: string): (i: number) => string {
+  let items: string[] | undefined;
+  let P = '';
+  return (i: number): string => {
+    if (text === undefined) throw new SaveVerifyError('V3', `${where}: a cell uses a shared string but the file has none`);
+    if (!items) {
+      P = xmlRootPrefix(text, 'sst', 'sharedStrings');
+      items = [];
+      const tag = `<${P}si`;
+      const end = `</${P}si>`;
+      for (let p = text.indexOf(tag); p >= 0; p = text.indexOf(tag, p + tag.length)) {
+        if (!isXmlNameEnd(text.charCodeAt(p + tag.length))) continue;
+        const gt = text.indexOf('>', p);
+        const close = text[gt - 1] === '/' ? gt + 1 : text.indexOf(end, gt) + end.length;
+        items.push(text.slice(p, close));
+        p = close - tag.length;
+      }
+    }
+    const item = Number.isInteger(i) ? items[i] : undefined;
+    if (item === undefined) throw new SaveVerifyError('V3', `${where}: shared string ${i} does not exist`);
+    return xstringItemText(item, P);
+  };
+}
+
+/** V3: every expected cell is in the new sheet XML with the expected value / formula / style index. */
+async function verifyReadBack(zip: ZipPackage, expect: readonly CellExpectation[], cache: ReadonlyMap<string, Buffer>, onYield?: SaveYieldHook): Promise<void> {
+  if (!expect.length) return;
+  let pkg: XlsxPackage;
+  try {
+    pkg = await openXlsxPackage(zip, onYield);
+  } catch (err) {
+    if (err instanceof PatchError || err instanceof ZipError) throw new SaveVerifyError('V3', saveErrorText(err));
+    throw err;
+  }
+  let sstText: string | undefined;
+  if (pkg.sstPath) sstText = cache.get(pkg.sstPath)?.toString('utf8') ?? (await readPartText(zip, pkg.sstPath, onYield));
+  const sstAt = sharedStringReader(sstText, 'sharedStrings');
+  const bySheet = new Map<number, CellExpectation[]>();
+  for (const e of expect) {
+    const list = bySheet.get(e.sheet);
+    if (list) list.push(e);
+    else bySheet.set(e.sheet, [e]);
+  }
+  for (const [sheetId, list] of bySheet) {
+    let sheet: XlsxSheetRef & { part: string };
+    let L: SheetXmlLayout;
+    let buf: Buffer;
+    const wanted = new Map<number, Map<number, string>>();
+    for (const e of list) wanted.set(e.r, new Map());
+    try {
+      sheet = worksheetOf(pkg, sheetId);
+      const entry = zip.get(sheet.part);
+      if (!entry) throw new PatchError(`the part of sheet ${sheetId} is missing`);
+      buf = cache.get(entry.name) ?? (await readEntry(zip, entry, onYield));
+      L = await sheetLayout(buf, `the sheet "${sheetLabel(sheet)}"`, onYield);
+      let last = -1;
+      for (const r of wanted.keys()) last = Math.max(last, r);
+      const step = saveSlicer(onYield, SAVE_YIELD_ROWS);
+      for (let pos = L.sdOpenEnd; !L.sdSelfClosing;) {
+        const rs = findStartTag(buf, L.rowTag, pos, L.sdClose);
+        if (rs < 0) break;
+        const row = readRowAt(buf, L, rs);
+        const cells = wanted.get(row.r);
+        if (cells && !row.selfClosing) {
+          const text = decodeRowText(buf, row, L.where);
+          const body = text.slice(row.tag.length, text.lastIndexOf(`</${L.P}row>`));
+          for (const span of parseRowCells(body, L.P, row.r, L.where)) cells.set(span.c, body.slice(span.start, span.end));
+        }
+        if (row.r >= last) break;
+        pos = row.end;
+        const pause = step();
+        if (pause) await pause;
+      }
+    } catch (err) {
+      if (err instanceof PatchError || err instanceof ZipError) throw new SaveVerifyError('V3', saveErrorText(err));
+      throw err;
+    }
+    for (const e of list) {
+      const where = `${sheetLabel(sheet)}!${indexToCol(e.c)}${e.r + 1}`;
+      const xml = wanted.get(e.r)?.get(e.c);
+      const got: SavedCell = xml === undefined ? { s: 0 } : readSavedCell(xml, L.P, where, sstAt);
+      if (e.styleIndex !== undefined && got.s !== e.styleIndex) {
+        throw new SaveVerifyError('V3', `${where} has style ${got.s}, expected ${e.styleIndex}`);
+      }
+      if (e.value === undefined && e.formula === undefined) continue;
+      // A shared-formula clone has no formula text of its own: only a cached-value patch can leave it in place (its <f>
+      // bytes are kept); the expanded formula is compared by V4.
+      const formulaOk = got.sharedClone ? e.formula !== undefined : (got.formula ?? undefined) === e.formula;
+      if (!formulaOk) {
+        throw new SaveVerifyError('V3', `${where} has the formula ${JSON.stringify(got.formula ?? null)}, expected ${JSON.stringify(e.formula ?? null)}`);
+      }
+      if (e.value !== undefined && !sameFileValue(got.value, e.value)) {
+        throw new SaveVerifyError('V3', `${where} holds ${fileValueText(got.value ?? null)}, expected ${fileValueText(e.value)}`);
+      }
+    }
+  }
+}
+
+/** V4: the new bytes load with the loader and every expected cell shows the expected value / formula (D-008). */
+async function verifyDeep(bytes: Uint8Array, expect: readonly CellExpectation[]): Promise<void> {
+  if (!expect.length) return;
+  let model: WorkbookModel;
+  try {
+    model = workbookToModel(await loadWorkbook(bytes));
+  } catch (err) {
+    throw new SaveVerifyError('V4', `the saved file cannot be read back (${saveErrorText(err)})`);
+  }
+  const worksheets = model.workbook.worksheets;
+  for (const e of expect) {
+    const index = worksheets.findIndex((ws) => ws.id === e.sheet);
+    const where = `${index >= 0 ? worksheets[index].name : `sheet ${e.sheet}`}!${indexToCol(e.c)}${e.r + 1}`;
+    if (index < 0) throw new SaveVerifyError('V4', `${where}: the sheet is missing after reload`);
+    if (e.value === undefined && e.formula === undefined) continue;
+    const cell = model.getRows(index, e.r, e.r + 1, e.c, e.c).rows.find((row) => row.r === e.r)?.cells.find((x) => x.c === e.c);
+    // Cases where the loader shows something else for correct XML (V3 still checks the XML): not comparable here.
+    if (cell?.link !== undefined) continue; // hyperlink cells: the loader drops the formula / shows the link text
+    if (model.getMeta().sheets[index]?.merges.some((m) => e.r >= m.r0 && e.r <= m.r1 && e.c >= m.c0 && e.c <= m.c1 && !(e.r === m.r0 && e.c === m.c0))) continue; // merged non-anchor cell
+    if (e.value && e.value.t === 'n' && cell?.t === 'e' && cell.v === '#VALUE!') continue; // a huge number in a date format
+    if (e.value && e.value.t === 's' && e.value.v === '') continue; // an empty string value reads back as an empty cell
+    const formula = e.formula === undefined ? undefined : displayFormula(e.formula);
+    if ((cell?.f || undefined) !== (formula || undefined)) {
+      throw new SaveVerifyError('V4', `${where} shows the formula ${JSON.stringify(cell?.f ?? null)} after reload, expected ${JSON.stringify(formula ?? null)}`);
+    }
+    if (e.value === undefined) continue;
+    const empty = !cell || cell.t === 'z' || (formula !== undefined && cell.t === 's' && cell.v === '');
+    let same: boolean;
+    if (e.value === null) {
+      same = empty;
+    } else if (e.value.t === 'n') {
+      const v = cell?.v;
+      same = typeof v === 'number' && (cell?.t === 'n' ? v === e.value.v : cell?.t === 'd' && Math.abs(v - e.value.v) <= 1e-8 * Math.max(1, Math.abs(v)));
+    } else if (e.value.t === 's') {
+      same = cell?.t === 's' && cell.v === e.value.v;
+    } else {
+      same = cell?.t === e.value.t && cell.v === e.value.v;
+    }
+    if (!same) {
+      throw new SaveVerifyError('V4', `${where} shows ${cell ? `${cell.t}:${JSON.stringify(cell.v ?? null)}` : 'nothing'} after reload, expected ${fileValueText(e.value)}`);
+    }
+  }
+}
+
+/**
+ * Checks the bytes buildXlsx made from `base` and `ops` before they are written (§4.2 step 4). Throws SaveVerifyError
+ * (nothing may be written) when: V1 the zip does not parse, an entry is missing / added / reordered, an entry that
+ * `ops` cannot change is not byte-identical, a rewritten entry does not inflate to its size + CRC, or a removed part
+ * is still referenced; V2 a rewritten XML part is not well-formed (big cell-patched sheet parts: each patched row is
+ * parsed and the rest must equal the base); V3 an expected cell is not in the new XML as expected; V4 (`o.deep`,
+ * default: file ≤ 10 MB) the loader does not show the expected cells.
+ */
+export async function verifyXlsx(
+  base: Uint8Array,
+  bytes: Uint8Array,
+  ops: readonly PackageOp[],
+  expect: CellExpectation[],
+  o?: { deep: boolean; onYield?: SaveYieldHook },
+): Promise<void> {
+  const onYield = o?.onYield;
+  let baseZip: ZipPackage;
+  let zip: ZipPackage;
+  try {
+    baseZip = parseZip(base);
+  } catch (err) {
+    throw new SaveVerifyError('V1', `the original file is not a valid zip package (${saveErrorText(err)})`);
+  }
+  try {
+    zip = parseZip(bytes);
+  } catch (err) {
+    throw new SaveVerifyError('V1', `the new file is not a valid zip package (${saveErrorText(err)})`);
+  }
+  // ----- V1: entry set, order, raw bytes -----
+  const allowedChanged = new Set<string>();
+  const allowedRemoved = new Set<string>();
+  const patchedRows = new Map<string, Set<number>>();
+  let basePkg: XlsxPackage | undefined;
+  if (ops.length) {
+    try {
+      basePkg = await openXlsxPackage(baseZip, onYield);
+    } catch (err) {
+      if (err instanceof PatchError || err instanceof ZipError) throw new SaveVerifyError('V1', saveErrorText(err));
+      throw err;
+    }
+    for (const op of ops) {
+      if (op.kind !== 'cells') throw new SaveVerifyError('V1', `"${op.kind}" changes cannot be checked yet`);
+      let part: string;
+      try {
+        part = worksheetOf(basePkg, op.sheet).part.toLowerCase();
+      } catch (err) {
+        throw new SaveVerifyError('V1', saveErrorText(err));
+      }
+      allowedChanged.add(part);
+      let rows = patchedRows.get(part);
+      if (!rows) patchedRows.set(part, (rows = new Set()));
+      for (const [r] of op.cells) rows.add(r);
+    }
+    for (const path of [basePkg.sstPath, basePkg.stylesPath, basePkg.wbPath, basePkg.wbRelsPath, '[Content_Types].xml']) {
+      if (path) allowedChanged.add(path.toLowerCase());
+    }
+    for (const path of basePkg.calcChainPaths) allowedRemoved.add(path.toLowerCase());
+  }
+  if (baseZip.comment.compare(zip.comment) !== 0) throw new SaveVerifyError('V1', 'the zip comment changed');
+  if (baseZip.buf.compare(zip.buf, 0, zip.prefixEnd, 0, baseZip.prefixEnd) !== 0) {
+    throw new SaveVerifyError('V1', 'the bytes before the first part changed');
+  }
+  const rewritten = new Map<string, Buffer>();
+  const removed: string[] = [];
+  for (const e of baseZip.entries) {
+    const n = zip.get(e.name);
+    if (!n) {
+      if (!allowedRemoved.has(e.name.toLowerCase())) throw new SaveVerifyError('V1', `the part ${e.name} is missing`);
+      removed.push(e.name);
+      continue;
+    }
+    const same = n.method === e.method && n.crc === e.crc && n.usize === e.usize && n.csize === e.csize &&
+      n.spanEnd - n.lho === e.spanEnd - e.lho && baseZip.buf.compare(zip.buf, n.lho, n.spanEnd, e.lho, e.spanEnd) === 0 &&
+      n.nameBytes.equals(e.nameBytes);
+    if (same) continue;
+    if (!allowedChanged.has(e.name.toLowerCase())) throw new SaveVerifyError('V1', `the part ${e.name} changed but must stay byte-identical`);
+    try {
+      rewritten.set(n.name, await readEntry(zip, n, onYield));
+    } catch (err) {
+      if (err instanceof ZipError) throw new SaveVerifyError('V1', saveErrorText(err));
+      throw err; // cancelled (onYield)
+    }
+  }
+  const expectedOrder = baseZip.entries.filter((e) => zip.get(e.name)).map((e) => e.name);
+  if (zip.entries.length !== expectedOrder.length) throw new SaveVerifyError('V1', 'the new file has parts the original does not have');
+  if (zip.entries.some((e, i) => e.name !== expectedOrder[i])) throw new SaveVerifyError('V1', 'the order of the zip directory changed');
+  const expectedLocal = baseZip.byOffset.filter((e) => zip.get(e.name)).map((e) => e.name);
+  if (zip.byOffset.some((e, i) => e.name !== expectedLocal[i])) throw new SaveVerifyError('V1', 'the order of the parts changed');
+  if (removed.length && basePkg) {
+    // A removed part must not be referenced any more (content type override, workbook relationship).
+    const ct = rewritten.get('[Content_Types].xml')?.toString('utf8') ?? (await readPartText(zip, '[Content_Types].xml', onYield)) ?? '';
+    const relsEntry = zip.get(basePkg.wbRelsPath);
+    const rels = (relsEntry && (rewritten.get(relsEntry.name)?.toString('utf8') ?? (await readPartText(zip, relsEntry.name, onYield)))) ?? '';
+    const gone = new Set(removed.map((name) => name.toLowerCase()));
+    for (const m of ct.matchAll(/<(?:[\w.-]+:)?Override\b[^>]*>/g)) {
+      const name = xmlAttrText(parseXmlAttrs(m[0]), 'PartName');
+      if (name && gone.has(resolvePartTarget('', name).toLowerCase())) throw new SaveVerifyError('V1', `the removed part ${name} still has a content type`);
+    }
+    for (const rel of parseRels(rels)) {
+      if (!rel.external && gone.has(resolvePartTarget(basePkg.wbPath, rel.target).toLowerCase())) {
+        throw new SaveVerifyError('V1', `the removed part ${rel.target} is still referenced by the workbook`);
+      }
+    }
+  }
+  // ----- V2: rewritten XML parts are well-formed -----
+  for (const [name, data] of rewritten) {
+    if (!/\.(xml|rels)$/i.test(name)) continue;
+    const rows = patchedRows.get(name.toLowerCase());
+    if (data.length > verifyTuning.fullParseBytes && rows) {
+      const baseEntry = baseZip.get(name);
+      if (!baseEntry) throw new SaveVerifyError('V2', `${name} has no original`);
+      await verifySheetRows(await readEntry(baseZip, baseEntry, onYield), data, rows, name, onYield);
+    } else {
+      await verifyXmlWellFormed(data, name, onYield);
+    }
+  }
+  // ----- V3: read back the edited cells -----
+  await verifyReadBack(zip, expect, rewritten, onYield);
+  // ----- V4: reload with the loader (small files) -----
+  if (o?.deep ?? deepVerifyAllowed(bytes)) await verifyDeep(bytes, expect);
+}
+
+// ----- patchable check -----
+
+/** Hard read-only scan of one worksheet part (§4.7): rows with numbers and in order, cells inside their row and in order. */
+async function scanSheetPart(buf: Buffer, where: string, yieldEvery: number, onYield?: SaveYieldHook): Promise<void> {
+  const L = await sheetLayout(buf, where, onYield);
+  if (L.sdSelfClosing) return;
+  const gapOk = (from: number, to: number): boolean => {
+    if (to <= from) return true;
+    return /^(?:\s|<!--[\s\S]*?-->)*$/.test(buf.toString('latin1', from, to));
+  };
+  let pos = L.sdOpenEnd;
+  let prevR = -1;
+  const step = saveSlicer(onYield, yieldEvery);
+  for (;;) {
+    const rs = findStartTag(buf, L.rowTag, pos, L.sdClose);
+    if (!gapOk(pos, rs < 0 ? L.sdClose : rs)) throw new PatchError(`${where} has cells outside a row`);
+    if (rs < 0) break;
+    const row = readRowAt(buf, L, rs);
+    if (row.r <= prevR) throw new PatchError(`${where} has rows out of order (row ${row.r + 1})`);
+    prevR = row.r;
+    if (!row.selfClosing) {
+      const inner = buf.toString('latin1', row.openEnd, row.end - L.rowEndTag.length);
+      // The patcher walks bytes, not an XML tree: a comment or CDATA section inside a row could hide a fake <c> or </row>.
+      if (inner.includes('<!--') || inner.includes('<![CDATA[')) throw new PatchError(`${where} has an XML comment or CDATA section inside a row (row ${row.r + 1})`);
+      parseRowCells(inner, L.P, row.r, where);
+    }
+    pos = row.end;
+    const pause = step();
+    if (pause) await pause;
+  }
+}
+
+/**
+ * Whether the save path can patch this package (§4.7 hard read-only; reason = plain text for "FileStudio cannot
+ * edit this file safely: <reason>. It is open read-only."): ZIP64, encrypted entries, compression other than
+ * store/deflate, duplicate part names, damaged zip, Strict Open XML, parts that are not UTF-8, and — unless
+ * `scanSheets` is false — every worksheet part is scanned for rows without numbers, rows out of order and cells
+ * outside their row or out of order. Cooperative (for the background check after load); `onYield` may throw to cancel.
+ */
+export async function checkPatchable(
+  base: Uint8Array,
+  o?: { scanSheets?: boolean; yieldEvery?: number; onYield?: SaveYieldHook },
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const state = { cancelled: false };
+  const userYield = o?.onYield;
+  const onYield: SaveYieldHook | undefined = userYield
+    ? (): void => {
+      try {
+        userYield();
+      } catch (err) {
+        state.cancelled = true;
+        throw err;
+      }
+    }
+    : undefined;
+  const yieldEvery = Math.max(1, Math.floor(o?.yieldEvery ?? SAVE_YIELD_ROWS));
+  try {
+    const zip = parseZip(base);
+    const pkg = await openXlsxPackage(zip, onYield);
+    if (pkg.strict) return { ok: false, reason: 'it uses Strict Open XML' };
+    for (const path of [pkg.sstPath, pkg.stylesPath]) {
+      const entry = path ? zip.get(path) : undefined;
+      if (entry) {
+        const text = partText(await readEntry(zip, entry, onYield), entry.name);
+        if (path === pkg.sstPath && (text.includes('<!--') || text.includes('<![CDATA['))) {
+          return { ok: false, reason: 'its shared strings contain an XML comment or CDATA section' };
+        }
+      }
+    }
+    if (o?.scanSheets !== false) {
+      for (const sheet of pkg.sheets) {
+        if (!WORKSHEET_REL_RE.test(sheet.type)) continue;
+        const entry = sheet.part ? zip.get(sheet.part) : undefined;
+        if (!entry) return { ok: false, reason: `the part of the sheet "${sheetLabel(sheet)}" is missing` };
+        await scanSheetPart(await readEntry(zip, entry, onYield), `the sheet "${sheetLabel(sheet)}"`, yieldEvery, onYield);
+        await saveYield(onYield);
+      }
+    }
+    return { ok: true };
+  } catch (err) {
+    if (state.cancelled) throw err;
+    if (err instanceof ZipError || err instanceof PatchError) return { ok: false, reason: err.message };
+    return { ok: false, reason: `it could not be checked (${saveErrorText(err)})` };
+  }
 }

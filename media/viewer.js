@@ -16,6 +16,28 @@
 
 // @ts-ignore -- side-effect CSS import: esbuild emits it as dist/viewer.css (KaTeX styles for the Markdown view).
 import 'katex/dist/katex.min.css';
+// (v0.2.0, P6) The WYSIWYG editor's styles (Milkdown Crepe theme, only the parts of the features used; every rule is scoped
+// to .milkdown). Static, like KaTeX: esbuild adds them to dist/viewer.css; the editor code itself loads lazily.
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/prosemirror.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/reset.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/block-edit.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/cursor.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/link-tooltip.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/list-item.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/placeholder.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/toolbar.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/common/table.css';
+// @ts-ignore -- side-effect CSS import
+import '@milkdown/crepe/theme/frame.css';
 // @ts-ignore -- side-effect CSS import: esbuild adds the pdf.js viewer styles (page, text and annotation layers) to dist/viewer.css.
 import 'pdfjs-dist/web/pdf_viewer.css';
 import { describePdfFailure, missingPdfEngineFeatures, PDF_ENGINE_UNSUPPORTED } from '../src/renderers/pdf';
@@ -39,6 +61,29 @@ import DOMPurify from 'dompurify';
 /** @typedef {Extract<HostMessage, { type: 'stats' }>} StatsMessage */
 /** @typedef {Extract<HostMessage, { type: 'invalidate' }>} InvalidateMessage */
 /** @typedef {{ message: string, detail?: string, canReopenAsText?: boolean }} ErrorInfo */
+// (v0.2.0) Editing protocol (contract §2.7), declared once by track F; the editing phases use these names.
+/** @typedef {import('../src/renderers/sheet').SheetId} SheetId */
+/** @typedef {import('../src/renderers/sheet').CfPaint} CfPaint */
+/** @typedef {import('../src/renderers/sheet').EditIntent} EditIntent */
+/** @typedef {import('../src/renderers/sheet').EditKind} EditKind */
+/** @typedef {import('../src/renderers/sheet').FindQuery} FindQuery */
+/** @typedef {import('../src/renderers/sheet').StyleDelta} StyleDelta */
+/** @typedef {import('../src/renderers/sheet').BorderSide} BorderSide */
+/** @typedef {import('../src/renderers/markdown').MdBlock} MdSourceBlock (the name MdBlock is the preview's rendered block, MARKDOWN) */
+/** @typedef {import('../src/renderers/markdown').MdTextEdit} MdTextEdit */
+/** @typedef {import('../src/viewerProvider').EditRejectCode} EditRejectCode */
+/** @typedef {import('../src/viewerProvider').EditState} EditState */
+/** @typedef {import('../src/viewerProvider').RowsPatch} RowsPatch */
+/** @typedef {Extract<HostMessage, { type: 'editResult' }>} EditResultMessage */
+/** @typedef {Extract<HostMessage, { type: 'patch' }>} PatchMessage */
+/** @typedef {Extract<HostMessage, { type: 'editState' }>} EditStateMessage */
+/** @typedef {Extract<HostMessage, { type: 'recalcState' }>} RecalcStateMessage */
+/** @typedef {Extract<HostMessage, { type: 'findResult' }>} FindResultMessage */
+/** @typedef {Extract<HostMessage, { type: 'filterResult' }>} FilterResultMessage */
+/** @typedef {Extract<HostMessage, { type: 'columnTexts' }>} ColumnTextsMessage */
+/** @typedef {Extract<HostMessage, { type: 'revealLine' }>} RevealLineMessage */
+/** @typedef {Extract<HostMessage, { type: 'flushRequest' }>} FlushRequestMessage */
+/** @typedef {Extract<WebviewMessage, { type: 'edit' }>} EditMessage */
 
 // ===== BOOTSTRAP & MESSAGING =====
 
@@ -107,6 +152,32 @@ function dispatch(msg) {
       break;
     case 'error':
       showError(msg);
+      break;
+    // ----- (v0.2.0) editing messages: declared by track F; the owning phase adds its call in its case -----
+    case 'editResult':
+      mdwOnEditResult(msg); // P6 (ignored unless the view is Markdown)
+      if (currentKind() !== 'markdown' && acceptsViewMessage(msg.type, ['sheet', 'csv'])) onEditResult(msg);
+      break;
+    case 'patch':
+      if (acceptsViewMessage(msg.type, ['sheet', 'csv'])) onPatch(msg);
+      break;
+    case 'editState':
+      mdOnEditState(msg); // P6 (ignored unless the view is Markdown)
+      if (currentKind() !== 'markdown' && acceptsViewMessage(msg.type, ['sheet', 'csv'])) onEditState(msg);
+      break;
+    case 'recalcState':
+      /* P5 */ break;
+    case 'findResult':
+      /* P3 / P4 */ break;
+    case 'filterResult':
+      /* P4 */ break;
+    case 'columnTexts':
+      /* P4 */ break;
+    case 'revealLine':
+      mdSplitReveal(msg.line); // P6
+      break;
+    case 'flushRequest':
+      mdwOnFlushRequest(msg.id); // P6
       break;
   }
 }
@@ -628,6 +699,7 @@ const NO_CELLS = [];
  * @property {HTMLElement} ariaDesc   description of the active cell (note, link target)
  * @property {HTMLElement | null} menu
  * @property {HTMLElement | null} banner
+ * @property {HTMLElement} [statusMode]
  * @property {HTMLElement} formulaBar
  * @property {HTMLElement} tabBar
  * @property {HTMLElement} statusBar
@@ -668,6 +740,12 @@ const NO_CELLS = [];
  * @property {CellBox | null} cellBox   read-only cell text box opened by a double-click (CELL TEXT BOX)
  * @property {HTMLElement | null} lostFocus  the grid or the cell text box whose focus went to <body> (see wireGridEvents)
  * @property {string | undefined} bannerText  lossy-content banner the host sent last (init / invalidate), even if dismissed
+ * @property {boolean} [bannerAction]   the banner carries an "Edit anyway" button
+ * @property {EditState} editState      what the host says about editing (init / invalidate / editState)
+ * @property {number} version           the host's document version this grid has seen (contract §2.7)
+ * @property {Map<number, Map<number, Map<number, string>>>} overlay  pending cell texts by sheet, row and column (EDITING)
+ * @property {EditMessage | null} inFlightEdit  the one edit asked of the host and not answered yet
+ * @property {(EditMessage | CommandMessage)[]} sendQueue  edits and commands waiting for it, in order
  */
 
 /** @type {GridState | null} */
@@ -716,12 +794,19 @@ function showGrid(msg) {
     cellBox: null,
     lostFocus: null,
     bannerText: msg.banner,
+    bannerAction: !!msg.editState?.canEditAnyway,
+    version: msg.version ?? 0,
+    // A host that sends no editState (0.1.2, test hosts) says it by `readOnly`.
+    editState: msg.editState || (msg.readOnly !== false ? { editable: false } : { editable: true, kinds: ['setCells', 'clear'] }),
+    overlay: new Map(),
+    inFlightEdit: null,
+    sendQueue: [],
   };
   resetRowCache();
   rowCache.metaFloor = rowCache.reqSeq;
   lastRegion = { sheet: -1, version: -1 };
   onDispose(() => {
-    closeCellBox(false);
+    closeCellBox('close', false);
     hideTooltip();
     closeMenu();
     saveGridState.flush();
@@ -739,25 +824,26 @@ function showGrid(msg) {
 
   mountGrid(msg.banner);
 
+  const g = /** @type {GridState} */ (G);
   // Hidden sheets this panel had revealed for viewing stay revealed (the active one may be among them).
-  if (G.saved && Array.isArray(G.saved.revealed)) {
-    for (const name of G.saved.revealed) {
-      const index = meta.sheets.findIndex((s) => s.name === name);
-      if (index >= 0 && meta.sheets[index].state !== 'visible') G.revealed.add(index);
+  if (g.saved && Array.isArray(g.saved.revealed)) {
+    for (const name of g.saved.revealed) {
+      const index = meta.sheets.findIndex((s) => sheetKey(s) === name || s.name === name);
+      if (index >= 0 && meta.sheets[index].state !== 'visible') g.revealed.add(index);
     }
   }
   // Initial sheet: the one persisted for this panel, else the workbook's active sheet. A hidden active sheet is shown
   // revealed (Excel opens the file on it, unhiding it); any other hidden one gives way to the first visible sheet.
   let first = -1;
-  if (G.saved && typeof G.saved.activeSheet === 'string') first = meta.sheets.findIndex((s) => s.name === G?.saved.activeSheet);
+  if (g.saved && typeof g.saved.activeSheet === 'string') first = meta.sheets.findIndex((s) => sheetKey(s) === g.saved.activeSheet || s.name === g.saved.activeSheet);
   if (first < 0) {
     first = clamp(meta.activeSheet | 0, 0, meta.sheets.length - 1);
-    if (meta.sheets[first].state === 'hidden') G.revealed.add(first);
+    if (meta.sheets[first].state === 'hidden') g.revealed.add(first);
   }
-  if (meta.sheets[first].state !== 'visible' && !G.revealed.has(first)) {
+  if (meta.sheets[first].state !== 'visible' && !g.revealed.has(first)) {
     const visible = meta.sheets.findIndex((s) => s.state === 'visible');
     if (visible >= 0) first = visible;
-    else G.revealed.add(first);
+    else g.revealed.add(first);
   }
   activateSheet(first, true);
   dom.scroller.focus({ preventScroll: true });
@@ -784,7 +870,7 @@ function showNoSheets(banner) {
 function mountGrid(banner) {
   const g = /** @type {GridState} */ (G);
   root.className = 'fv-grid-app';
-  root.replaceChildren(...buildGridApp({ banner }, g.dom));
+  root.replaceChildren(...buildGridApp({ banner, editState: g.editState }, g.dom));
   g.viewW = g.dom.scroller.clientWidth;
   g.viewH = g.dom.scroller.clientHeight;
   if (!g.wired) {
@@ -849,6 +935,7 @@ function buildGridDom(msg) {
     statusMsg: status.msg,
     statusStats: status.stats,
     statusInfo: status.info,
+    statusMode: status.mode,
     zoomLabel: status.zoomLabel,
     tooltip: h('div', { class: 'fv-tooltip', role: 'tooltip', hidden: true }),
     ariaRow,
@@ -864,13 +951,13 @@ function buildGridDom(msg) {
 
 /**
  * Top-level children of #app for the grid view.
- * @param {{ banner?: string }} msg  lossy-content banner text (GridInitMessage.banner)
+ * @param {{ banner?: string, editState?: EditState }} msg  lossy-content banner text (GridInitMessage.banner)
  * @param {GridDom} dom
  */
 function buildGridApp(msg, dom) {
   /** @type {HTMLElement[]} */
   const parts = [];
-  if (msg.banner) parts.push(buildGridBanner(msg.banner, dom));
+  if (msg.banner) parts.push(buildGridBanner(msg.banner, dom, msg.editState?.canEditAnyway ? { label: 'Edit anyway', onClick: () => post({ type: 'editAnyway' }) } : null));
   parts.push(dom.formulaBar, h('div', { class: 'fv-grid-host' }, dom.scroller), dom.tabBar, dom.statusBar, dom.tooltip, dom.ariaDesc);
   return parts;
 }
@@ -878,13 +965,14 @@ function buildGridApp(msg, dom) {
 /**
  * The grid's lossy-content banner (kept in dom.banner).
  * @param {string} text @param {GridDom} dom
+ * @param {{ label: string, onClick: () => void } | null} [action]
  */
-function buildGridBanner(text, dom) {
+function buildGridBanner(text, dom, action = null) {
   dom.banner = buildBanner(text, () => {
     dom.banner = null;
     // The Dismiss button had focus: give it back to the grid instead of losing it to <body>.
     G?.dom.scroller.focus({ preventScroll: true });
-  });
+  }, action);
   return dom.banner;
 }
 
@@ -893,43 +981,54 @@ function buildGridBanner(text, dom) {
  * "no worksheets" page, so it says what the reloaded file holds (a chart added or removed on disk). A banner the user
  * dismissed stays dismissed while the host sends the same text.
  * @param {string | undefined} text
+ * @param {boolean | object} [canEditAnyway]
  */
-function updateBanner(text) {
+function updateBanner(text, canEditAnyway) {
   const g = G;
-  if (!g || text === g.bannerText) return;
+  if (!g) return;
+  const canEdit = canEditAnyway !== undefined ? !!canEditAnyway : !!g.editState?.canEditAnyway;
+  if (text === g.bannerText && canEdit === g.bannerAction) return;
   g.bannerText = text;
+  g.bannerAction = canEdit;
   const focused = document.activeElement;
   root.querySelector(':scope > .fv-banner')?.remove();
   g.dom.banner = null;
-  if (text) root.prepend(g.dom.scroller.isConnected ? buildGridBanner(text, g.dom) : buildBanner(text, null));
+  const action = canEdit ? { label: 'Edit anyway', onClick: () => post({ type: 'editAnyway' }) } : null;
+  if (text) root.prepend(g.dom.scroller.isConnected ? buildGridBanner(text, g.dom, action) : buildBanner(text, null, action));
   // Removing a banner whose Dismiss button had the focus would drop it to <body>.
   if (focused instanceof HTMLElement && !focused.isConnected && g.dom.scroller.isConnected) g.dom.scroller.focus({ preventScroll: true });
 }
 
 /**
- * Lossy-content banner with a Dismiss button.
+ * Lossy-content banner with a Dismiss button and optional action button.
  * @param {string} text @param {(() => void) | null} onDismiss called after the banner is removed
+ * @param {{ label: string, onClick: () => void } | null} [action]
  */
-function buildBanner(text, onDismiss) {
+function buildBanner(text, onDismiss, action = null) {
+  // A banner with an action ("Edit anyway") cannot be dismissed: dismissing it would take away the only way to edit.
+  const actionBtn = action ? h('button', { class: 'fv-btn fv-banner-action', type: 'button', onclick: () => action.onClick() }, action.label) : null;
   const banner = h(
     'div',
     { class: 'fv-banner', role: 'status' },
     icon(ICONS.info),
     h('span', { class: 'fv-banner-text', title: text }, text),
-    h(
-      'button',
-      {
-        class: 'fv-icon-btn fv-banner-close',
-        type: 'button',
-        title: 'Dismiss',
-        'aria-label': 'Dismiss',
-        onclick: () => {
-          banner.remove();
-          onDismiss?.();
-        },
-      },
-      icon(ICONS.close),
-    ),
+    actionBtn,
+    actionBtn
+      ? null
+      : h(
+          'button',
+          {
+            class: 'fv-icon-btn fv-banner-close',
+            type: 'button',
+            title: 'Dismiss',
+            'aria-label': 'Dismiss',
+            onclick: () => {
+              banner.remove();
+              onDismiss?.();
+            },
+          },
+          icon(ICONS.close),
+        ),
   );
   return banner;
 }
@@ -944,6 +1043,7 @@ function wireGridEvents() {
   listen(sc, 'keydown', onGridKeyDown);
   listen(sc, 'wheel', onGridWheel, { passive: false });
   listen(sc, 'dblclick', onGridDblClick);
+  listen(sc, 'paste', onGridPaste);
   listen(window, 'mousemove', onWindowMouseMove);
   listen(window, 'mouseup', onWindowMouseUp);
   listen(window, 'keydown', (e) => trackModifier(e, true));
@@ -955,6 +1055,10 @@ function wireGridEvents() {
   // The webview document going away (reload, editor moved to another window) keeps the last change: the state save
   // is debounced and would otherwise be dropped.
   listen(window, 'pagehide', () => saveGridState.flush());
+  // A hidden panel keeps what the user typed: an open editor commits (as when it loses the focus).
+  listen(document, 'visibilitychange', () => {
+    if (document.visibilityState === 'hidden') closeCellBox('hidden', false);
+  });
   listen(document, 'copy', onCopyEvent);
   // VS Code's context menu (also a click in the workbench) takes the focus out of the webview's frame, which drops it
   // to <body>: the grid / cell text box that had it is remembered, so that the menu's Copy copies from it and the
@@ -969,8 +1073,9 @@ function wireGridEvents() {
   listen(document, 'keydown', onLostFocusKeyDown);
   listen(document, 'mousedown', (e) => {
     // A click anywhere but the cell text box closes it (the focus goes back to the grid unless the click focuses
-    // something else, such as the name box).
-    if (G?.cellBox && !G.cellBox.el.contains(/** @type {Node} */ (e.target))) closeCellBox();
+    // something else, such as the name box). An editor commits ('blur'); the formula bar is part of the same edit.
+    const box = G?.cellBox;
+    if (G && box && !box.el.contains(/** @type {Node} */ (e.target)) && !(box.mode !== 'view' && G.dom.formula.contains(/** @type {Node} */ (e.target)))) closeCellBox(box.mode === 'view' ? 'close' : 'blur');
     const menu = G?.dom.menu;
     if (menu && !menu.contains(/** @type {Node} */ (e.target)) && e.target !== G?.dom.hiddenBtn && !G?.dom.hiddenBtn.contains(/** @type {Node} */ (e.target))) closeMenu();
   });
@@ -993,7 +1098,7 @@ function wireGridEvents() {
   const ro = new ResizeObserver(() => {
     if (!G) return;
     // The cell text box is placed for the old size.
-    if (G.cellBox && (sc.clientWidth !== G.viewW || sc.clientHeight !== G.viewH)) closeCellBox();
+    if (G.cellBox && (sc.clientWidth !== G.viewW || sc.clientHeight !== G.viewH)) closeCellBox('resize');
     G.viewW = sc.clientWidth;
     G.viewH = sc.clientHeight;
     scheduleRender();
@@ -1021,7 +1126,7 @@ function wireGridEvents() {
     const key = gridThemeKey();
     if (key === themeKey) return;
     themeKey = key;
-    closeCellBox(); // its colours come from the old theme
+    closeCellBox('theme'); // its colours come from the old theme
     G.dark = isDarkTheme();
     darkColorCache.clear();
     darkBgLuminance = -1;
@@ -1054,7 +1159,7 @@ function activateSheet(index, force = false) {
   if (!G) return;
   if (index < 0 || index >= G.meta.sheets.length) return;
   if (index === G.sheet && !force) return;
-  closeCellBox();
+  closeCellBox('sheetSwitch');
   hideTooltip();
   closeMenu();
   if (G.meta.sheets[index].state !== 'visible') G.revealed.add(index);
@@ -1086,7 +1191,7 @@ function getView(index) {
   const existing = g.views.get(index);
   if (existing) return existing;
   const sm = g.meta.sheets[index];
-  const saved = g.saved?.sheets?.[sm.name];
+  const saved = g.saved?.sheets?.[sheetKey(sm)] ?? g.saved?.sheets?.[sm.name];
   /** @type {SheetView} */
   const view = {
     index,
@@ -1135,6 +1240,17 @@ const rowCache = {
   /** Replies to requests up to this id predate the current WorkbookMeta (style indexes may differ). */
   metaFloor: 0,
 };
+
+/**
+ * The `sheetId` field of a request about a sheet: the host resolves the sheet by id when it is given (the position stays
+ * for 0.1.2). Nothing for a host that sends no ids.
+ * @param {number} sheet
+ * @returns {{ sheetId?: SheetId }}
+ */
+function idField(sheet) {
+  const id = G?.meta.sheets[sheet]?.id;
+  return id === undefined ? {} : { sheetId: id };
+}
 
 /**
  * @param {number} sheet
@@ -1199,7 +1315,7 @@ function pumpRequests() {
     if (start >= end) continue;
     const reqId = ++rowCache.reqSeq;
     rowCache.inflight.set(key, { reqId, sent: now });
-    post({ type: 'getRows', reqId, sheet, start, end });
+    post({ type: 'getRows', reqId, sheet, ...idField(sheet), start, end });
   }
 }
 
@@ -1246,6 +1362,12 @@ function mergeStyles(entries) {
 /** @param {RowsMessage} msg */
 function onRows(msg) {
   if (!G) return;
+  // Rows of an older document version, or of another sheet than the one asked for (the tab at that position changed),
+  // are dropped (contract §2.7); the block is asked for again.
+  if ((msg.version !== undefined && msg.version < G.version) || (msg.sheetId !== undefined && G.meta.sheets[msg.sheet]?.id !== undefined && msg.sheetId !== G.meta.sheets[msg.sheet].id)) {
+    dropStaleRows(msg);
+    return;
+  }
   // Style entries are valid for the current meta even when the rows themselves arrive too late.
   if (msg.reqId > rowCache.metaFloor) mergeStyles(msg.styles);
   const direct = rowCache.direct.get(msg.reqId);
@@ -1278,9 +1400,41 @@ function onRows(msg) {
     }
     // A cell text box opened before its row was loaded gets its text now.
     const box = G.cellBox;
-    if (box && !box.loaded && box.sheet === msg.sheet && box.r >= msg.start && box.r < msg.end) openCellBox(activeView(), box.r, box.c);
+    if (box && !box.loaded && box.sheet === msg.sheet && box.r >= msg.start && box.r < msg.end) fillCellBox(box);
   }
   pumpRequests();
+}
+
+/** A rows reply that is not used: its request is forgotten, so the block is asked for again. @param {RowsMessage} msg */
+function dropStaleRows(msg) {
+  const key = blockKey(msg.sheet, Math.floor(msg.start / BLOCK_ROWS));
+  if (rowCache.inflight.get(key)?.reqId === msg.reqId) rowCache.inflight.delete(key);
+  const direct = rowCache.direct.get(msg.reqId);
+  if (direct) {
+    rowCache.direct.delete(msg.reqId);
+    direct.reject(new Error('The data changed while it was being read.'));
+  }
+  scheduleRender();
+  pumpRequests();
+}
+
+/**
+ * A box opened before its row was loaded gets the cell's text now. The read-only box opens again (0.1.2); an editor only
+ * takes the text while nothing was typed, and compares with the loaded text from now on.
+ * @param {CellBox} box
+ */
+function fillCellBox(box) {
+  const view = activeView();
+  if (box.mode === 'view') {
+    openCellBox(view, box.r, box.c);
+    return;
+  }
+  const text = editStartText(view, box.r, box.c, cellAt(view, box.r, box.c));
+  box.loaded = true;
+  if (box.el.value === box.initialValue) box.el.value = text;
+  box.initialValue = text;
+  syncFormulaFromBox();
+  relayoutCellBox();
 }
 
 /**
@@ -1324,7 +1478,7 @@ async function fetchRows(sheet, r0, r1, cols) {
     /** @type {RowsMessage} */
     const reply = await new Promise((resolve, reject) => {
       rowCache.direct.set(reqId, { resolve, reject });
-      post(cols ? { type: 'getRows', reqId, sheet, start, end: end + 1, c0: cols.c0, c1: cols.c1 } : { type: 'getRows', reqId, sheet, start, end: end + 1 });
+      post(cols ? { type: 'getRows', reqId, sheet, ...idField(sheet), start, end: end + 1, c0: cols.c0, c1: cols.c1 } : { type: 'getRows', reqId, sheet, ...idField(sheet), start, end: end + 1 });
     });
     for (const row of reply.rows) if (row.r >= r0 && row.r <= r1) rows.set(row.r, row);
   }
@@ -1342,16 +1496,20 @@ function countCells(sheet, ranges) {
   const reqId = ++g.statsSeq;
   return new Promise((resolve, reject) => {
     rowCache.probes.set(reqId, { resolve, reject });
-    post({ type: 'getStats', reqId, sheet, ranges });
+    post({ type: 'getStats', reqId, sheet, ...idField(sheet), ranges });
   });
 }
 
 /** @param {InvalidateMessage} msg */
 function onInvalidate(msg) {
   if (!G) return;
-  closeCellBox(); // its text may have changed
+  closeCellBox('invalidate');
   resetRowCache();
   hideTooltip();
+  if (msg.version !== undefined) G.version = Math.max(G.version, msg.version);
+  dropQueuedEdits();
+  G.overlay.clear();
+  if (msg.editState) onEditState({ type: 'editState', state: msg.editState });
   if (msg.banner !== undefined) updateBanner(msg.banner ?? undefined);
   if (msg.meta) {
     rowCache.metaFloor = rowCache.reqSeq;
@@ -1365,7 +1523,7 @@ function onInvalidate(msg) {
     G.views = new Map();
     G.revealed = new Set();
     msg.meta.sheets.forEach((s, i) => {
-      if (revealedNames.has(s.name)) G?.revealed.add(i);
+      if (revealedNames.has(sheetKey(s)) || revealedNames.has(s.name)) G?.revealed.add(i);
     });
     if (!msg.meta.sheets.length) {
       // No active sheet until worksheets come back: queued renders, stats and announcements stop.
@@ -1381,7 +1539,7 @@ function onInvalidate(msg) {
       mountGrid(root.querySelector('.fv-banner-text')?.textContent ?? undefined);
       if (document.activeElement === document.body) G.dom.scroller.focus({ preventScroll: true });
     }
-    let index = msg.meta.sheets.findIndex((s) => s.name === activeName);
+    let index = msg.meta.sheets.findIndex((s) => sheetKey(s) === activeName || s.name === activeName);
     if (index < 0) {
       // The active sheet is gone: same position, else the workbook's active sheet (revealed when it is hidden, as on
       // first display); another hidden one only if revealed.
@@ -1895,7 +2053,7 @@ function onGridScroll() {
   if (!G) return;
   // Scrolling closes the cell text box (not the scroll event of the position it opened at).
   const box = G.cellBox;
-  if (box && (Math.abs(G.dom.scroller.scrollTop - box.st) >= 1 || Math.abs(G.dom.scroller.scrollLeft - box.sl) >= 1)) closeCellBox();
+  if (box && (Math.abs(G.dom.scroller.scrollTop - box.st) >= 1 || Math.abs(G.dom.scroller.scrollLeft - box.sl) >= 1)) closeCellBox('scroll');
   scheduleRender();
   hoverReset();
   saveGridState();
@@ -2038,7 +2196,8 @@ function renderPaneCells(p, view, L, ra, rb, ca, cb) {
       if (rowHeight(L, r) === 0) continue;
       const row = getRow(view.index, r);
       if (row === undefined) continue; // placeholder drawn by renderPaneGrid
-      const cells = row ? row.cells : NO_CELLS;
+      const pending = getRowOverlay(view.index, r);
+      const cells = pending ? withOverlayCells(row ? row.cells : NO_CELLS, pending) : row ? row.cells : NO_CELLS;
       const rowS = rowStyleIndex(sm, r);
       let i = lowerBound(cells, ca);
       // Text overflowing into the window from the left (a formula returning "" blocks overflow, see overflowTarget).
@@ -2147,15 +2306,16 @@ function paintCell(p, view, L, key, m, r, c, cell, s, rowCells) {
 
   // Text. Numbers, dates, booleans and errors are values: never wrapped and never cut — they lose decimals
   // (General) or show ### like Excel.
-  const value = !!cell && (cell.t === 'n' || cell.t === 'd' || cell.t === 'b' || cell.t === 'e');
+  const over = getCellOverlay(view.index, r, c);
+  const raw = over !== undefined ? over : (cell ? displayText(cell) : '');
+  const value = over !== undefined ? false : !!cell && (cell.t === 'n' || cell.t === 'd' || cell.t === 'b' || cell.t === 'e');
   const wrap = S.wrap && !value;
-  const raw = cell ? displayText(cell) : '';
   let text = !wrap && raw.includes('\n') ? oneLine(raw) : raw;
   /** @type {RichRun[] | null} */
-  let rich = cell && cell.rt && cell.rt.length ? cell.rt : null;
+  let rich = over === undefined && cell && cell.rt && cell.rt.length ? cell.rt : null;
   // Fitted values always fit their cell (no clipping check needed below).
   const fitted = !!text && value && !S.rot && !S.shrink && !rich;
-  if (fitted) text = fitNumber(cell, text, S, w);
+  if (fitted && cell) text = fitNumber(cell, text, S, w);
   // Repeat-to-fill formats (accounting `_("$"* #,##0.00_)`, `@*-`) span the whole cell whatever its alignment (fillHtml);
   // a value that did not fit (### / rounded) is shown as such. Not with wrapping, rotation, shrinking or rich text.
   const fillFmt = cell && cell.fill && text === raw && !wrap && !S.rot && !S.shrink && !rich && S.h !== 'fill' ? cell.fill : null;
@@ -3678,6 +3838,27 @@ function serialToDateString(serial) {
   return hasTime ? `${date.toLocaleDateString(undefined, opts)} ${date.toLocaleTimeString(undefined, opts)}` : date.toLocaleDateString(undefined, opts);
 }
 
+/**
+ * Excel serial → editable date/time text that the host reads back the same in every locale (parseCellInput knows ISO
+ * and m/d/yyyy only): `yyyy-mm-dd`, `yyyy-mm-dd hh:mm:ss`, or `hh:mm:ss` for a time alone (+ `.mmm` when there are
+ * milliseconds). A locale text such as 05/01/2024 (en-GB) would be read back as May 1.
+ * @param {number} serial
+ */
+function serialToEditText(serial) {
+  const g = /** @type {GridState} */ (G);
+  let days = serial + (g.meta.date1904 ? 1462 : 0);
+  if (!g.meta.date1904 && days < 61) days += 1; // Excel's fictitious 1900-02-29
+  const date = new Date(Math.round((days - 25569) * 86400000));
+  if (Number.isNaN(date.getTime())) return String(serial);
+  const two = (/** @type {number} */ n) => String(n).padStart(2, '0');
+  const ms = date.getUTCMilliseconds();
+  const time = `${two(date.getUTCHours())}:${two(date.getUTCMinutes())}:${two(date.getUTCSeconds())}${ms ? '.' + String(ms).padStart(3, '0') : ''}`;
+  if (serial < 1 && serial >= 0) return time;
+  const day = `${String(date.getUTCFullYear()).padStart(4, '0')}-${two(date.getUTCMonth() + 1)}-${two(date.getUTCDate())}`;
+  const hasTime = date.getUTCHours() || date.getUTCMinutes() || date.getUTCSeconds() || ms;
+  return hasTime ? `${day} ${time}` : day;
+}
+
 /** Value shown in the formula bar: `=formula` (`{=formula}`), or the raw value. @param {CellData | null | undefined} cell */
 function rawValue(cell) {
   if (!cell || cell.t === 'z') return '';
@@ -3691,7 +3872,7 @@ function rawValue(cell) {
     case 'n':
       return typeof v === 'number' ? formulaBarNumber(v) : String(v);
     case 'd':
-      return typeof v === 'number' ? serialToDateString(v) : String(v);
+      return typeof v === 'number' ? serialToEditText(v) : String(v);
     case 'b':
       return v ? 'TRUE' : 'FALSE';
     default:
@@ -4399,7 +4580,7 @@ function setZoom(zoom) {
   const view = activeView();
   zoom = clamp(Math.round(zoom), MIN_ZOOM, MAX_ZOOM);
   if (zoom === view.zoom || !view.L) return;
-  closeCellBox();
+  closeCellBox('zoom');
   const L = view.L;
   const vy = virtualScrollTop();
   const sl = G.dom.scroller.scrollLeft;
@@ -4456,6 +4637,30 @@ function onGridKeyDown(e) {
   if (!L) return;
   const ctrl = e.ctrlKey || e.metaKey;
   const shift = e.shiftKey;
+  // An edit of this panel is in flight (or queued): VS Code's undo would hit the edit BEFORE it, so Ctrl+Z / Ctrl+Y are
+  // held back and sent as a command behind the edits (D-067). Ctrl+S is held back the same way, so the file has every edit.
+  if (G.inFlightEdit && ctrl && !e.altKey) {
+    const k = e.key.toLowerCase();
+    if (k === 'z' || k === 'y' || (k === 's' && !shift)) {
+      e.preventDefault();
+      e.stopPropagation();
+      sendCommand(k === 's' ? 'save' : k === 'y' || shift ? 'redo' : 'undo');
+      return;
+    }
+  }
+  // Typing starts an edit with the typed character. An IME or dead key opens the box empty and the browser types into it.
+  if (isCellEditable()) {
+    const typed = editStartKey(e);
+    if (typed !== null) {
+      const m = masterOf(view, view.sel.active.r, view.sel.active.c);
+      if (typed !== '') e.preventDefault();
+      e.stopPropagation();
+      openCellBox(view, m.r, m.c, { mode: 'replace', text: typed });
+      return;
+    }
+  } else if (editStartKey(e)) {
+    sayReadOnly();
+  }
   switch (e.key) {
     case 'ArrowUp':
       moveSelection(view, -1, 0, shift, ctrl);
@@ -4515,14 +4720,25 @@ function onGridKeyDown(e) {
       closeMenu();
       return;
     case 'F2': {
-      // Excel's F2 edits the active cell in place: here the read-only cell text box, caret at the end of the text.
+      // Excel's F2 edits the active cell in place, caret at the end of the text (a read-only grid: the read-only box).
       if (ctrl || shift || e.altKey) return;
       const m = masterOf(view, view.sel.active.r, view.sel.active.c);
-      openCellBox(view, m.r, m.c, true);
+      openCellBox(view, m.r, m.c, { mode: 'edit', caretAtEnd: true });
       break;
     }
+    case 'Delete':
+      if (!ctrl && !e.altKey && !canClear()) sayReadOnly();
+      if (ctrl || e.altKey || !canClear()) return;
+      clearSelectionContents(view);
+      break;
     case 'Backspace':
-      // Ctrl+Backspace scrolls the active cell into view; Shift+Backspace keeps only the active cell selected (Excel).
+      // An editable grid: Backspace clears like Delete. Ctrl+Backspace scrolls the active cell into view; Shift+Backspace
+      // keeps only the active cell selected (Excel).
+      if (!ctrl && !shift && !e.altKey && canClear()) {
+        clearSelectionContents(view);
+        break;
+      }
+      if (!ctrl && !shift && !e.altKey) sayReadOnly();
       if (e.altKey || ctrl === shift) return;
       if (ctrl) scrollCellIntoView(view, view.sel.active.r, view.sel.active.c);
       else selectCell(view, view.sel.active.r, view.sel.active.c);
@@ -4531,7 +4747,13 @@ function onGridKeyDown(e) {
       const k = e.key.toLowerCase();
       if (ctrl && !e.altKey && k === 'a') selectRegionOrAll(view);
       else if (ctrl && !e.altKey && !shift && k === 'c') copySelectionFromKeyboard();
-      else if (ctrl && !e.altKey && !shift && e.key === '.') nextCorner(view);
+      else if (ctrl && !e.altKey && !shift && k === 'x' && isCellEditable()) {
+        // Cut is not in 0.2.0 (D-044): nothing is removed, and the key does not reach VS Code's own cut.
+        setStatusMessage('Cut is not available yet; use Copy and Delete.', 'info');
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      } else if (ctrl && !e.altKey && !shift && e.key === '.') nextCorner(view);
       else return;
     }
   }
@@ -5241,8 +5463,21 @@ async function currentRegion(view, alive) {
  * @typedef {'cell' | 'single' | 'rows' | 'cols'} CopyMode
  */
 
-/** Text prepared for the next `copy` event (set by the keyboard handler); html '' = plain text only. @type {{ text: string, html: string, cells: number } | null} */
+/** Text prepared for the next `copy` event (set by the keyboard handler); html '' = plain text only. @type {{ text: string, html: string, cells: number, values?: string[][] } | null} */
 let pendingCopy = null;
+
+/** The last copy from this grid: a paste whose plain text is still `text` pastes `values` (exact numbers, text stays text). @type {{ text: string, values: string[][] } | null} */
+let lastCopy = null;
+
+/** Remembers what was put on the clipboard. @param {{ text: string, values?: string[][] }} payload */
+function rememberCopy(payload) {
+  lastCopy = payload.values ? { text: payload.text, values: payload.values } : null;
+}
+
+/** Line endings and one final line break do not matter when the clipboard text is compared. @param {string} text */
+function clipboardKey(text) {
+  return text.replace(/\r\n?/g, '\n').replace(/\n$/, '');
+}
 
 function copySelectionFromKeyboard() {
   if (!G) return;
@@ -5262,9 +5497,10 @@ function copySelectionFromKeyboard() {
 /**
  * Puts a payload on the clipboard through a copy event (text + HTML), else (execCommand refused, or no copy event
  * reached onCopyEvent) as plain text with the async clipboard API.
- * @param {{ text: string, html: string, cells: number }} payload
+ * @param {{ text: string, html: string, cells: number, values?: string[][] }} payload
  */
 function copyPayload(payload) {
+  rememberCopy(payload);
   pendingCopy = payload;
   let ok = false;
   try {
@@ -5315,6 +5551,7 @@ function onCopyEvent(e) {
     }
   }
   e.preventDefault();
+  rememberCopy(payload);
   e.clipboardData.setData('text/plain', payload.text);
   if (payload.html) e.clipboardData.setData('text/html', payload.html);
   setStatusMessage(payload.cells ? `Copied ${formatCount(payload.cells)} cell${payload.cells === 1 ? '' : 's'}` : 'Copied', 'info');
@@ -5360,14 +5597,20 @@ function planCopy(view) {
  * available.
  * @param {SheetView} view @param {Range[]} ranges @param {CopyMode} mode
  * @param {(r: number) => RowData | null | undefined} rowOf
- * @returns {{ text: string, html: string, cells: number } | null}
+ * `values`: per copied cell, the text that pastes the same value back inside FileStudio (exact number, apostrophe for
+ * text that would read as a value); used on paste while the clipboard still holds `text`.
+ * @returns {{ text: string, html: string, cells: number, values: string[][] } | null}
  */
 function buildCopyPayload(view, ranges, mode, rowOf) {
   if (mode === 'cell') {
     const { r0, c0 } = ranges[0];
+    const over = getCellOverlay(view.index, r0, c0);
+    if (over !== undefined) return { text: over, html: '', cells: 1, values: [[over]] };
     const row = rowOf(r0);
     if (row === undefined) return null;
-    return { text: displayText(row ? findCell(row.cells, c0) : null), html: '', cells: 1 };
+    const cell = row ? findCell(row.cells, c0) : null;
+    const text = displayText(cell);
+    return { text, html: '', cells: 1, values: [[pasteTextOf(cell, text)]] };
   }
   const sm = view.meta;
   /** Rows (columns) of [a, b] that are not hidden; all of them when every one is hidden. */
@@ -5383,9 +5626,11 @@ function buildCopyPayload(view, ranges, mode, rowOf) {
   const table = [];
   /** Per table cell: a text cell (marked as text in the HTML). @type {boolean[][]} */
   const isText = [];
+  /** @type {string[][]} */
+  const values = [];
   const markText = G?.kind === 'sheet';
-  /** @param {number} r @param {number[]} cols ascending @param {string[]} out @param {boolean[]} outText */
-  const appendRow = (r, cols, out, outText) => {
+  /** @param {number} r @param {number[]} cols ascending @param {string[]} out @param {boolean[]} outText @param {string[]} outVal */
+  const appendRow = (r, cols, out, outText, outVal) => {
     const row = rowOf(r);
     if (row === undefined) return false;
     const cells = row ? row.cells : NO_CELLS;
@@ -5394,16 +5639,22 @@ function buildCopyPayload(view, ranges, mode, rowOf) {
       while (i < cells.length && cells[i].c < c) i++;
       let text = '';
       let str = false;
-      if (i < cells.length && cells[i].c === c) {
+      let val = '';
+      const over = getCellOverlay(view.index, r, c);
+      if (over !== undefined) {
+        text = val = over; // what the grid shows; whether it is text is known when the host's rows arrive
+      } else if (i < cells.length && cells[i].c === c) {
         const cell = cells[i++];
         const covered = view.mergeIndex.size && mergeAt(view, r, c) >= 0 && !(masterOf(view, r, c).r === r && masterOf(view, r, c).c === c);
         if (!covered) {
           text = displayText(cell);
           str = markText && cell.t === 's' && text !== '';
+          val = pasteTextOf(cell, text);
         }
       }
       out.push(text);
       outText.push(str);
+      outVal.push(val);
     }
     return true;
   };
@@ -5415,9 +5666,12 @@ function buildCopyPayload(view, ranges, mode, rowOf) {
       const out = [];
       /** @type {boolean[]} */
       const outText = [];
-      for (const cols of colsOf) if (!appendRow(r, cols, out, outText)) return null;
+      /** @type {string[]} */
+      const outVal = [];
+      for (const cols of colsOf) if (!appendRow(r, cols, out, outText, outVal)) return null;
       table.push(out);
       isText.push(outText);
+      values.push(outVal);
     }
   } else {
     for (const rg of ranges) {
@@ -5427,9 +5681,12 @@ function buildCopyPayload(view, ranges, mode, rowOf) {
         const out = [];
         /** @type {boolean[]} */
         const outText = [];
-        if (!appendRow(r, cols, out, outText)) return null;
+        /** @type {string[]} */
+        const outVal = [];
+        if (!appendRow(r, cols, out, outText, outVal)) return null;
         table.push(out);
         isText.push(outText);
+        values.push(outVal);
       }
     }
   }
@@ -5437,7 +5694,58 @@ function buildCopyPayload(view, ranges, mode, rowOf) {
   const text = table.map((row) => row.map(quote).join('\t')).join('\r\n');
   const td = (/** @type {string} */ s, /** @type {boolean} */ str) => `<td${str ? ` style="mso-number-format:'\\@'"` : ''}>${escapeHtml(s).replace(/\r?\n/g, '<br>')}</td>`;
   const html = '<meta charset="utf-8"><table>' + table.map((row, i) => '<tr>' + row.map((s, j) => td(s, isText[i][j])).join('') + '</tr>').join('') + '</table>';
-  return { text, html, cells: table.length * (table[0]?.length ?? 0) };
+  return { text, html, cells: table.length * (table[0]?.length ?? 0), values };
+}
+
+/**
+ * xlsx: the text that pastes this cell's value back exactly (Excel keeps the value on a copy inside the app): the full
+ * number when the display text rounds it (1234.5678 shown as $1,234.57, 5 shown as "5.00 kg"), an apostrophe on text that
+ * would read as a value ('007, '=1+1, 'true). Formulas and everything else: the display text.
+ * @param {CellData | null | undefined} cell @param {string} text the display text
+ */
+function pasteTextOf(cell, text) {
+  if (!cell || cell.f || G?.kind !== 'sheet') return text;
+  if (cell.t === 's') return textReadsAsValue(text) ? `'${text}` : text;
+  if (cell.t === 'n' && typeof cell.v === 'number' && Number.isFinite(cell.v)) return exactNumberText(text, cell.v, true) ?? text;
+  return text;
+}
+
+/**
+ * The text to paste for number v shown as `text`, or null when the text already reads back as v. A plain number shape
+ * keeps its % or $ (so a General target still gets that format); any other display text ("5.00 kg", " 1/2") gives the
+ * bare number when `anyShape`, else null.
+ * @param {string} text @param {number} v @param {boolean} anyShape
+ * @returns {string | null}
+ */
+function exactNumberText(text, v, anyShape) {
+  const shape = numberShape(text);
+  if (!shape) return anyShape ? formulaBarNumber(v) : null;
+  if (shape.n === v || Math.abs(shape.n - v) <= Math.abs(v) * 1e-15) return null;
+  if (shape.percent) return `${formulaBarNumber(v * 100)}%`;
+  return (shape.currency ? '$' : '') + formulaBarNumber(v);
+}
+
+/**
+ * A display text in a plain number shape ($, thousands separators, spaces, a trailing %, negative parentheses) and the
+ * number it reads as; null for anything else (dates, units, fractions).
+ * @param {string} text
+ * @returns {{ n: number, percent: boolean, currency: boolean } | null}
+ */
+function numberShape(text) {
+  let t = text.trim();
+  const percent = t.endsWith('%');
+  if (percent) t = t.slice(0, -1);
+  let neg = false;
+  if (/^\(.*\)$/.test(t)) {
+    neg = true;
+    t = t.slice(1, -1);
+  }
+  const currency = t.includes('$');
+  t = t.replace(/[$,\s]/g, '');
+  if (!/^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/.test(t)) return null;
+  let n = Number(t) / (percent ? 100 : 1);
+  if (neg) n = -n;
+  return { n, percent, currency };
 }
 
 /**
@@ -5481,6 +5789,10 @@ async function writeClipboard(text, cells) {
 }
 
 // ----- CELL TEXT BOX -----
+// (v0.2.0) The box is also the cell EDITOR while the host allows editing (editState.editable and the kind setCells): F2,
+// a double-click or typing open it, Enter / Tab / Shift+ commit and move, Esc cancels, Alt+Enter is a line break. Every way
+// it can close is one call of closeCellBox(reason) with a fixed rule per reason (CELLBOX_RULES). The rest of this comment
+// describes the read-only box of 0.1.2, which is what the box is while the grid is read-only.
 // Double-clicking a cell opens Excel's in-cell edit box, read-only: a textarea that refuses every edit, over the cell
 // (or merged area), with the cell's display text, all of it selected. Part of it can be selected with the mouse or keyboard and
 // copied: the textarea's own copy (plain text); the grid's copy handler only acts while the grid has the focus.
@@ -5501,6 +5813,9 @@ async function writeClipboard(text, cells) {
  * @property {boolean} loaded    the cell's row was loaded (else onRows fills the text in when it arrives)
  * @property {boolean} menu      a context menu was opened on it and the focus has not come back since: VS Code's menu
  *   takes the focus away (to <body>), which must not close the box (its Copy copies the box's selected text)
+ * @property {'view' | 'edit' | 'replace'} mode  view = the read-only box of 0.1.2; edit = F2 / double-click / formula bar; replace = typing
+ * @property {string} initialValue  an editor: the text the edit started from (what "unchanged" means)
+ * @property {boolean} composing    an IME composition is running (it never commits)
  */
 
 /** @param {MouseEvent} e */
@@ -5516,28 +5831,64 @@ function onGridDblClick(e) {
   if (hit.area !== 'cell') return;
   const view = activeView();
   const m = masterOf(view, hit.r, hit.c);
-  openCellBox(view, m.r, m.c);
+  openCellBox(view, m.r, m.c, { mode: 'edit', caretAtEnd: isCellEditable() });
 }
 
 /**
- * Opens (or re-opens) the read-only text box of a cell: all of its text selected (double-click), or the caret at the
- * end of the text (F2, as Excel's in-cell edit puts it).
- * @param {SheetView} view @param {number} r @param {number} c  top-left cell of the cell / merged area
- * @param {boolean} [caretAtEnd]
+ * What opens the in-cell box and how.
+ * @typedef {object} CellBoxOpen
+ * @property {'view' | 'edit' | 'replace'} [mode]  'edit' (F2, double-click, formula bar) and 'replace' (typing) only while the
+ *   grid is editable; otherwise, and by default, the read-only box of 0.1.2
+ * @property {boolean} [caretAtEnd]  caret at the end of the text; else all of it selected
+ * @property {string} [text]         'replace': what the user typed to start the edit
+ * @property {boolean} [focus]       false: the formula bar keeps the focus (it is the second editor of the same cell)
  */
-function openCellBox(view, r, c, caretAtEnd = false) {
+
+/**
+ * Opens (or re-opens) the in-cell box of a cell. Read-only mode: all of the display text selected (double-click) or the
+ * caret at its end (F2), nothing can be changed. Edit modes (grid editable): the text starts as the cell's edit text
+ * (editStartText); 'replace' starts with what the user typed. Opening a box first ends an editor that is still open
+ * (commit, like clicking elsewhere).
+ * @param {SheetView} view @param {number} r @param {number} c  top-left cell of the cell / merged area
+ * @param {CellBoxOpen} [opts]
+ */
+function openCellBox(view, r, c, opts = {}) {
   const g = /** @type {GridState} */ (G);
-  closeCellBox(false);
+  closeCellBox('blur', false);
   const host = g.dom.scroller.parentElement;
   if (!view.L || !host) return;
   hoverReset();
   closeMenu();
   scrollCellIntoView(view, r, c);
   const cell = cellAt(view, r, c);
-  const text = cell ? displayText(cell) : '';
-  // Not the readonly attribute: Chrome then ignores the keys that move the caret (Shift+Arrow, Home, End), so the
-  // text could not be selected from the keyboard. Every edit is cancelled instead (beforeinput, paste, cut, drop); an
-  // IME composition, which cannot be cancelled, is undone by the input handler.
+  /** @type {'view' | 'edit' | 'replace'} */
+  const mode = isCellEditable() ? opts.mode || 'view' : 'view';
+  const original = mode === 'view' ? '' : editStartText(view, r, c, cell);
+  const text = mode === 'view' ? (cell ? displayText(cell) : '') : mode === 'replace' ? opts.text || '' : original;
+  const caretAtEnd = opts.caretAtEnd === true || mode === 'replace';
+  const el = mode === 'view' ? buildViewCellBox(r, c, text) : buildEditCellBox(r, c);
+  el.value = text;
+  const sc = g.dom.scroller;
+  g.cellBox = { el, sheet: view.index, r, c, st: sc.scrollTop, sl: sc.scrollLeft, loaded: cell !== undefined, menu: false, mode, initialValue: original, composing: false };
+  host.appendChild(el);
+  layoutCellBox(view, el, r, c, cell);
+  if (opts.focus !== false) {
+    el.focus({ preventScroll: true });
+    el.setSelectionRange(caretAtEnd ? el.value.length : 0, el.value.length);
+    el.scrollTop = caretAtEnd ? el.scrollHeight : 0;
+  }
+  if (mode !== 'view') syncFormulaFromBox();
+}
+
+/**
+ * The read-only box (0.1.2). Not the readonly attribute: Chrome then ignores the keys that move the caret (Shift+Arrow,
+ * Home, End), so the text could not be selected from the keyboard. Every edit is cancelled instead (beforeinput, paste,
+ * cut, drop); an IME composition, which cannot be cancelled, is undone by the input handler.
+ * @param {number} r @param {number} c @param {string} text
+ * @returns {HTMLTextAreaElement}
+ */
+function buildViewCellBox(r, c, text) {
+  /** @type {HTMLTextAreaElement} */
   const el = /** @type {HTMLTextAreaElement} */ (
     h('textarea', {
       class: 'fv-cellbox',
@@ -5550,12 +5901,12 @@ function openCellBox(view, r, c, caretAtEnd = false) {
         if (e.isComposing || (e.key !== 'Escape' && e.key !== 'Enter' && e.key !== 'Tab')) return;
         e.preventDefault();
         e.stopPropagation();
-        closeCellBox();
+        closeCellBox('escape');
       },
       // Focus moving elsewhere in the view (F6, Ctrl+G, a click on the name box) closes it; switching to another
       // window keeps it, and the browser gives it the focus back. So does VS Code's context menu on it.
       onblur: () => {
-        if (G?.cellBox?.el === el && document.hasFocus() && !G.cellBox.menu) closeCellBox(false);
+        if (G?.cellBox?.el === el && document.hasFocus() && !G.cellBox.menu) closeCellBox('blur', false);
       },
       oncontextmenu: () => {
         if (G?.cellBox?.el === el) G.cellBox.menu = true;
@@ -5574,28 +5925,204 @@ function openCellBox(view, r, c, caretAtEnd = false) {
       ondragstart: (/** @type {Event} */ e) => e.preventDefault(),
     })
   );
-  el.value = text;
-  const sc = g.dom.scroller;
-  g.cellBox = { el, sheet: view.index, r, c, st: sc.scrollTop, sl: sc.scrollLeft, loaded: cell !== undefined, menu: false };
-  host.appendChild(el);
-  layoutCellBox(view, el, r, c, cell);
-  el.focus({ preventScroll: true });
-  el.setSelectionRange(caretAtEnd ? el.value.length : 0, el.value.length);
-  el.scrollTop = caretAtEnd ? el.scrollHeight : 0;
+  return el;
 }
 
 /**
- * Closes the cell text box. With `focusGrid` the grid takes the focus back when the box had it (or the focus was lost).
- * @param {boolean} [focusGrid]
+ * The editor box. Its text is the one source of truth of an edit: the formula bar mirrors it (and the other way round).
+ * @param {number} r @param {number} c
+ * @returns {HTMLTextAreaElement}
  */
-function closeCellBox(focusGrid = true) {
+function buildEditCellBox(r, c) {
+  /** @type {HTMLTextAreaElement} */
+  const el = /** @type {HTMLTextAreaElement} */ (
+    h('textarea', {
+      class: 'fv-cellbox',
+      'aria-readonly': 'false',
+      spellcheck: 'false',
+      autocomplete: 'off',
+      'aria-label': `${colName(c)}${r + 1} cell text`,
+      onkeydown: (/** @type {KeyboardEvent} */ e) => onCellBoxKeyDown(e, el),
+      onblur: (/** @type {FocusEvent} */ e) => onCellBoxBlur(e, el),
+      oncontextmenu: () => {
+        if (G?.cellBox?.el === el) G.cellBox.menu = true;
+      },
+      onwheel: (/** @type {WheelEvent} */ e) => onCellBoxWheel(e, el),
+      oninput: () => onCellBoxInput(el),
+      // An IME composition never commits: its Enter / Tab belong to the IME, and only compositionend ends it.
+      oncompositionstart: () => {
+        if (G?.cellBox?.el === el) G.cellBox.composing = true;
+      },
+      oncompositionend: () => {
+        if (G?.cellBox?.el === el) G.cellBox.composing = false;
+        onCellBoxInput(el);
+      },
+    })
+  );
+  return el;
+}
+
+/**
+ * Keys of the editor box (contract §10, D-026). Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z: the browser undoes the typing (no
+ * preventDefault) and the key must not reach VS Code, which would undo the document. Ctrl+S commits and saves.
+ * @param {KeyboardEvent} e @param {HTMLTextAreaElement} el
+ */
+function onCellBoxKeyDown(e, el) {
+  const box = G?.cellBox;
+  if (!G || !box || box.el !== el) return;
+  box.menu = false;
+  if (e.isComposing || box.composing || e.keyCode === 229) return;
+  const ctrl = e.ctrlKey || e.metaKey;
+  const key = e.key.toLowerCase();
+  if (ctrl && !e.altKey && (key === 'z' || key === 'y')) {
+    e.stopPropagation();
+    return;
+  }
+  if (ctrl && !e.altKey && !e.shiftKey && key === 's') {
+    e.preventDefault();
+    e.stopPropagation();
+    endCellEdit('save', 0, 'save');
+    return;
+  }
+  if (e.altKey && !ctrl && e.key === 'Enter') {
+    e.preventDefault();
+    e.stopPropagation();
+    insertLineBreak(el);
+    return;
+  }
+  if (ctrl && !e.altKey && !e.shiftKey && e.key === 'Enter') {
+    // Excel: Ctrl+Enter commits and stays in the cell.
+    e.preventDefault();
+    e.stopPropagation();
+    endCellEdit('enter', 0);
+    return;
+  }
+  if (ctrl || e.altKey) return;
+  if (e.key === 'Enter' || e.key === 'Tab') {
+    e.preventDefault();
+    e.stopPropagation();
+    endCellEdit(e.key === 'Enter' ? 'enter' : 'tab', e.shiftKey ? -1 : 1);
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    e.stopPropagation();
+    cancelCellEdit();
+  }
+}
+
+/**
+ * The editor lost the focus: that commits, unless the window itself lost it (VS Code's menus, another window: the
+ * browser gives it back), a context menu is open on it, or the focus went to the formula bar (the same edit).
+ * @param {FocusEvent} e @param {HTMLTextAreaElement} el
+ */
+function onCellBoxBlur(e, el) {
+  const box = G?.cellBox;
+  if (!G || !box || box.el !== el || !document.hasFocus() || box.menu) return;
+  if (e.relatedTarget === G.dom.formula) return;
+  closeCellBox('blur', false);
+}
+
+/** @param {HTMLTextAreaElement} el */
+function onCellBoxInput(el) {
+  if (G?.cellBox?.el !== el) return;
+  syncFormulaFromBox();
+  relayoutCellBox();
+}
+
+/** Alt+Enter: a line break at the caret (Excel). @param {HTMLTextAreaElement} el */
+function insertLineBreak(el) {
+  const start = el.selectionStart;
+  el.setRangeText('\n', start, el.selectionEnd, 'end');
+  onCellBoxInput(el);
+}
+
+/**
+ * What closeCellBox does with an open EDITOR for each reason (contract §10): commit = send the text, cancel = drop it,
+ * keep = leave it open (it is only moved). The read-only box of 0.1.2 closes for every reason.
+ * @type {Record<string, 'commit' | 'cancel' | 'keep'>}
+ */
+const CELLBOX_RULES = {
+  blur: 'commit',
+  enter: 'commit',
+  tab: 'commit',
+  save: 'commit',
+  sheetSwitch: 'commit',
+  hidden: 'commit',
+  escape: 'cancel',
+  invalidate: 'cancel',
+  notEditable: 'cancel',
+  close: 'cancel',
+  scroll: 'keep',
+  zoom: 'keep',
+  theme: 'keep',
+  resize: 'keep',
+};
+
+/**
+ * Closes the cell box, or ends the cell editor, by one fixed rule per reason (CELLBOX_RULES). With `focusGrid` the grid
+ * takes the focus back when the box had it (or the focus was lost). `then: 'save'` asks the host to save after the edit.
+ * @param {string} [reason] @param {boolean} [focusGrid] @param {'save'} [then]
+ */
+function closeCellBox(reason = 'close', focusGrid = true, then) {
   const box = G?.cellBox;
   if (!G || !box) return;
+  const rule = box.mode === 'view' ? 'cancel' : CELLBOX_RULES[reason] || 'cancel';
+  if (rule === 'keep') {
+    relayoutSoon(); // moved in the next frame (a zoom or theme change is applied right after this call)
+    return;
+  }
+  const text = box.el.value;
   // Cleared first: removing the focused box fires its blur handler, which must find it closed.
   G.cellBox = null;
   const hadFocus = document.activeElement === box.el;
   box.el.remove();
   if (focusGrid && (hadFocus || document.activeElement === document.body) && G.dom.scroller.isConnected) G.dom.scroller.focus({ preventScroll: true });
+  if (box.mode === 'view') return;
+  if (rule === 'commit') submitCellText(box.sheet, box.r, box.c, text, box.initialValue ?? '', then);
+  updateFormulaBar();
+}
+
+/**
+ * Enter / Tab / Ctrl+S in an editor: commit, give the grid the focus and move on (Enter down, Tab right, Shift back;
+ * inside a selection of several cells the active cell walks through it, like in the grid).
+ * @param {'enter' | 'tab' | 'save'} reason @param {number} delta @param {'save'} [then]
+ */
+function endCellEdit(reason, delta, then) {
+  const box = G?.cellBox;
+  if (!G || !box) return;
+  const sheet = box.sheet;
+  closeCellBox(reason, false, then);
+  G.dom.scroller.focus({ preventScroll: true });
+  const view = G.views.get(sheet);
+  if (view && delta && sheet === G.sheet) cycleInSelection(view, reason === 'enter' ? 'col' : 'row', delta);
+}
+
+/** Esc in an editor (cell or formula bar): the edit is dropped, the grid has the focus. */
+function cancelCellEdit() {
+  if (!G) return;
+  closeCellBox('escape', false);
+  G.dom.scroller.focus({ preventScroll: true });
+  updateFormulaBar();
+}
+
+let relayoutQueued = false;
+
+/** relayoutCellBox in the next animation frame, once for any number of requests (a scroll fires many events). */
+function relayoutSoon() {
+  if (relayoutQueued) return;
+  relayoutQueued = true;
+  requestAnimationFrame(() => {
+    relayoutQueued = false;
+    relayoutCellBox();
+  });
+}
+
+/** Moves the open box to its cell again (scroll, zoom, theme, resize, typing, patches). */
+function relayoutCellBox() {
+  const box = G?.cellBox;
+  if (!G || !box) return;
+  const view = G.views.get(box.sheet);
+  if (!view || !view.L || G.sheet !== box.sheet) return;
+  layoutCellBox(view, box.el, box.r, box.c, cellAt(view, box.r, box.c));
 }
 
 /**
@@ -5695,9 +6222,806 @@ function onCellBoxWheel(e, el) {
   e.preventDefault();
   const sc = G.dom.scroller;
   const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? G.viewH : 1;
-  closeCellBox();
+  closeCellBox('scroll');
   sc.scrollTop += e.deltaY * unit;
   sc.scrollLeft += (isRtl() ? -1 : 1) * e.deltaX * unit;
+}
+
+// ----- EDITING -----
+// Cell editing in the webview (contract §10, D-024..D-026, D-067). The host is the authority: the grid only shows a typed
+// value at once (the OVERLAY: cell text by position, drawn over the cached rows, never written into them) and asks.
+// - One `edit` message per user action; one in flight per panel. Later edits (and Ctrl+Z / Ctrl+Y / Ctrl+S commands) wait
+//   in G.sendQueue in the order they were made and are sent after the editResult, re-based on its version.
+// - editResult accepted: the host's rows (`patches`) replace the overlay. Rejected: the overlay entries of that edit go and
+//   the reason is shown in the status line (never the error page). A `patch` / `invalidate` from another source drops
+//   the queued edits ("The file changed; your last change was not applied.") and the overlay.
+// - The cell editor box (CELL TEXT BOX) and the formula bar are two views of ONE edit: the box's text is the truth.
+// - The webview keeps no undo history: Ctrl+Z / Ctrl+Y on the grid go to VS Code (document undo).
+
+/** Most cells an optimistic overlay is kept for (a bigger paste / clear waits for the host's rows). */
+const OVERLAY_MAX_CELLS = 20000;
+/** Most cells of one setCells (the host's limit, parseWebviewMessage). */
+const EDIT_MAX_CELLS = 1000000;
+
+/** @typedef {Extract<WebviewMessage, { type: 'command' }>} CommandMessage */
+
+// ----- EDITING: overlay -----
+
+/**
+ * The pending texts of one row of a sheet (column -> text), or undefined.
+ * @param {number} sheet @param {number} r
+ * @returns {Map<number, string> | undefined}
+ */
+function getRowOverlay(sheet, r) {
+  const g = G;
+  if (!g || !g.overlay || g.overlay.size === 0) return undefined; // (the unit tests stub a grid without an overlay)
+  return g.overlay.get(sheet)?.get(r);
+}
+
+/**
+ * The text a pending edit put in a cell (what the grid shows until the host's rows arrive), or undefined.
+ * @param {number} sheet @param {number} r @param {number} c
+ * @returns {string | undefined}
+ */
+function getCellOverlay(sheet, r, c) {
+  return getRowOverlay(sheet, r)?.get(c);
+}
+
+/** @param {number} sheet @param {number} r @param {number} c @param {string} text */
+function setCellOverlay(sheet, r, c, text) {
+  const g = G;
+  if (!g) return;
+  let rows = g.overlay.get(sheet);
+  if (!rows) g.overlay.set(sheet, (rows = new Map()));
+  let cols = rows.get(r);
+  if (!cols) rows.set(r, (cols = new Map()));
+  cols.set(c, text);
+  g.dataVersion++; // the cell painter repaints only when the data version changed
+}
+
+/**
+ * Removes an overlay entry, but only while it still holds `text` (a newer pending text of the same cell stays).
+ * @param {number} sheet @param {number} r @param {number} c @param {string} text
+ */
+function dropCellOverlay(sheet, r, c, text) {
+  const rows = G?.overlay.get(sheet);
+  const cols = rows?.get(r);
+  if (!G || !rows || !cols || cols.get(c) !== text) return;
+  cols.delete(c);
+  if (cols.size === 0) rows.delete(r);
+  if (rows.size === 0) G.overlay.delete(sheet);
+  G.dataVersion++;
+}
+
+/**
+ * A row's cells plus a text cell for every pending overlay text that has no cell yet (the cached row is never changed).
+ * @param {CellData[]} cells sorted by column @param {Map<number, string>} pending
+ * @returns {CellData[]}
+ */
+function withOverlayCells(cells, pending) {
+  const extra = [];
+  for (const [c, text] of pending) if (!findCell(cells, c)) extra.push(/** @type {CellData} */ ({ c, t: 's', v: text, w: text }));
+  if (extra.length === 0) return cells;
+  return [...cells, ...extra].sort((a, b) => a.c - b.c);
+}
+
+/** @param {SheetId | undefined} id @returns {number} the tab position of a sheet, -1 when it is not there */
+function sheetIndexById(id) {
+  return G && id !== undefined ? G.meta.sheets.findIndex((s) => s.id === id) : -1;
+}
+
+/** @param {Range[]} ranges @returns {number} the cells of the ranges (counted twice where they overlap) */
+function rangesCellCount(ranges) {
+  let n = 0;
+  for (const rg of ranges) n += (rg.r1 - rg.r0 + 1) * (rg.c1 - rg.c0 + 1);
+  return n;
+}
+
+/**
+ * Drops the overlay entries a (finished or dropped) intent made.
+ * @param {EditIntent} intent
+ */
+function dropIntentOverlay(intent) {
+  if (!G || G.overlay.size === 0) return;
+  if (intent.kind === 'setCells') {
+    const sheet = sheetIndexById(intent.sheetId);
+    if (sheet >= 0) for (const [r, c, text] of intent.cells) dropCellOverlay(sheet, r, c, text);
+  } else if (intent.kind === 'clear') {
+    const sheet = sheetIndexById(intent.sheetId);
+    if (sheet < 0 || rangesCellCount(intent.ranges) > OVERLAY_MAX_CELLS) return;
+    for (const rg of intent.ranges) for (let r = rg.r0; r <= rg.r1; r++) for (let c = rg.c0; c <= rg.c1; c++) dropCellOverlay(sheet, r, c, '');
+  }
+}
+
+// ----- EDITING: state -----
+
+/** Can the user change cells now? The host decides (editState); the webview only follows it. */
+function isCellEditable() {
+  const g = G;
+  if (!g || g.sheet < 0 || !g.editState || !g.editState.editable) return false;
+  if (g.editState.kinds && !g.editState.kinds.includes('setCells')) return false;
+  return g.meta.sheets[g.sheet]?.id !== undefined;
+}
+
+let readOnlySaidAt = 0;
+
+/** A key that would change a cell in a read-only grid: say why nothing happens (at most every 5 s; the status is a live region). */
+function sayReadOnly() {
+  const now = Date.now();
+  if (!G || now - readOnlySaidAt < 5000) return;
+  readOnlySaidAt = now;
+  const reason = G.editState?.reason;
+  setStatusMessage(reason ? `This view is read-only: ${reason}` : 'This view is read-only.', 'info');
+}
+
+/** Delete / Backspace need the `clear` intent. */
+function canClear() {
+  return isCellEditable() && (!G?.editState?.kinds || G.editState.kinds.includes('clear'));
+}
+
+/** The error literals, numbers, dates, times and booleans Excel reads from typed text (parseCellInput in sheet.ts; wider is harmless). */
+const TYPED_VALUE_RE = /^\s*(?:true|false|#(?:NULL!|DIV\/0!|VALUE!|REF!|NAME\?|NUM!|N\/A)|\(?[+-]?\$?[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?%?\)?|\d{4}-\d{1,2}-\d{1,2}(?:[ T]\d{1,2}:\d{2}.*)?|\d{1,2}\/\d{1,2}\/\d{2,4}(?: \d{1,2}:\d{2}.*)?|\d{1,2}:\d{2}(?::\d{2})?(?:\s?[AaPp][Mm])?)\s*$/i;
+
+/**
+ * xlsx: would this stored TEXT turn into something else when it is typed back in (a formula, a number, a date, TRUE,
+ * an error, or an apostrophe that Excel eats)? Then the editor shows it with a leading apostrophe, Excel's text mark.
+ * @param {string} text
+ */
+function textReadsAsValue(text) {
+  if (text === '') return false;
+  if (text.startsWith('=') || text.startsWith("'")) return true;
+  return /\d|true|false|#/i.test(text) && TYPED_VALUE_RE.test(text);
+}
+
+/**
+ * The text an edit of the cell starts with: a pending overlay text, else the cell's raw value or =formula (never the
+ * display text). xlsx text that would read as something else gets the apostrophe (`'007`, `'=A1`).
+ * @param {SheetView} view @param {number} r @param {number} c @param {CellData | null | undefined} cell
+ */
+function editStartText(view, r, c, cell) {
+  const over = getCellOverlay(view.index, r, c);
+  if (over !== undefined) return over;
+  const text = cell ? rawValue(cell) : '';
+  return G?.kind === 'sheet' && cell && cell.t === 's' && !cell.f && textReadsAsValue(text) ? `'${text}` : text;
+}
+
+/** Applies a new edit state: formula bar, status bar, banner button; an open editor goes when editing is off. @param {EditStateMessage} msg */
+function onEditState(msg) {
+  const g = G;
+  if (!g) return;
+  const could = isCellEditable();
+  const had = !!g.editState;
+  g.editState = msg.state;
+  g.readOnly = !msg.state.editable;
+  if (!isCellEditable()) {
+    closeCellBox('notEditable');
+    // Said once, when editing stops while the view is open (the reason is also the status bar's tooltip).
+    if (could && msg.state.reason) setStatusMessage(msg.state.reason, 'warn');
+  } else if (had && !could) {
+    // Said once when editing starts in an open view ("Edit anyway", the setting turned on): the live status tells screen readers.
+    setStatusMessage('Editing is on.', 'info');
+  }
+  updateEditUi();
+}
+
+/** Read-only / Ready in the status bar, the formula bar's editability and the banner's "Edit anyway" button. */
+function updateEditUi() {
+  const g = G;
+  if (!g) return;
+  const state = g.editState;
+  const editable = isCellEditable();
+  const mode = g.dom.statusMode;
+  if (mode) {
+    mode.textContent = editable ? 'Ready' : 'Read-only';
+    mode.title = editable ? '' : state?.reason ? `This view is read-only: ${state.reason}` : 'This view is read-only';
+  }
+  const fx = g.dom.formulaBar.querySelector('.fv-fx');
+  if (fx) fx.setAttribute('title', editable ? 'Cell value or formula' : 'Cell value or formula (read-only)');
+  updateBanner(g.bannerText, state?.canEditAnyway);
+  updateFormulaBar();
+}
+
+// ----- EDITING: sending -----
+
+let nextEditId = 1;
+
+/**
+ * Asks the host for one edit (one user action). Sent at once, or after the edit in flight.
+ * @param {EditIntent} intent @param {'save'} [then]
+ */
+function sendEdit(intent, then) {
+  const g = G;
+  if (!g) return;
+  enqueueSend({ type: 'edit', editId: nextEditId++, baseVersion: g.version, intent, ...(then ? { then } : {}) });
+}
+
+/** A document command, in order with the edits (D-067: a Ctrl+Z pressed while an edit is in flight undoes THAT edit). @param {'undo' | 'redo' | 'save'} id */
+function sendCommand(id) {
+  enqueueSend({ type: 'command', id });
+}
+
+/** @param {EditMessage | CommandMessage} msg */
+function enqueueSend(msg) {
+  if (!G) return;
+  G.sendQueue.push(msg);
+  pumpSendQueue();
+}
+
+/** Sends queued messages until an edit is in flight (re-based on the latest version). */
+function pumpSendQueue() {
+  const g = G;
+  while (g && !g.inFlightEdit && g.sendQueue.length > 0) {
+    const msg = g.sendQueue.shift();
+    if (!msg) break;
+    if (msg.type === 'edit') {
+      msg.baseVersion = g.version;
+      g.inFlightEdit = msg;
+    }
+    post(msg);
+  }
+}
+
+/** Drops the queued edits (and their overlay) because the file changed under them; a command that waited goes too. */
+function dropQueuedEdits() {
+  const g = G;
+  if (!g || g.sendQueue.length === 0) return;
+  let edits = 0;
+  for (const msg of g.sendQueue) {
+    if (msg.type !== 'edit') continue;
+    edits++;
+    dropIntentOverlay(msg.intent);
+  }
+  g.sendQueue = [];
+  if (edits > 0) setStatusMessage('The file changed; your last change was not applied.', 'warn');
+  scheduleRender();
+}
+
+/** @param {EditResultMessage} msg */
+function onEditResult(msg) {
+  const g = G;
+  if (!g) return;
+  const sent = g.inFlightEdit;
+  if (!sent || sent.editId !== msg.editId) return;
+  g.inFlightEdit = null;
+  g.version = Math.max(g.version, msg.version);
+  if (msg.accepted) {
+    if (msg.sheets) for (const sm of msg.sheets) applySheetMeta(sm);
+    if (msg.patches) applyPatches(msg.patches);
+    dropIntentOverlay(sent.intent);
+    if (msg.select) selectResult(msg.select);
+    // Delete and paste change cells the user may not see: the live status says it was done (typing says nothing).
+    const it = sent.intent;
+    if (it.kind === 'clear') setStatusMessage('Cleared.', 'info');
+    else if (it.kind === 'setCells' && it.cells.length > 1) setStatusMessage(`Changed ${formatCount(it.cells.length)} cells.`, 'info');
+  } else {
+    dropIntentOverlay(sent.intent);
+    setStatusMessage(msg.reason || 'The change was not applied.', 'warn');
+    reopenRejectedDraft(msg.editId);
+  }
+  scheduleRender();
+  updateFormulaBar();
+  scheduleStats();
+  pumpSendQueue();
+}
+
+/** A patch from another source (another panel, undo / redo, recalc). @param {PatchMessage} msg */
+function onPatch(msg) {
+  const g = G;
+  if (!g || msg.version < g.version) return;
+  g.version = msg.version;
+  dropQueuedEdits();
+  if (msg.styles) mergeStyles(msg.styles);
+  if (msg.sheets) for (const sm of msg.sheets) applySheetMeta(sm);
+  if (msg.patches) applyPatches(msg.patches);
+  scheduleRender();
+  updateFormulaBar();
+  scheduleStats();
+}
+
+/**
+ * Puts the host's rows into the row cache: rows [start, end) of a patch are replaced (a row that is not in `rows` is now
+ * empty). Blocks that are not loaded stay so (they are fetched later, with the new data).
+ * @param {RowsPatch[]} patches
+ */
+function applyPatches(patches) {
+  const g = G;
+  if (!g) return;
+  for (const patch of patches) {
+    const sheet = sheetIndexById(patch.sheetId);
+    if (sheet < 0) continue;
+    mergeStyles(patch.styles);
+    /** @type {Map<number, RowData>} */
+    const byRow = new Map();
+    for (const row of patch.rows) byRow.set(row.r, row);
+    const first = Math.floor(patch.start / BLOCK_ROWS);
+    const last = Math.floor((patch.end - 1) / BLOCK_ROWS);
+    for (let b = first; b <= last; b++) {
+      const block = rowCache.blocks.get(blockKey(sheet, b));
+      if (!block) continue;
+      for (let i = 0; i < BLOCK_ROWS; i++) {
+        const r = b * BLOCK_ROWS + i;
+        if (r >= patch.start && r < patch.end) block[i] = byRow.get(r);
+      }
+    }
+  }
+  g.dataVersion++;
+}
+
+/**
+ * A sheet's new meta from a `patch` (used range grown by an edit, merges, size): replaces it by id; the row cache stays.
+ * @param {SheetMeta} sm
+ */
+function applySheetMeta(sm) {
+  const g = G;
+  const index = sheetIndexById(sm.id);
+  if (!g || index < 0) return;
+  g.meta.sheets[index] = sm;
+  const view = g.views.get(index);
+  if (view) {
+    view.meta = sm;
+    view.mergeIndex = buildMergeIndex(sm.merges);
+    view.maxR = Math.max(MAX_ROWS, sm.rowCount);
+    view.maxC = Math.max(MAX_COLS, sm.colCount);
+    const top = index === g.sheet && view.L ? virtualScrollTop() : view.scrollTop;
+    const left = index === g.sheet ? g.dom.scroller.scrollLeft : view.scrollLeft;
+    view.L = null;
+    if (index === g.sheet) {
+      applyLayout(view);
+      setVirtualScroll(view, top, left);
+      g.dom.scroller.setAttribute('aria-rowcount', String(view.maxR));
+      g.dom.scroller.setAttribute('aria-colcount', String(view.maxC));
+      g.selVersion++;
+    }
+  }
+  renderTabs();
+}
+
+/** The host's choice of selection after an edit (a paste over merged cells). @param {{ sheetId: SheetId, range: Range }} sel */
+function selectResult(sel) {
+  const g = G;
+  if (!g || sheetIndexById(sel.sheetId) !== g.sheet) return;
+  selectRange(activeView(), sel.range);
+}
+
+/** Selects one range, the active cell at its top-left corner. @param {SheetView} view @param {Range} rg */
+function selectRange(view, rg) {
+  const from = { r: rg.r0, c: rg.c0 };
+  setSelection(view, [{ r0: rg.r0, c0: rg.c0, r1: rg.r1, c1: rg.c1 }], from, { anchor: from, cursor: { r: rg.r1, c: rg.c1 }, reveal: null });
+}
+
+// ----- EDITING: cells -----
+
+/**
+ * A committed cell text: shown at once, sent to the host. The same text as the cell had sends nothing (Enter without a
+ * change); Ctrl+S (`then: 'save'`) then only saves.
+ * @param {number} sheet @param {number} r @param {number} c @param {string} text @param {string} original @param {'save'} [then]
+ */
+function submitCellText(sheet, r, c, text, original, then) {
+  const g = G;
+  if (!g) return;
+  const sheetId = g.meta.sheets[sheet]?.id;
+  if (text === original || sheetId === undefined) {
+    if (then === 'save') sendCommand('save');
+    return;
+  }
+  setCellOverlay(sheet, r, c, text);
+  scheduleRender();
+  sendEdit({ kind: 'setCells', sheetId, cells: [[r, c, text]] }, then);
+  editorDraft = { editId: nextEditId - 1, sheet, r, c, text };
+}
+
+/** The last text committed from the editor: a rejected edit opens the editor again with it (Excel keeps the editor open). @type {{ editId: number, sheet: number, r: number, c: number, text: string } | null} */
+let editorDraft = null;
+
+/** The host refused the editor's text: open the editor on that cell again with the text, unless the user moved on. @param {number} editId */
+function reopenRejectedDraft(editId) {
+  const g = G;
+  const d = editorDraft;
+  if (!g || !d || d.editId !== editId) return;
+  editorDraft = null;
+  if (g.cellBox || g.sheet !== d.sheet || !isCellEditable()) return;
+  const view = activeView();
+  selectRange(view, { r0: d.r, c0: d.c, r1: d.r, c1: d.c });
+  openCellBox(view, d.r, d.c, { mode: 'replace', text: d.text });
+}
+
+/** Delete / Backspace: clear the contents of the selection, one edit for all of its ranges. @param {SheetView} view */
+function clearSelectionContents(view) {
+  const sheetId = view.meta.id;
+  if (sheetId === undefined || !canClear()) return;
+  const ranges = view.sel.ranges.map((rg) => ({ r0: rg.r0, c0: rg.c0, r1: rg.r1, c1: rg.c1 }));
+  if (ranges.length > 1000) {
+    setStatusMessage('This change is too large (max 1,000 ranges).', 'warn');
+    return;
+  }
+  if (rangesCellCount(ranges) <= OVERLAY_MAX_CELLS) {
+    for (const rg of ranges) for (let r = rg.r0; r <= rg.r1; r++) for (let c = rg.c0; c <= rg.c1; c++) setCellOverlay(view.index, r, c, '');
+  }
+  scheduleRender();
+  updateFormulaBar();
+  sendEdit({ kind: 'clear', sheetId, ranges, what: 'contents' });
+}
+
+/**
+ * The text a key press starts an edit with ('' = an IME or dead key: the browser types it into the box that now has
+ * the focus), or null when the key is not for typing. AltGr characters (Ctrl+Alt on Windows) count as typing.
+ * @param {KeyboardEvent} e
+ * @returns {string | null}
+ */
+function editStartKey(e) {
+  if (e.key === 'Process' || e.key === 'Dead' || e.keyCode === 229) return '';
+  const altGr = e.getModifierState('AltGraph');
+  if (e.metaKey || ((e.ctrlKey || e.altKey) && !altGr)) return null;
+  if ([...e.key].length !== 1) return null;
+  if (e.key === ' ' && e.shiftKey) return null; // Shift+Space selects the row
+  return e.key;
+}
+
+// ----- EDITING: formula bar -----
+// The formula bar is the second editor of the same cell: focusing it opens the editor box over the cell (without taking
+// the focus); typing in either one changes both. Enter, Tab, Esc, Ctrl+S and blur work as in the box.
+
+/** @param {boolean} editable */
+function setFormulaEditable(editable) {
+  const f = G?.dom.formula;
+  if (!f) return;
+  const want = editable ? 'plaintext-only' : null;
+  if (f.getAttribute('contenteditable') !== want) {
+    if (want) f.setAttribute('contenteditable', want);
+    else f.removeAttribute('contenteditable');
+  }
+  f.setAttribute('aria-readonly', editable ? 'false' : 'true');
+  if (editable) f.setAttribute('aria-multiline', 'true'); // Alt+Enter adds line breaks
+  else f.removeAttribute('aria-multiline');
+}
+
+/** The text and look of the formula bar. @param {string} text @param {boolean} isFormula */
+function setFormulaText(text, isFormula) {
+  const f = G?.dom.formula;
+  if (!f) return;
+  if (f.textContent !== text) {
+    f.textContent = text;
+    f.title = text.length > 60 || text.includes('\n') ? text : '';
+  }
+  f.classList.toggle('fv-formula-f', isFormula);
+}
+
+/** The box's text goes to the formula bar (unless the user is typing there). */
+function syncFormulaFromBox() {
+  const g = G;
+  const box = g?.cellBox;
+  if (!g || !box || box.mode === 'view' || document.activeElement === g.dom.formula) return;
+  setFormulaText(box.el.value, g.kind === 'sheet' && box.el.value.startsWith('='));
+}
+
+/** The formula bar's text goes to the open box. */
+function onFormulaInput() {
+  const g = G;
+  const box = g?.cellBox;
+  if (!g || !box || box.mode === 'view') return;
+  box.el.value = g.dom.formula.textContent || '';
+  relayoutCellBox();
+  g.dom.formula.classList.toggle('fv-formula-f', g.kind === 'sheet' && box.el.value.startsWith('='));
+}
+
+/**
+ * Alt+Enter in the formula bar: a line break at the caret. insertLineBreak puts a real newline into a plaintext-only
+ * contenteditable and keeps the caret after it (insertText does nothing for a newline there; a hand-made text node
+ * leaves the caret before a trailing newline). It fires `input`, which copies the text to the editor box.
+ */
+function insertFormulaLineBreak() {
+  document.execCommand('insertLineBreak');
+}
+
+/** Focus in the formula bar starts an edit of the active cell (Excel). */
+function onFormulaFocus() {
+  const g = G;
+  if (!g || g.cellBox || !isCellEditable()) return;
+  const view = activeView();
+  const m = masterOf(view, view.sel.active.r, view.sel.active.c);
+  openCellBox(view, m.r, m.c, { mode: 'edit', caretAtEnd: true, focus: false });
+}
+
+/** Focus left the formula bar: commit, unless the window lost it or it went to the editor box. @param {FocusEvent} e */
+function onFormulaBlur(e) {
+  const box = G?.cellBox;
+  if (!G || !box || box.mode === 'view' || !document.hasFocus() || e.relatedTarget === box.el) return;
+  closeCellBox('blur', false);
+}
+
+/** @param {KeyboardEvent} e */
+function onFormulaKeyDown(e) {
+  const g = G;
+  if (!g || e.isComposing || e.keyCode === 229) return;
+  const ctrl = e.ctrlKey || e.metaKey;
+  const key = e.key.toLowerCase();
+  const box = g.cellBox && g.cellBox.mode !== 'view' ? g.cellBox : null;
+  if (box) {
+    if (ctrl && !e.altKey && (key === 'z' || key === 'y')) {
+      e.stopPropagation(); // the browser undoes the typing here (D-026); VS Code must not undo the document
+      return;
+    }
+    if (ctrl && !e.altKey && !e.shiftKey && key === 's') {
+      e.preventDefault();
+      e.stopPropagation();
+      endCellEdit('save', 0, 'save');
+      return;
+    }
+    if (e.altKey && !ctrl && e.key === 'Enter') {
+      e.preventDefault();
+      e.stopPropagation();
+      insertFormulaLineBreak();
+      return;
+    }
+    if (!ctrl && !e.altKey && (e.key === 'Enter' || e.key === 'Tab')) {
+      e.preventDefault();
+      e.stopPropagation();
+      endCellEdit(e.key === 'Enter' ? 'enter' : 'tab', e.shiftKey ? -1 : 1);
+      return;
+    }
+    if (ctrl && !e.altKey && !e.shiftKey && e.key === 'Enter') {
+      e.preventDefault();
+      e.stopPropagation();
+      endCellEdit('enter', 0); // Ctrl+Enter: commit, stay in the cell
+      return;
+    }
+    if (e.key === 'Escape' && !ctrl && !e.altKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      cancelCellEdit();
+      return;
+    }
+  } else if ((e.key === 'Escape' || e.key === 'Enter') && !ctrl && !e.altKey) {
+    e.preventDefault();
+    g.dom.scroller.focus({ preventScroll: true });
+    return;
+  }
+  if (ctrl && !e.altKey && !e.shiftKey && key === 'a') {
+    // Select all = the formula text, as in a text box (the page's select-all would take the whole view). Not passed on:
+    // VS Code would run its own select-all on the page.
+    e.preventDefault();
+    e.stopPropagation();
+    window.getSelection()?.selectAllChildren(g.dom.formula);
+  }
+}
+
+// ----- EDITING: paste -----
+
+/**
+ * Ctrl+V on the grid (the editor box and the formula bar paste text natively). `text/html` (from Excel) is parsed into an
+ * inert fragment that is never inserted (a table, cells as text), else `text/plain` is read as TSV. One setCells for
+ * the whole block; a single copied cell fills a selection of several cells (Excel). Formulas in pasted HTML are not taken.
+ * @param {ClipboardEvent} e
+ */
+function onGridPaste(e) {
+  const g = G;
+  const dt = e.clipboardData;
+  if (!g || !dt || g.cellBox || !isCellEditable()) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const table = clipboardTable(dt);
+  if (table === 'tooLarge') setStatusMessage(PASTE_TOO_LARGE, 'warn');
+  else if (table && table.length > 0) pasteTable(activeView(), table);
+}
+
+const PASTE_TOO_LARGE = 'This change is too large (max 1,000,000 cells).';
+
+/** @param {DataTransfer} dt @returns {string[][] | null | 'tooLarge'} */
+function clipboardTable(dt) {
+  const plain = dt.getData('text/plain');
+  if (lastCopy && plain && clipboardKey(plain) === clipboardKey(lastCopy.text)) return lastCopy.values;
+  const html = dt.getData('text/html');
+  if (html && html.length <= 32 * 1024 * 1024) {
+    try {
+      // Parsed in a <template>: its content belongs to an inert document (nothing runs). Handler attributes and images are
+      // cut from the markup first (inside tags only, text is untouched): even an inert parser reports them to the CSP.
+      const tpl = document.createElement('template');
+      tpl.innerHTML = html
+        .replace(/<img\b[^>]*>/gi, '')
+        .replace(/<[a-zA-Z][^>]*>/g, (tag) => tag.replace(/\s+on[a-zA-Z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/gi, ''));
+      const table = tpl.content.querySelector('table');
+      const grid = table ? htmlTableToGrid(table, textClasses(tpl.content)) : null;
+      if (grid && grid.length > 0) return grid;
+    } catch (err) {
+      if (err instanceof RangeError && err.message === PASTE_TOO_LARGE) return 'tooLarge';
+      // not parseable: the plain text below
+    }
+  }
+  const text = dt.getData('text/plain');
+  return text ? parseTsv(text) : null;
+}
+
+/**
+ * Class names that Excel's HTML (its <style> block) marks as Text format (mso-number-format:"\@").
+ * @param {ParentNode} root
+ * @returns {Set<string>}
+ */
+function textClasses(root) {
+  /** @type {Set<string>} */
+  const out = new Set();
+  for (const st of root.querySelectorAll('style')) {
+    for (const m of (st.textContent || '').matchAll(/\.([\w-]+)\s*\{[^}]*mso-number-format\s*:\s*["']?\\?@/gi)) out.add(m[1].toLowerCase());
+  }
+  return out;
+}
+
+/**
+ * The text to paste for one HTML table cell. A cell marked as text (x:str, or mso-number-format "\@" inline or by
+ * class: FileStudio's and Excel's copy) stays text: spaces kept, an apostrophe when it would read as a value. A number
+ * whose display text rounds it pastes its x:num value.
+ * @param {Element} td @param {Set<string>} [textCls]
+ */
+function htmlPasteText(td, textCls) {
+  const style = td.getAttribute('style') || '';
+  const asText = td.hasAttribute('x:str') || /mso-number-format\s*:\s*["']?\\?@/i.test(style) || [...td.classList].some((c) => !!textCls?.has(c.toLowerCase()));
+  const text = htmlCellText(td, asText);
+  if (asText) return textReadsAsValue(text) ? `'${text}` : text;
+  const num = td.getAttribute('x:num');
+  if (num) {
+    const v = Number(num);
+    if (Number.isFinite(v)) return exactNumberText(text, v, false) ?? text;
+  }
+  return text;
+}
+
+/**
+ * Cell texts of an HTML table, spans expanded (a merged cell's text in its top-left cell, '' after it).
+ * @param {HTMLTableElement} table @param {Set<string>} [textCls] classes marked as Text format
+ * @returns {string[][]}
+ */
+function htmlTableToGrid(table, textCls) {
+  /** @type {string[][]} */
+  const out = [];
+  const taken = new Set();
+  let r = 0;
+  let area = 0;
+  for (const tr of table.rows) {
+    let c = 0;
+    out[r] ||= [];
+    for (const td of tr.cells) {
+      while (taken.has(r * 65536 + c)) c++;
+      const rowSpan = clamp(td.rowSpan || 1, 1, 1000);
+      const colSpan = clamp(td.colSpan || 1, 1, 1000);
+      // Spans are counted before they are expanded: a crafted table must not freeze the view before the size check.
+      if ((area += rowSpan * colSpan) > EDIT_MAX_CELLS) throw new RangeError(PASTE_TOO_LARGE);
+      for (let i = 0; i < rowSpan; i++) {
+        out[r + i] ||= [];
+        for (let j = 0; j < colSpan; j++) {
+          out[r + i][c + j] = i === 0 && j === 0 ? htmlPasteText(td, textCls) : '';
+          if (i || j) taken.add((r + i) * 65536 + c + j);
+        }
+      }
+      c += colSpan;
+    }
+    r++;
+  }
+  const rows = out.length;
+  for (let i = 0; i < rows; i++) {
+    const row = out[i] || (out[i] = []);
+    for (let j = 0; j < row.length; j++) if (row[j] === undefined) row[j] = '';
+  }
+  return out;
+}
+
+/**
+ * The text of a table cell as the page would show it: runs of white space are one space, <br> and blocks are line breaks.
+ * `keepEnds`: a text cell keeps its leading and trailing spaces.
+ * @param {Element} td @param {boolean} [keepEnds]
+ */
+function htmlCellText(td, keepEnds = false) {
+  let out = '';
+  /** @param {Node} node */
+  const walk = (node) => {
+    for (const n of node.childNodes) {
+      if (n.nodeType === Node.TEXT_NODE) out += (n.textContent || '').replace(/[ \t\r\n\f ]+/g, ' ');
+      else if (n instanceof HTMLElement) {
+        if (n.tagName === 'SCRIPT' || n.tagName === 'STYLE') continue;
+        if (n.tagName === 'BR') out += '\n';
+        else {
+          if (/^(P|DIV|LI)$/.test(n.tagName) && out !== '' && !out.endsWith('\n')) out += '\n';
+          walk(n);
+        }
+      }
+    }
+  };
+  walk(td);
+  const lines = out.replace(/ *\n */g, '\n');
+  return keepEnds ? lines.replace(/^\n+|\n+$/g, '') : lines.trim();
+}
+
+/**
+ * Reads tab-separated text (Excel's text/plain): a field that starts with a quote runs to the closing quote ("" = a quote,
+ * line breaks stay inside); the final line break ends the last row.
+ * @param {string} text
+ * @returns {string[][]}
+ */
+function parseTsv(text) {
+  /** @type {string[][]} */
+  const rows = [];
+  let row = [];
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    let field = '';
+    if (text[i] === '"') {
+      i++;
+      for (;;) {
+        const q = text.indexOf('"', i);
+        if (q < 0) {
+          field += text.slice(i);
+          i = n;
+          break;
+        }
+        field += text.slice(i, q);
+        if (text[q + 1] === '"') {
+          field += '"';
+          i = q + 2;
+        } else {
+          i = q + 1;
+          break;
+        }
+      }
+      field = field.replace(/\r\n?/g, '\n');
+      // Anything between the closing quote and the next tab / line break is kept as it is.
+      while (i < n && text[i] !== '\t' && text[i] !== '\n' && text[i] !== '\r') field += text[i++];
+    } else {
+      let j = i;
+      while (j < n && text[j] !== '\t' && text[j] !== '\n' && text[j] !== '\r') j++;
+      field = text.slice(i, j);
+      i = j;
+    }
+    row.push(field);
+    if (i >= n) break;
+    if (text[i] === '\t') {
+      i++;
+      if (i >= n) row.push('');
+    } else {
+      if (text[i] === '\r' && text[i + 1] === '\n') i++;
+      i++;
+      rows.push(row);
+      row = [];
+    }
+  }
+  if (row.length > 0) rows.push(row);
+  return rows;
+}
+
+/**
+ * Sends a pasted block: at the top-left of the selection, or into every cell of the selection when one cell was copied.
+ * @param {SheetView} view @param {string[][]} table
+ */
+function pasteTable(view, table) {
+  const sheetId = view.meta.id;
+  const last = view.sel.ranges[view.sel.ranges.length - 1];
+  if (sheetId === undefined || !last) return;
+  const rows = table.length;
+  const cols = table.reduce((m, row) => Math.max(m, row.length), 0);
+  /** @type {[r: number, c: number, text: string][]} */
+  const cells = [];
+  /** @type {Range | null} */
+  let block = null;
+  if (rows === 1 && cols === 1 && rangesCellCount(view.sel.ranges) > 1) {
+    if (rangesCellCount(view.sel.ranges) > EDIT_MAX_CELLS) return tooLarge();
+    for (const rg of view.sel.ranges) for (let r = rg.r0; r <= rg.r1; r++) for (let c = rg.c0; c <= rg.c1; c++) cells.push([r, c, table[0][0]]);
+  } else {
+    if (rows * cols > EDIT_MAX_CELLS) return tooLarge();
+    if (last.r0 + rows > view.maxR || last.c0 + cols > view.maxC) {
+      setStatusMessage('This does not fit: it would go past the end of the sheet.', 'warn');
+      return;
+    }
+    for (let i = 0; i < rows; i++) for (let j = 0; j < table[i].length; j++) cells.push([last.r0 + i, last.c0 + j, table[i][j]]);
+    block = { r0: last.r0, c0: last.c0, r1: last.r0 + rows - 1, c1: last.c0 + cols - 1 };
+  }
+  if (cells.length === 0) return;
+  if (cells.length <= OVERLAY_MAX_CELLS) for (const [r, c, text] of cells) setCellOverlay(view.index, r, c, text);
+  scheduleRender();
+  updateFormulaBar();
+  sendEdit({ kind: 'setCells', sheetId, cells });
+  if (block && (rows > 1 || cols > 1)) selectRange(view, block);
+
+  function tooLarge() {
+    setStatusMessage('This change is too large (max 1,000,000 cells).', 'warn');
+  }
 }
 
 // ----- LINKS & NAVIGATION -----
@@ -5830,7 +7154,7 @@ function snapshotState() {
   /** @type {Record<string, any>} */
   const sheets = { ...(g.saved?.sheets || {}) };
   for (const v of g.views.values()) {
-    sheets[v.meta.name] = {
+    sheets[sheetKey(v.meta)] = {
       st: Math.round(v.scrollTop),
       sl: Math.round(v.scrollLeft),
       z: v.zoom,
@@ -5840,8 +7164,18 @@ function snapshotState() {
   // Hidden sheets revealed for viewing (one of them may be the active sheet). While the workbook has no worksheets
   // (sheet -1 after an invalidate), the last active / revealed sheets are kept for when worksheets come back.
   if (g.sheet < 0 && g.saved) return { file: g.fileName, activeSheet: g.saved.activeSheet, revealed: g.saved.revealed, sheets };
-  const revealed = [...g.revealed].map((i) => g.meta.sheets[i]?.name).filter((name) => name !== undefined);
-  return { file: g.fileName, activeSheet: g.meta.sheets[g.sheet]?.name, revealed, sheets };
+  const revealed = [...g.revealed].map((i) => g.meta.sheets[i]).filter((sm) => sm !== undefined).map(sheetKey);
+  const active = g.meta.sheets[g.sheet];
+  return { file: g.fileName, activeSheet: active ? sheetKey(active) : undefined, revealed, sheets };
+}
+
+/**
+ * The key of a sheet in the persisted view state: its stable id (survives a rename), else its name (0.1.2 states and
+ * files without ids). A state saved by name is still found.
+ * @param {SheetMeta} sm
+ */
+function sheetKey(sm) {
+  return sm.id !== undefined ? `id:${sm.id}` : sm.name;
 }
 
 const saveGridState = debounce(() => {
@@ -5928,7 +7262,7 @@ function renderTabs() {
         title: revealed ? `${sm.name} (${hiddenSheetLabel(sm)})` : sm.name,
         // Screen readers hear what the italic label and the dashed mark show.
         'aria-label': revealed ? `${sm.name}, ${hiddenSheetLabel(sm)}` : null,
-        dataset: { index: String(sm.index) },
+        dataset: { index: String(sm.index), ...(sm.id != null ? { id: String(sm.id) } : {}) },
         onclick: () => {
           activateSheet(sm.index);
           G?.dom.scroller.focus({ preventScroll: true });
@@ -6170,21 +7504,13 @@ function buildFormulaBar() {
   });
   nameBox.addEventListener('focus', () => nameBox.select());
   nameBox.addEventListener('blur', () => updateFormulaBar());
-  // Read-only text box: focusable so keyboard and screen-reader users can read (and select) the whole value;
-  // Escape / Enter go back to the grid like Excel.
+  // Formula text box: focusable so keyboard and screen-reader users can read (and select) the whole value;
+  // Escape / Enter go back to the grid like Excel; editable when cell is editable.
   const formula = h('div', { class: 'fv-formula', role: 'textbox', tabindex: '0', 'aria-readonly': 'true', 'aria-label': 'Formula Bar' });
-  formula.addEventListener('keydown', (e) => {
-    if ((e.key === 'Escape' || e.key === 'Enter') && !e.ctrlKey && !e.altKey && !e.metaKey) {
-      e.preventDefault();
-      G?.dom.scroller.focus({ preventScroll: true });
-    } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'a') {
-      // Select all = the formula text, as in a text box (the page's select-all would take the whole view). Not
-      // passed on: VS Code would run its own select-all on the page.
-      e.preventDefault();
-      e.stopPropagation();
-      window.getSelection()?.selectAllChildren(formula);
-    }
-  });
+  formula.addEventListener('keydown', onFormulaKeyDown);
+  formula.addEventListener('input', onFormulaInput);
+  formula.addEventListener('focus', onFormulaFocus);
+  formula.addEventListener('blur', onFormulaBlur);
   const bar = h(
     'div',
     { class: 'fv-formula-bar' },
@@ -6196,7 +7522,10 @@ function buildFormulaBar() {
   return { bar, nameBox, formula };
 }
 
-/** Name box = address of the selection, formula bar = raw value or =formula of the active cell. */
+/**
+ * Name box = address of the selection, formula bar = raw value or =formula of the active cell (editable grid: the text an
+ * edit starts with, so `'007` shows its apostrophe; while an edit is open: the edit's text).
+ */
 function updateFormulaBar() {
   if (!G || G.sheet < 0) return;
   const view = activeView();
@@ -6204,12 +7533,12 @@ function updateFormulaBar() {
   if (document.activeElement !== d.nameBox) d.nameBox.value = selectionLabel(view);
   const a = view.sel.active;
   const cell = cellAt(view, a.r, a.c);
-  const text = cell === undefined ? '' : rawValue(cell);
-  if (d.formula.textContent !== text) {
-    d.formula.textContent = text;
-    d.formula.title = text.length > 60 || text.includes('\n') ? text : '';
-  }
-  d.formula.classList.toggle('fv-formula-f', !!(cell && cell.f));
+  const editable = isCellEditable();
+  setFormulaEditable(editable);
+  const box = G.cellBox && G.cellBox.mode !== 'view' ? G.cellBox : null;
+  if (box && document.activeElement === d.formula) return; // the user is typing there
+  const text = box ? box.el.value : editable ? editStartText(view, a.r, a.c, cell) : cell === undefined ? '' : rawValue(cell);
+  setFormulaText(text, box || editable ? G.kind === 'sheet' && text.startsWith('=') : !!(cell && cell.f));
 }
 
 // ===== STATUS BAR =====
@@ -6217,7 +7546,10 @@ function updateFormulaBar() {
 /** @param {GridInitMessage} msg */
 function buildStatusBar(msg) {
   const info = h('span', { class: 'fv-status-item fv-status-dims' });
-  const mode = h('span', { class: 'fv-status-item fv-status-mode', title: msg.readOnly !== false ? 'This view is read-only' : '' }, msg.readOnly !== false ? 'Read-only' : 'Ready');
+  const isReadOnly = msg.editState ? !msg.editState.editable : msg.readOnly !== false;
+  const reason = msg.editState?.reason;
+  const modeTitle = isReadOnly ? (reason ? `This view is read-only: ${reason}` : 'This view is read-only') : '';
+  const mode = h('span', { class: 'fv-status-item fv-status-mode', title: modeTitle }, isReadOnly ? 'Read-only' : 'Ready');
   const msgEl = h('span', { class: 'fv-status-item fv-status-msg', role: 'status', 'aria-live': 'polite' });
   const stats = h('span', { class: 'fv-status-item fv-status-stats', 'aria-live': 'polite' });
   const zoomLabel = /** @type {HTMLButtonElement} */ (h('button', { class: 'fv-zoom-label', type: 'button', title: 'Reset zoom to the sheet setting', onclick: () => resetZoom() }, '100%'));
@@ -6230,7 +7562,7 @@ function buildStatusBar(msg) {
   );
   const delimiter = msg.kind === 'csv' && msg.delimited ? buildDelimiterStatus(msg.delimited) : null;
   const bar = h('div', { class: 'fv-statusbar' }, mode, info, ...(delimiter ? [delimiter] : []), msgEl, h('span', { class: 'fv-status-spacer' }), stats, zoom);
-  return { bar, msg: msgEl, stats, info, zoomLabel };
+  return { bar, mode, msg: msgEl, stats, info, zoomLabel };
 }
 
 /** Names of the delimiters parseDelimited uses (' ' = runs of spaces). */
@@ -6338,7 +7670,7 @@ const scheduleStats = debounce(() => {
     const reqId = ++G.statsSeq;
     req.ids.add(reqId);
     req.requests++;
-    post({ type: 'getStats', reqId, sheet: view.index, ranges: parts.slice(i, Math.min(sent, i + STATS_MAX_RANGES)) });
+    post({ type: 'getStats', reqId, sheet: view.index, ...idField(view.index), ranges: parts.slice(i, Math.min(sent, i + STATS_MAX_RANGES)) });
   }
 }, STATS_DEBOUNCE_MS);
 
@@ -6511,7 +7843,8 @@ function formatCount(n) {
 /**
  * @typedef {{ level: number, text: string, slug: string, line: number }} MdTocEntry
  * @typedef {{ type?: string, kind?: string, fileName?: string, html: string, toc?: MdTocEntry[], source?: string,
- *   mode?: string, version: number, readOnly?: boolean }} MdMessage  Fields shared by `init` (kind 'markdown') and
+ *   mode?: string, version: number, readOnly?: boolean, editState?: EditState, blocks?: MdSourceBlock[], eol?: string,
+ *   limits?: { wysiwyg: boolean, reason?: string }, resourceBase?: string }} MdMessage  Fields shared by `init` (kind 'markdown') and
  *   `markdownUpdate` (`readOnly`: the document cannot be edited, task checkboxes are disabled; an update without it
  *   keeps the current state).
  * @typedef {{ key: string, dark: boolean, variables: Record<string, string | boolean> }} MdMermaidTheme
@@ -6604,7 +7937,7 @@ const mdState = {
   /** Blocks of a large document not built yet (see MD_FIRST_PAINT_CHARS); null when the article is complete. */
   deferred: /** @type {MdDeferredBlocks | null} */ (null),
   fileName: '',
-  mode: 'preview',
+  mode: /** @type {MdMode} */ ('preview'),
   source: '',
   /** HTML of the latest requested render (identical updates skip the DOM work). */
   html: '',
@@ -6614,6 +7947,8 @@ const mdState = {
   version: 0,
   /** The document is read-only (a git: version, a file VS Code shows read-only): task checkboxes are disabled. */
   readOnly: false,
+  /** Why editing is off (editState.reason), shown as the tooltip of disabled task checkboxes; '' = plain read-only. */
+  readOnlyReason: '',
   /** Bumped on every render; async work belonging to an older render is dropped. */
   generation: 0,
   /** Mermaid theme of the diagrams on screen (set by every render). @type {MdMermaidTheme} */
@@ -6657,7 +7992,8 @@ let mdBlocks = [];
 function showMarkdown(msg) {
   try {
     mdResetTasks();
-    const mode = msg.mode || 'preview';
+    mdAcceptEditing(msg);
+    const mode = mdStartMode(msg.mode);
     const view = h('div', {
       class: 'md-view',
       tabindex: '-1', // focusable so keyboard scrolling works right away
@@ -6707,7 +8043,7 @@ function showMarkdown(msg) {
     view.append(article);
     mdState.article = article;
     mdBlocks = [...blocks, ...deferred];
-    root.replaceChildren(view);
+    root.replaceChildren(mdBuildFrame(view));
 
     mdHoldOnResize(view, article, mdState.scroll);
     mdRestoreScroll(view, article, saved);
@@ -6716,6 +8052,7 @@ function showMarkdown(msg) {
     if (deferred.length) mdStartDeferredBlocks(raws.slice(eager), deferred);
     keepScrollerFocus(view);
     view.focus({ preventScroll: true });
+    mdFrameStart(msg);
   } catch (err) {
     mdFail(err, 'Could not display the Markdown preview.', true);
   }
@@ -6723,6 +8060,7 @@ function showMarkdown(msg) {
 
 /** View disposal (new `init`, error page): stop async work and observers that belong to the old view. */
 function mdDispose() {
+  mdFrameDispose();
   mdState.generation++; // drops updates still waiting for diagrams
   mdCancelDeferredBlocks();
   mdState.view = null;
@@ -6755,6 +8093,7 @@ function updateMarkdown(msg) {
   try {
     const html = typeof msg.html === 'string' ? msg.html : '';
     mdAcceptMessage(msg);
+    if (mdFrameOnUpdate(msg)) return; // WYSIWYG / frame (P6)
     if (html === mdState.html) {
       // Same output (the change did not affect the rendering): only the document version moved on. A pending
       // update for this html stamps the latest version itself when it lands.
@@ -6776,6 +8115,9 @@ function updateMarkdown(msg) {
  * @param {MdMessage} msg
  */
 function mdAcceptMessage(msg) {
+  mdAcceptEditing(msg);
+  const why = msg.editState && typeof msg.editState === 'object' && msg.editState.editable === false ? msg.editState.reason : undefined;
+  if (typeof why === 'string' || msg.type === 'init' || typeof msg.readOnly === 'boolean') mdState.readOnlyReason = typeof why === 'string' && why ? why : '';
   if (msg.type === 'init') mdState.readOnly = msg.readOnly === true;
   else if (typeof msg.readOnly === 'boolean') mdState.readOnly = msg.readOnly;
   mdState.version = Number.isFinite(msg.version) ? msg.version : mdState.version;
@@ -8197,11 +9539,14 @@ function mdIsTaskCheckbox(el) {
 function mdSetTasksReadOnly(container) {
   const readOnly = mdState.readOnly;
   for (const input of mdTaskCheckboxes(container)) {
-    if (mdReadOnlyTasks.has(input) === readOnly) continue;
+    if (mdReadOnlyTasks.has(input) === readOnly) {
+      if (readOnly) input.title = mdState.readOnlyReason || MD_READ_ONLY_TASK_TITLE; // the reason can change while still read-only
+      continue;
+    }
     input.disabled = readOnly;
     if (readOnly) {
       mdReadOnlyTasks.add(input);
-      input.title = MD_READ_ONLY_TASK_TITLE;
+      input.title = mdState.readOnlyReason || MD_READ_ONLY_TASK_TITLE;
     } else {
       mdReadOnlyTasks.delete(input);
       input.removeAttribute('title');
@@ -8660,6 +10005,2058 @@ function mdPreventDefault(event) {
 function mdFail(err, message, canReopenAsText) {
   logError(message, err);
   showError({ message, detail: errorDetail(err), canReopenAsText });
+}
+
+// ----- MARKDOWN: FRAME & TOOLBAR -----
+// (v0.2.0, P6; contract §9.1) The preview sits in `div.md-app`: a toolbar (TOC toggle, the radiogroup Preview | Split |
+// WYSIWYG, a status text and "Edit anyway") over `div.md-body` = [`nav.md-toc` | `.md-view` | `.md-wysiwyg`]. `.md-view`
+// stays the scroller of the preview. The mode is per panel: the host's `defaultMode` is only the start; the toolbar
+// choice is kept in the webview state (`markdownMode`) and reported to the host with `setMode` (the host opens the
+// source beside the preview for Split and sends blocks, not html, for WYSIWYG). A mode that cannot be used (kill switch,
+// read-only file, too large, wrong encoding) stays focusable with `aria-disabled` and says why.
+
+/** @typedef {'preview' | 'split' | 'wysiwyg'} MdMode */
+/**
+ * @typedef {object} MdFrame
+ * @property {HTMLElement} app
+ * @property {HTMLElement} body
+ * @property {HTMLElement} toc  `nav.md-toc`
+ * @property {HTMLButtonElement} tocBtn
+ * @property {Record<MdMode, HTMLButtonElement>} radios
+ * @property {HTMLElement} status  polite live region of the toolbar
+ * @property {HTMLButtonElement} anyway  "Edit anyway" (hidden unless the host offers it)
+ * @property {HTMLElement} wysiwyg  `.md-wysiwyg`: the editor's holder (hidden unless the mode is WYSIWYG)
+ */
+/**
+ * @typedef {object} MdAvailability  whether the WYSIWYG editor may be shown, and may be typed in
+ * @property {'ok' | 'readonly' | 'disabled'} state  ok: editable; readonly: shown but not editable (save check open); disabled: not offered
+ * @property {string} reason
+ */
+
+const MD_STATE_MODE_KEY = 'markdownMode';
+const MD_MODES = /** @type {MdMode[]} */ (['preview', 'split', 'wysiwyg']);
+const MD_MODE_LABELS = { preview: 'Preview', split: 'Split', wysiwyg: 'WYSIWYG' };
+/** A message in the status line (an edit that was refused, a mode that is off) stays this long, then the base text returns. */
+const MD_STATUS_MS = 6000;
+const MD_FRAME_ICONS = {
+  toc: '<svg viewBox="0 0 16 16" width="16" height="16"><path d="M2.5 4h1M2.5 8h1M2.5 12h1M6 4h7.5M6 8h7.5M6 12h7.5" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>',
+};
+
+/** What the webview knows besides the preview: edit state, limits, line break, blocks (only while the host is in WYSIWYG). */
+const mdx = {
+  /** @type {EditState | null} */
+  editState: null,
+  /** @type {{ wysiwyg: boolean, reason?: string } | null} */
+  limits: null,
+  eol: /** @type {'\n' | '\r\n'} */ ('\n'),
+  /** @type {MdSourceBlock[] | null} */
+  blocks: null,
+  resourceBase: '',
+  /** A message for the status line and when it goes away. */
+  flash: '',
+  flashTimer: 0,
+};
+
+/** @type {MdFrame | null} */
+let mdFrame = null;
+
+/**
+ * The fields of an init / markdownUpdate that belong to editing (read by mdAcceptMessage).
+ * @param {MdMessage} msg
+ */
+function mdAcceptEditing(msg) {
+  if (msg.editState && typeof msg.editState === 'object') mdx.editState = msg.editState;
+  if (msg.limits && typeof msg.limits === 'object') mdx.limits = msg.limits;
+  if (msg.eol === '\n' || msg.eol === '\r\n') mdx.eol = msg.eol;
+  mdx.blocks = Array.isArray(msg.blocks) ? msg.blocks : null;
+  if (typeof msg.resourceBase === 'string') mdx.resourceBase = msg.resourceBase;
+}
+
+/** The mode this panel starts in: the toolbar choice of an earlier view of this webview, else the host's default. */
+function mdStartMode(/** @type {string | undefined} */ hostMode) {
+  const stored = /** @type {unknown} */ (getStateKey(MD_STATE_MODE_KEY));
+  const wanted = MD_MODES.find((m) => m === stored) ?? MD_MODES.find((m) => m === hostMode) ?? 'preview';
+  return wanted === 'wysiwyg' && mdWysiwygAvailability().state === 'disabled' ? /** @type {MdMode} */ ('preview') : wanted;
+}
+
+/**
+ * Whether WYSIWYG can be used now, from the host's edit state and size limits (contract §9.5).
+ * @returns {MdAvailability}
+ */
+function mdWysiwygAvailability() {
+  const limits = mdx.limits;
+  if (limits && !limits.wysiwyg) return { state: 'disabled', reason: limits.reason || 'This file is too large for WYSIWYG editing. Use Split to edit the Markdown source.' };
+  const es = mdx.editState;
+  if (!es) return { state: 'disabled', reason: 'WYSIWYG is not available in this version.' };
+  if (!es.editable) return { state: 'disabled', reason: es.reason || 'Editing is not available for this file.' };
+  if (Array.isArray(es.kinds) && es.kinds.includes('mdText')) return { state: 'ok', reason: '' };
+  if (es.code === 'fidelity') return { state: 'readonly', reason: es.reason || 'Saving in VS Code would change parts of this file you did not edit.' };
+  return { state: 'disabled', reason: es.reason || 'WYSIWYG editing is not available for this file.' };
+}
+
+/**
+ * The toolbar and the body around the preview. Called by showMarkdown with the finished `.md-view`.
+ * @param {HTMLElement} view
+ * @returns {HTMLElement} `.md-app`
+ */
+function mdBuildFrame(view) {
+  /** @type {Record<string, HTMLButtonElement>} */
+  const radios = {};
+  const group = h('div', { class: 'md-modes', role: 'radiogroup', 'aria-label': 'Markdown view' });
+  for (const mode of MD_MODES) {
+    const button = /** @type {HTMLButtonElement} */ (
+      h('button', { class: 'md-mode-btn', type: 'button', role: 'radio', 'aria-checked': 'false', tabindex: '-1', dataset: { mode }, onclick: () => mdChooseMode(mode) }, MD_MODE_LABELS[mode])
+    );
+    radios[mode] = button;
+    group.append(button);
+  }
+  group.addEventListener('keydown', mdOnModeKeyDown);
+  const tocBtn = /** @type {HTMLButtonElement} */ (
+    h('button', { class: 'fv-icon-btn md-toc-btn', type: 'button', title: 'Table of contents', 'aria-label': 'Table of contents', 'aria-pressed': 'false', 'aria-controls': 'md-toc', onclick: () => mdTocToggle() }, icon(MD_FRAME_ICONS.toc))
+  );
+  const status = h('span', { class: 'md-status', role: 'status', 'aria-live': 'polite' });
+  const anyway = /** @type {HTMLButtonElement} */ (
+    h('button', { class: 'md-anyway', type: 'button', hidden: true, onclick: () => post({ type: 'editAnyway' }) }, 'Edit anyway…')
+  );
+  const toolbar = h('div', { class: 'md-toolbar', role: 'toolbar', 'aria-label': 'Markdown toolbar' }, tocBtn, group, status, anyway);
+  const toc = h('nav', { class: 'md-toc', id: 'md-toc', 'aria-label': 'Table of contents', hidden: true });
+  const wysiwyg = h('div', { class: 'md-wysiwyg', hidden: true });
+  const body = h('div', { class: 'md-body' }, toc, view, wysiwyg);
+  const app = h('div', { class: 'md-app', dataset: { mode: mdState.mode } }, toolbar, body);
+  mdFrame = { app, body, toc, tocBtn, radios: /** @type {Record<MdMode, HTMLButtonElement>} */ (radios), status, anyway, wysiwyg };
+  return app;
+}
+
+/** After the first init: the table of contents, the toolbar state and the mode the host has to know about. */
+function mdFrameStart(/** @type {MdMessage} */ msg) {
+  mdTocInit();
+  mdSplitInit();
+  mdFrameRefresh();
+  // The host starts in its default mode: tell it the mode this panel is really in (Split opens the source editor).
+  if (mdState.mode !== msg.mode || mdState.mode === 'split') post({ type: 'setMode', mode: mdState.mode });
+  if (mdState.mode === 'wysiwyg') mdwEnter();
+}
+
+/** Radio states, status text, "Edit anyway", the table of contents and the task checkboxes follow the latest state. */
+function mdFrameRefresh() {
+  const frame = mdFrame;
+  if (!frame) return;
+  const availability = mdWysiwygAvailability();
+  for (const mode of MD_MODES) {
+    const button = frame.radios[mode];
+    const checked = mode === mdState.mode;
+    button.setAttribute('aria-checked', String(checked));
+    button.tabIndex = checked ? 0 : -1;
+    const off = mode === 'wysiwyg' && availability.state === 'disabled';
+    if (off) button.setAttribute('aria-disabled', 'true');
+    else button.removeAttribute('aria-disabled');
+    button.title = off ? `WYSIWYG is not available: ${availability.reason}` : mode === 'split' ? 'Split: the preview beside the Markdown source' : mode === 'wysiwyg' ? 'Edit in a rich editor' : 'Read-only rendering';
+  }
+  // (a panel whose mode is off falls back to the preview: its radio would otherwise stay unreachable)
+  if (!MD_MODES.some((mode) => mode === mdState.mode)) frame.radios.preview.tabIndex = 0;
+  frame.app.dataset.mode = mdState.mode;
+  const es = mdx.editState;
+  const offer = es && es.code === 'fidelity' && es.canEditAnyway && mdState.mode === 'wysiwyg' ? es.canEditAnyway : null;
+  frame.anyway.hidden = !offer;
+  frame.anyway.title = offer ? offer.details.join('\n') : '';
+  mdShowStatus();
+}
+
+/** The status line: a fresh message first, else what the current mode needs to say. */
+function mdShowStatus() {
+  const frame = mdFrame;
+  if (!frame) return;
+  let text = mdx.flash;
+  if (!text && mdState.mode === 'wysiwyg') {
+    const availability = mdWysiwygAvailability();
+    if (availability.state === 'readonly') text = mdReadonlyText(availability.reason);
+    else if (mdw.failure) text = mdw.failure;
+    else if (!mdw.ready) text = 'Loading the WYSIWYG editor…';
+  }
+  if (frame.status.textContent !== text) frame.status.textContent = text;
+}
+
+/** The title the host gave for a read-only WYSIWYG (the reason is long; the details are in the button's tooltip). */
+function mdReadonlyText(/** @type {string} */ reason) {
+  const offer = mdx.editState && mdx.editState.canEditAnyway;
+  return offer ? `Read-only: ${offer.title}` : reason;
+}
+
+/**
+ * A message in the status line for a few seconds (live region: read by screen readers).
+ * @param {string} text
+ */
+function mdFlash(text) {
+  mdx.flash = text;
+  window.clearTimeout(mdx.flashTimer);
+  mdx.flashTimer = window.setTimeout(() => {
+    mdx.flash = '';
+    mdShowStatus();
+  }, MD_STATUS_MS);
+  mdShowStatus();
+}
+
+/** Toolbar choice (click, Enter, Space or arrow key on a radio). @param {MdMode} mode */
+function mdChooseMode(mode) {
+  if (mode === 'wysiwyg') {
+    const availability = mdWysiwygAvailability();
+    if (availability.state === 'disabled') {
+      mdFlash(availability.reason);
+      return;
+    }
+  }
+  if (mode === mdState.mode) return;
+  setStateKey(MD_STATE_MODE_KEY, mode);
+  void mdSwitchMode(mode);
+}
+
+let mdSwitching = Promise.resolve();
+
+/**
+ * Switches the panel to `mode`: pending WYSIWYG typing is sent first; the host answers `setMode` with a rendering that
+ * fits the mode (html for Preview / Split, blocks for WYSIWYG).
+ * @param {MdMode} mode
+ */
+function mdSwitchMode(mode) {
+  mdSwitching = mdSwitching.then(async () => {
+    const previous = mdState.mode;
+    if (previous === mode || !mdFrame) return;
+    if (previous === 'wysiwyg') await mdwLeave();
+    mdState.mode = mode;
+    if (mdState.view) mdState.view.dataset.mode = mode;
+    post({ type: 'setMode', mode });
+    mdFrameRefresh();
+    if (mode === 'wysiwyg') mdwEnter();
+    else {
+      mdwShow(false);
+      mdTocCurrentSoon();
+    }
+  });
+  return mdSwitching.catch((err) => logError('Could not switch the Markdown mode', err));
+}
+
+/**
+ * The panel could not stay in its mode (WYSIWYG load failed, self-check, the host says it is off): back to Preview.
+ * @param {string} reason shown in the status line
+ */
+function mdFallbackToPreview(reason) {
+  log('info', `Markdown: back to Preview (${reason})`);
+  if (mdState.mode === 'wysiwyg') {
+    mdState.mode = 'preview';
+    if (mdState.view) mdState.view.dataset.mode = 'preview';
+    mdwShow(false);
+    post({ type: 'setMode', mode: 'preview' });
+  }
+  mdFrameRefresh();
+  mdFlash(reason);
+}
+
+/** Radio keys: Left / Up and Right / Down move (and choose, unless the mode is off), Home / End jump. @param {KeyboardEvent} e */
+function mdOnModeKeyDown(e) {
+  if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || e.isComposing || !mdFrame) return;
+  const current = MD_MODES.find((mode) => mdFrame && mdFrame.radios[mode] === e.target);
+  if (!current) return;
+  let index = MD_MODES.indexOf(current);
+  switch (e.key) {
+    case 'ArrowLeft':
+    case 'ArrowUp':
+      index = (index + MD_MODES.length - 1) % MD_MODES.length;
+      break;
+    case 'ArrowRight':
+    case 'ArrowDown':
+      index = (index + 1) % MD_MODES.length;
+      break;
+    case 'Home':
+      index = 0;
+      break;
+    case 'End':
+      index = MD_MODES.length - 1;
+      break;
+    case ' ':
+    case 'Enter':
+      e.preventDefault();
+      mdChooseMode(current);
+      return;
+    default:
+      return;
+  }
+  e.preventDefault();
+  const next = MD_MODES[index];
+  const button = mdFrame.radios[next];
+  // Roving tabindex: the focused radio is the one Tab returns to; an unusable one is focused but not chosen.
+  for (const mode of MD_MODES) mdFrame.radios[mode].tabIndex = mode === next ? 0 : -1;
+  button.focus();
+  mdChooseMode(next);
+}
+
+/**
+ * `editState` message: the document became (or stopped being) editable, the save check finished, "Edit anyway" was accepted.
+ * @param {EditStateMessage} msg
+ */
+function mdOnEditState(msg) {
+  if (currentKind() !== 'markdown' || !mdFrame || !msg.state || typeof msg.state !== 'object') return;
+  mdx.editState = msg.state;
+  mdFrameRefresh();
+  mdwOnEditStateChange();
+}
+
+/**
+ * `markdownUpdate` hook (called after mdAcceptMessage): updates that belong to the WYSIWYG editor, or that tell a WYSIWYG
+ * panel the host fell back to Preview, are handled here. Returns true when the preview must not be patched.
+ * @param {MdMessage} msg
+ * @returns {boolean}
+ */
+function mdFrameOnUpdate(msg) {
+  mdFrameRefresh();
+  mdTocRebuild();
+  const fromWysiwygHost = Array.isArray(msg.blocks);
+  if (mdState.mode === 'wysiwyg') {
+    if (fromWysiwygHost) {
+      mdwOnUpdate(msg);
+      return true;
+    }
+    if (mdWysiwygAvailability().state !== 'disabled') return true; // a Preview update sent before the host got `setMode`
+    mdFallbackToPreview(mdWysiwygAvailability().reason);
+    return false;
+  }
+  if (fromWysiwygHost) return true; // a WYSIWYG update that crossed our switch back to Preview: the host will send the html
+  mdSplitOnUpdate();
+  return false;
+}
+
+/** `.md-view` and `.md-wysiwyg` swap: only one of them is shown. @param {boolean} on */
+function mdwShow(on) {
+  const frame = mdFrame;
+  if (!frame) return;
+  frame.wysiwyg.hidden = !on;
+  if (mdState.view) mdState.view.hidden = on;
+}
+
+/** Disposal of the frame (new init, error page). */
+function mdFrameDispose() {
+  window.clearTimeout(mdx.flashTimer);
+  mdx.flash = '';
+  mdFrame = null;
+  mdTocDispose();
+  mdSplitDispose();
+  mdwDispose();
+}
+
+// ----- MARKDOWN: TOC -----
+// (contract §9.4) The table of contents is a tree built from `toc` like the PDF outline: entries nest by level (a skipped
+// level nests under the last open entry), collapse state is keyed `slug@line` and saved with `open` in the webview state
+// (`markdownToc`), the tree is rebuilt on every update keeping the collapse state and the focus, a click or Enter scrolls
+// (Preview: the heading; Split: also the source editor; WYSIWYG: the heading's block), the heading in view is marked.
+
+const MD_STATE_TOC_KEY = 'markdownToc';
+const MD_TOC_MAX_DEPTH = 8;
+/** A heading this close below the top of the view (the scroll padding) is the one in view. */
+const MD_TOC_TOP_SLACK = 24;
+/**
+ * @typedef {{ entry: MdTocEntry, key: string, children: MdTocNode[] }} MdTocNode
+ * @typedef {{ open: boolean, collapsed: Set<string> }} MdTocState
+ */
+/** @type {MdTocState} */
+const mdTocState = { open: false, collapsed: new Set() };
+const mdToc = {
+  /** Key of the entry the roving tabindex is on. */
+  active: '',
+  /** Key of the entry of the heading in view. */
+  current: '',
+  /** @type {Map<string, HTMLElement>} */
+  items: new Map(),
+  /** @type {MdTocNode[]} */
+  tree: [],
+  raf: 0,
+};
+
+function mdTocInit() {
+  try {
+    const saved = /** @type {{ open?: unknown, collapsed?: unknown } | null | undefined} */ (getStateKey(MD_STATE_TOC_KEY));
+    mdTocState.open = saved?.open === true;
+    mdTocState.collapsed = new Set(Array.isArray(saved?.collapsed) ? saved.collapsed.filter((/** @type {unknown} */ k) => typeof k === 'string') : []);
+  } catch {
+    mdTocState.open = false;
+    mdTocState.collapsed = new Set();
+  }
+  mdToc.active = '';
+  mdToc.current = '';
+  mdTocRebuild();
+  mdTocShow(mdTocState.open, false);
+  // The heading in view follows the scroll of the preview (and of the editor, see mdwOnScroll).
+  const view = mdState.view;
+  if (view) {
+    view.addEventListener('scroll', mdTocCurrentSoon, { passive: true });
+    onDispose(() => view.removeEventListener('scroll', mdTocCurrentSoon));
+  }
+}
+
+function mdTocDispose() {
+  cancelAnimationFrame(mdToc.raf);
+  mdToc.items.clear();
+  mdToc.tree = [];
+}
+
+function mdTocSave() {
+  setStateKey(MD_STATE_TOC_KEY, { open: mdTocState.open, collapsed: [...mdTocState.collapsed] });
+}
+
+/** @param {MdTocEntry[]} toc @returns {MdTocNode[]} */
+function mdTocTree(toc) {
+  /** @type {MdTocNode[]} */
+  const roots = [];
+  /** @type {MdTocNode[]} */
+  const stack = [];
+  for (const entry of toc) {
+    /** @type {MdTocNode} */
+    const node = { entry, key: `${entry.slug}@${entry.line}`, children: [] };
+    while (stack.length && stack[stack.length - 1].entry.level >= entry.level) stack.pop();
+    (stack.length ? stack[stack.length - 1].children : roots).push(node);
+    stack.push(node);
+  }
+  return roots;
+}
+
+/** @param {boolean} open @param {boolean} [save] */
+function mdTocShow(open, save = true) {
+  const frame = mdFrame;
+  if (!frame) return;
+  mdTocState.open = open;
+  frame.toc.hidden = !open;
+  frame.tocBtn.setAttribute('aria-pressed', String(open));
+  if (save) mdTocSave();
+  if (open) mdTocCurrentSoon();
+}
+
+function mdTocToggle() {
+  const frame = mdFrame;
+  if (!frame) return;
+  const open = Boolean(frame.toc.hidden);
+  mdTocShow(open);
+  if (open) mdTocFocusActive();
+}
+
+function mdTocFocusActive() {
+  const item = mdToc.items.get(mdToc.active) ?? mdToc.items.values().next().value;
+  if (item) item.focus({ preventScroll: true });
+}
+
+/** Rebuilds the tree from mdState.toc, keeping collapse state, focus and the heading in view. */
+function mdTocRebuild() {
+  const frame = mdFrame;
+  if (!frame) return;
+  const focused = document.activeElement instanceof HTMLElement && frame.toc.contains(document.activeElement) ? document.activeElement.dataset.key : undefined;
+  const tree = mdTocTree(mdState.toc);
+  // A collapsed entry whose line moved (an edit above it) is the one with the same slug.
+  const keys = new Set();
+  /** @type {Map<string, string>} */
+  const bySlug = new Map();
+  /** @param {MdTocNode[]} nodes */
+  const walk = (nodes) => {
+    for (const node of nodes) {
+      keys.add(node.key);
+      bySlug.set(node.entry.slug, node.key);
+      walk(node.children);
+    }
+  };
+  walk(tree);
+  let changed = false;
+  for (const key of [...mdTocState.collapsed]) {
+    if (keys.has(key)) continue;
+    mdTocState.collapsed.delete(key);
+    const moved = bySlug.get(key.slice(0, key.lastIndexOf('@')));
+    if (moved) mdTocState.collapsed.add(moved);
+    changed = true;
+  }
+  if (changed) mdTocSave();
+  mdToc.tree = tree;
+  mdToc.items.clear();
+  if (!keys.has(mdToc.active)) mdToc.active = tree.length ? tree[0].key : '';
+  frame.toc.replaceChildren(
+    tree.length
+      ? mdTocBuildList(tree, 1)
+      : h('p', { class: 'md-toc-empty' }, 'This document has no headings.'),
+  );
+  if (focused && mdToc.items.has(focused)) mdToc.items.get(focused)?.focus({ preventScroll: true });
+  mdTocMarkCurrent();
+}
+
+/**
+ * @param {MdTocNode[]} nodes
+ * @param {number} level 1-based depth
+ * @returns {HTMLElement}
+ */
+function mdTocBuildList(nodes, level) {
+  const list = h('ul', { class: 'md-toc-list', role: level === 1 ? 'tree' : 'group', 'aria-label': level === 1 ? 'Table of contents' : null });
+  if (level === 1) list.addEventListener('keydown', mdTocOnKeyDown);
+  for (const node of nodes) {
+    const children = node.children.length && level < MD_TOC_MAX_DEPTH ? node.children : [];
+    const expanded = !mdTocState.collapsed.has(node.key);
+    const row = h(
+      'div',
+      {
+        class: 'md-toc-row',
+        role: 'treeitem',
+        tabindex: node.key === mdToc.active ? '0' : '-1',
+        'aria-level': String(level),
+        'aria-expanded': children.length ? String(expanded) : null,
+        'aria-selected': 'false',
+        dataset: { key: node.key, line: String(node.entry.line) },
+        title: node.entry.text,
+      },
+      h('span', { class: 'md-toc-toggle', 'aria-hidden': 'true' }, children.length ? icon(ICONS.chevronRight) : null),
+      h('span', { class: 'md-toc-text' }, node.entry.text || 'Untitled'),
+    );
+    row.addEventListener('click', (e) => {
+      const toggle = e.target instanceof Element ? e.target.closest('.md-toc-toggle') : null;
+      mdToc.active = node.key;
+      if (toggle && children.length) mdTocSetExpanded(node, row, !(row.getAttribute('aria-expanded') === 'true'));
+      else mdTocGo(node.entry, row);
+      mdTocRovingTo(row);
+    });
+    mdToc.items.set(node.key, row);
+    const li = h('li', { class: 'md-toc-item', role: 'none' }, row);
+    if (children.length) {
+      const sub = mdTocBuildList(children, level + 1);
+      sub.hidden = !expanded;
+      li.append(sub);
+    }
+    list.append(li);
+  }
+  return list;
+}
+
+/** @param {HTMLElement} row */
+function mdTocRovingTo(row) {
+  for (const item of mdToc.items.values()) item.tabIndex = item === row ? 0 : -1;
+  mdToc.active = row.dataset.key ?? mdToc.active;
+}
+
+/**
+ * @param {MdTocNode} node
+ * @param {HTMLElement} row
+ * @param {boolean} expanded
+ */
+function mdTocSetExpanded(node, row, expanded) {
+  row.setAttribute('aria-expanded', String(expanded));
+  const sub = row.parentElement?.querySelector(':scope > ul');
+  if (sub instanceof HTMLElement) sub.hidden = !expanded;
+  if (expanded) mdTocState.collapsed.delete(node.key);
+  else mdTocState.collapsed.add(node.key);
+  mdTocSave();
+}
+
+/**
+ * Tree keys like a VS Code tree: Up / Down previous / next entry shown, Right expands (or goes to the first child), Left
+ * collapses (or goes to the parent), Home / End first / last entry shown, Enter / Space go to the heading.
+ * @param {KeyboardEvent} e
+ */
+function mdTocOnKeyDown(e) {
+  if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || e.isComposing) return;
+  const row = e.target instanceof HTMLElement ? e.target.closest('.md-toc-row') : null;
+  if (!(row instanceof HTMLElement)) return;
+  const shown = [...mdToc.items.values()].filter((item) => item.getClientRects().length > 0);
+  const i = shown.indexOf(row);
+  const node = mdTocFind(row.dataset.key ?? '');
+  const expanded = row.getAttribute('aria-expanded');
+  /** @type {HTMLElement | null | undefined} */
+  let next = null;
+  switch (e.key) {
+    case 'ArrowDown':
+      next = shown[i + 1];
+      break;
+    case 'ArrowUp':
+      next = i > 0 ? shown[i - 1] : null;
+      break;
+    case 'Home':
+      next = shown[0];
+      break;
+    case 'End':
+      next = shown[shown.length - 1];
+      break;
+    case 'ArrowRight':
+      if (node && expanded === 'false') mdTocSetExpanded(node, row, true);
+      else if (expanded === 'true') next = /** @type {HTMLElement | null} */ (row.parentElement?.querySelector(':scope > ul > .md-toc-item > .md-toc-row') ?? null);
+      break;
+    case 'ArrowLeft':
+      if (node && expanded === 'true') mdTocSetExpanded(node, row, false);
+      else next = /** @type {HTMLElement | null} */ (row.parentElement?.parentElement?.closest('.md-toc-item')?.querySelector(':scope > .md-toc-row') ?? null);
+      break;
+    case 'Enter':
+    case ' ':
+      if (node) mdTocGo(node.entry, row);
+      e.preventDefault();
+      return;
+    case 'Escape':
+      // Like a side drawer: closes the panel (the state is saved) and gives the focus back to the button that opened it.
+      mdTocShow(false);
+      mdFrame?.tocBtn.focus();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    default:
+      return;
+  }
+  e.preventDefault();
+  e.stopPropagation();
+  if (next) {
+    mdTocRovingTo(next);
+    next.focus();
+  }
+}
+
+/** @param {string} key @param {MdTocNode[]} [nodes] @returns {MdTocNode | undefined} */
+function mdTocFind(key, nodes = mdToc.tree) {
+  for (const node of nodes) {
+    if (node.key === key) return node;
+    const inner = mdTocFind(key, node.children);
+    if (inner) return inner;
+  }
+  return undefined;
+}
+
+/**
+ * Scrolls to a heading: Preview / Split the heading of the article (Split also tells the source editor), WYSIWYG its block.
+ * The keyboard focus stays in the tree (the jump of an in-page link would move it to the heading).
+ * @param {MdTocEntry} entry
+ * @param {HTMLElement} [row] the entry's row
+ */
+function mdTocGo(entry, row) {
+  if (mdState.mode === 'wysiwyg') {
+    mdwScrollToLine(entry.line);
+    return;
+  }
+  const article = mdState.article;
+  if (!article) return;
+  mdScrollToFragment(article, encodeURIComponent(entry.slug), mdState.toc, mdState.scroll);
+  if (row && document.activeElement !== row) row.focus({ preventScroll: true });
+  if (mdState.mode === 'split') post({ type: 'previewScrolled', line: entry.line });
+}
+
+function mdTocCurrentSoon() {
+  if (mdToc.raf || !mdFrame || mdFrame.toc.hidden) return;
+  mdToc.raf = requestAnimationFrame(() => {
+    mdToc.raf = 0;
+    mdTocMarkCurrent();
+  });
+}
+
+/** Marks the entry of the last heading above the top of the view (`aria-current="location"`). */
+function mdTocMarkCurrent() {
+  const frame = mdFrame;
+  if (!frame || frame.toc.hidden || !mdState.toc.length) return;
+  const line = mdState.mode === 'wysiwyg' ? mdwLineAtTop() : mdLineAtTop(MD_TOC_TOP_SLACK);
+  let current = mdState.toc[0];
+  for (const entry of mdState.toc) {
+    if (entry.line <= line) current = entry;
+    else break;
+  }
+  const key = `${current.slug}@${current.line}`;
+  if (key === mdToc.current && mdToc.items.get(key)?.getAttribute('aria-current')) return;
+  mdToc.current = key;
+  for (const [k, item] of mdToc.items) {
+    if (k === key) {
+      item.setAttribute('aria-current', 'location');
+      item.setAttribute('aria-selected', 'true');
+    } else {
+      item.removeAttribute('aria-current');
+      item.setAttribute('aria-selected', 'false');
+    }
+  }
+}
+
+// ----- MARKDOWN: SPLIT (scroll sync) -----
+// (contract §9.2) In Split the host shows the Markdown source in VS Code's own text editor beside the preview and keeps
+// the two in step. Editor -> preview: `revealLine {line}` (fractional); preview -> editor: `previewScrolled {line}`. The
+// position of a source line is found with a binary search over the elements that carry `data-source-line` (only the
+// ones that go forward: footnotes and alerts jump back), interpolated inside a block by its height. A scroll we caused
+// ourselves is not sent back (`programmatic`, 150 ms).
+
+const MD_SYNC_ECHO_MS = 150;
+const MD_SYNC_SEND_MS = 40;
+/** A reveal keeps its line at the top for at most this long while a large document settles (see mdSplitScrollTo). */
+const MD_SYNC_PIN_MS = 600;
+const mdSync = {
+  /** performance.now() until which scroll events are our own. */
+  programmaticUntil: 0,
+  /** Number of the newest reveal (a refinement of an older one stops). */
+  reveal: 0,
+  /** @type {{ line: number, el: HTMLElement }[] | null} */
+  list: null,
+  /** @type {MutationObserver | null} */
+  observer: null,
+  timer: 0,
+  lastSent: -1,
+};
+
+function mdSplitInit() {
+  const view = mdState.view;
+  const article = mdState.article;
+  if (!view || !article) return;
+  view.addEventListener('scroll', mdSplitOnScroll, { passive: true });
+  mdSync.observer = new MutationObserver(() => (mdSync.list = null));
+  mdSync.observer.observe(article, { childList: true });
+  mdSync.list = null;
+  mdSync.lastSent = -1;
+  onDispose(() => view.removeEventListener('scroll', mdSplitOnScroll));
+}
+
+function mdSplitDispose() {
+  mdSync.observer?.disconnect();
+  mdSync.observer = null;
+  mdSync.list = null;
+  mdSync.reveal++;
+  window.clearTimeout(mdSync.timer);
+  mdSync.timer = 0;
+}
+
+/** A markdownUpdate may have patched the article: the element list is made again when needed. */
+function mdSplitOnUpdate() {
+  mdSync.list = null;
+}
+
+/** The elements of the article with a source line, in document order, only those whose line does not go back. */
+function mdSyncList() {
+  if (mdSync.list) return mdSync.list;
+  /** @type {{ line: number, el: HTMLElement }[]} */
+  const list = [];
+  const article = mdState.article;
+  if (article) {
+    let last = -1;
+    for (const el of article.querySelectorAll('[data-source-line]')) {
+      const line = Number(el.getAttribute('data-source-line'));
+      if (!Number.isInteger(line) || line < last || !(el instanceof HTMLElement)) continue;
+      // the first element of a line only: a block and its first child share the line
+      if (line === last && list.length) continue;
+      list.push({ line, el });
+      last = line;
+    }
+  }
+  mdSync.list = list;
+  return list;
+}
+
+/** Top of `el` in the scroller's content coordinates. @param {HTMLElement} view @param {Element} el */
+function mdElementTop(view, el) {
+  return el.getBoundingClientRect().top - view.getBoundingClientRect().top + view.scrollTop;
+}
+
+/**
+ * The source line (fractional) at the top of the preview (`slack` px below the very top: the table of contents counts a
+ * heading that a jump left a little below the top, because of the scroll padding, as the one in view).
+ * @param {number} [slack]
+ * @returns {number}
+ */
+function mdLineAtTop(slack = 0) {
+  const view = mdState.view;
+  if (!view) return 0;
+  const list = mdSyncList();
+  if (!list.length) return 0;
+  const y = view.scrollTop + 1 + slack;
+  let lo = 0;
+  let hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (mdElementTop(view, list[mid].el) <= y) lo = mid + 1;
+    else hi = mid;
+  }
+  const i = lo - 1;
+  if (i < 0) return 0;
+  const top = mdElementTop(view, list[i].el);
+  const next = list[i + 1];
+  if (!next) return list[i].line;
+  const span = mdElementTop(view, next.el) - top;
+  const fraction = span > 0 ? clamp((y - top) / span, 0, 1) : 0;
+  return list[i].line + fraction * (next.line - list[i].line);
+}
+
+/**
+ * `revealLine` (the source editor scrolled): scrolls the preview to the source line (fractional).
+ * @param {number} line
+ */
+function mdSplitReveal(line) {
+  const view = mdState.view;
+  if (currentKind() !== 'markdown' || mdState.mode !== 'split' || !view || !mdState.article || !Number.isFinite(line)) return;
+  if (mdState.deferred) {
+    mdFinishDeferredBlocks(); // the target may be in a block not built yet
+    mdSync.list = null; // (the observer that clears it only runs after this call)
+  }
+  if (!mdSyncList().length) return;
+  mdState.scroll.anchor = null; // an explicit jump replaces any held position
+  mdState.scroll.top = null;
+  mdSplitScrollTo(line);
+}
+
+/**
+ * The scroll position (px) of a source line (fractional): binary search over the elements, interpolated by height.
+ * @param {HTMLElement} view
+ * @param {number} line
+ */
+function mdYOfLine(view, line) {
+  const list = mdSyncList();
+  let lo = 0;
+  let hi = list.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (list[mid].line <= line) lo = mid + 1;
+    else hi = mid;
+  }
+  const i = lo - 1;
+  if (i < 0) return 0;
+  const top = mdElementTop(view, list[i].el);
+  const next = list[i + 1];
+  if (!next) return top + Math.min((line - list[i].line) * 20, list[i].el.getBoundingClientRect().height);
+  const span = mdElementTop(view, next.el) - top;
+  const lines = next.line - list[i].line;
+  return top + (lines > 0 ? ((line - list[i].line) / lines) * span : 0);
+}
+
+/**
+ * Scrolls the preview to a source line. In a very large document the blocks away from the viewport only have an estimated
+ * height (`content-visibility: auto`); the ones around the target get their real height over the next frames and the
+ * target moves. So the line is kept at the top until the layout is stable (3 frames with the same height, at most
+ * MD_SYNC_PIN_MS). A newer reveal, a scroll that is not ours or a mode change ends it.
+ * @param {number} line
+ */
+function mdSplitScrollTo(line) {
+  const view = mdState.view;
+  if (!view) return;
+  const token = ++mdSync.reveal;
+  const started = performance.now();
+  let placed = 0;
+  let height = -1;
+  let stable = 0;
+  /** Where the line should be now (the browser cannot scroll past the end). */
+  const wanted = () => Math.max(0, Math.min(Math.round(mdYOfLine(view, line)), view.scrollHeight - view.clientHeight));
+  const place = () => {
+    mdSync.programmaticUntil = performance.now() + MD_SYNC_ECHO_MS;
+    mdSync.lastSent = line;
+    view.scrollTop = wanted();
+    placed = view.scrollTop; // what the browser made of it
+  };
+  place();
+  const step = () => {
+    if (mdSync.reveal !== token || mdState.mode !== 'split' || mdState.view !== view || performance.now() - started > MD_SYNC_PIN_MS) return;
+    if (Math.abs(view.scrollTop - placed) > 1) return; // someone else scrolled: do not fight it
+    stable = view.scrollHeight === height ? stable + 1 : 0;
+    height = view.scrollHeight;
+    if (Math.abs(wanted() - view.scrollTop) > 1) {
+      place();
+      stable = 0;
+    }
+    if (stable < 3) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+/** The preview scrolled (by the user): tell the host which source line is at the top, unless we caused it. */
+function mdSplitOnScroll() {
+  if (mdState.mode !== 'split' || performance.now() < mdSync.programmaticUntil) return;
+  mdSync.reveal++; // the user scrolls: a reveal that is still correcting its position stops
+  if (mdSync.timer) return;
+  mdSync.timer = window.setTimeout(() => {
+    mdSync.timer = 0;
+    if (mdState.mode !== 'split' || performance.now() < mdSync.programmaticUntil) return;
+    const line = mdLineAtTop();
+    if (Math.abs(line - mdSync.lastSent) < 0.25) return;
+    mdSync.lastSent = line;
+    post({ type: 'previewScrolled', line });
+  }, MD_SYNC_SEND_MS);
+}
+
+// ----- MARKDOWN: WYSIWYG ENGINE -----
+// (v0.2.0, P6; contract §9.3; port of the s2-markdown spike's engine.js) The block engine that makes WYSIWYG editing
+// minimal: the host sends the exact source and its top-level blocks (markdown-it token.map, `markdownBlocks`); this code
+// builds the editor document block by block with Milkdown's own parser, remembers which source range each node came
+// from, and later turns the changed region(s) into `MdTextEdit`s (UTF-16 offsets of the document text, each with the text
+// it replaces). Blocks that Milkdown cannot round-trip exactly (`serialize(parse(text)) !== text`) and the host's `fixed`
+// kinds (front matter, HTML, footnotes, math, alerts, indented code, "depends on context") are shown as protected raw
+// text (`fs_raw`), never parsed or re-serialized. The functions are pure: the Milkdown modules are passed in (`mw`, see
+// mdwLoad); nothing here touches the DOM or the host.
+
+/**
+ * @typedef {object} MdwItem  one block of the source and the editor nodes made from it
+ * @property {number} start  UTF-16 offset in `source`
+ * @property {number} end
+ * @property {string} kind
+ * @property {any} opts  serializer options read from the block's own text (bullet, fence, ...)
+ * @property {any[]} nodes  ProseMirror nodes (an untouched node keeps its identity)
+ * @property {boolean} raw  shown as protected raw text
+ * @property {string} [why]  why it is raw
+ * @typedef {{ source: string, eol: string, items: MdwItem[], loadedDoc?: any, stats?: { blocks: number, editable: number, raw: number, fails: { kind: string, text: string, out: string }[] } }} MdwModel
+ */
+
+/** @param {string} s */
+const mdwNl = (s) => s.replace(/\r\n?/g, '\n');
+/** @param {number} c UTF-16 unit */
+const mdwIsLow = (c) => c >= 0xdc00 && c <= 0xdfff;
+
+/**
+ * The editor's own node types: `fs_raw` (a protected block: exact Markdown text, edited as plain text) and the plugins
+ * that guard the editor: no undo / redo of its own (the document's undo is VS Code's), no uploads, pasted HTML sanitized,
+ * pasted files refused, relative images shown through the resource base (display only, the file keeps the written path).
+ * @param {MdwModules} mw
+ * @param {{ onChange: () => void, onRefuse: (text: string) => void, resolveImage: (src: string) => string }} hooks
+ * @returns {any[]} plugins for `editor.use`
+ */
+function mdwPlugins(mw, hooks) {
+  const { $node, $prose } = mw.utils;
+  const { Plugin } = mw.proseState;
+  const fsRaw = $node('fs_raw', () => ({
+    content: 'text*',
+    group: 'block',
+    code: true,
+    marks: '',
+    defining: true,
+    isolating: true,
+    attrs: { kind: { default: '' } },
+    parseDOM: [{ tag: 'pre.fs-raw', preserveWhitespace: 'full' }],
+    toDOM: (/** @type {any} */ node) => ['pre', { class: 'fs-raw', 'data-kind': node.attrs.kind, spellcheck: 'false' }, ['code', 0]],
+    parseMarkdown: { match: () => false, runner: () => {} },
+    toMarkdown: {
+      match: (/** @type {any} */ n) => n.type.name === 'fs_raw',
+      runner: (/** @type {any} */ state, /** @type {any} */ node) => {
+        state.addNode('html', undefined, node.textContent);
+      },
+    },
+  }));
+  const guard = $prose(
+    () =>
+      new Plugin({
+        props: {
+          // Pasted HTML goes through DOMPurify (scripts, styles, event handlers, forms are dropped).
+          transformPastedHTML: (/** @type {string} */ html) => sanitize(html),
+          handlePaste: (/** @type {any} */ _view, /** @type {ClipboardEvent} */ event) => {
+            if (event.clipboardData && event.clipboardData.files && event.clipboardData.files.length > 0) {
+              hooks.onRefuse('Pasting files is not supported here; add the image as a Markdown link.');
+              return true;
+            }
+            return false;
+          },
+          handleDrop: (/** @type {any} */ _view, /** @type {DragEvent} */ event) => {
+            if (event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files.length > 0) {
+              hooks.onRefuse('Dropping files is not supported here; add the image as a Markdown link.');
+              return true;
+            }
+            return false;
+          },
+          // A relative image path is shown through the document's resource base. Only the displayed `src` changes: the node (and
+          // so the Markdown) keeps the path as written. The picture is made with its final `src`: no request for the raw path.
+          nodeViews: {
+            image: (/** @type {any} */ node) => {
+              const img = document.createElement('img');
+              /** @param {any} n */
+              const show = (n) => {
+                img.setAttribute('src', hooks.resolveImage(String(n.attrs.src ?? '')));
+                img.setAttribute('alt', String(n.attrs.alt ?? ''));
+                if (n.attrs.title) img.setAttribute('title', String(n.attrs.title));
+                else img.removeAttribute('title');
+              };
+              show(node);
+              return {
+                dom: img,
+                update: (/** @type {any} */ next) => {
+                  if (next.type !== node.type) return false;
+                  node = next;
+                  show(next);
+                  return true;
+                },
+                ignoreMutation: () => true,
+              };
+            },
+          },
+        },
+        view: () => ({
+          update: (/** @type {any} */ view, /** @type {any} */ prev) => {
+            if (!view.state.doc.eq(prev.doc)) hooks.onChange();
+          },
+        }),
+      }),
+  );
+  return [fsRaw, guard];
+}
+
+/**
+ * serialize(parse(text)) with the editor's own pipeline.
+ * @param {any} editor
+ * @param {MdwModules} mw
+ * @param {string} text
+ */
+function mdwRoundTrip(editor, mw, text) {
+  const { parserCtx, serializerCtx } = mw.core;
+  return editor.action((/** @type {any} */ ctx) => ctx.get(serializerCtx)(ctx.get(parserCtx)(text)));
+}
+
+/**
+ * Style options read from a block's own source, so a re-serialized block keeps the author's markers (bullet - * +, ordered
+ * . or ), thematic break, fence character, setext headings, compact tables). Emphasis / strong markers are kept per mark
+ * by Milkdown.
+ * @param {string} text
+ * @param {string} kind
+ * @returns {Record<string, any>}
+ */
+function mdwStyleOf(text, kind) {
+  /** @type {Record<string, any>} */
+  const o = {};
+  /** @type {RegExpExecArray | null} */
+  let m;
+  if (/list/.test(kind) && (m = /^[ \t>]*([-*+])[ \t]/m.exec(text))) o.bullet = m[1];
+  if (/list/.test(kind) && (m = /^[ \t>]*\d+([.)])[ \t]/m.exec(text))) o.bulletOrdered = m[1];
+  if (kind === 'hr' && (m = /^ {0,3}([-*_])/.exec(text))) {
+    o.rule = m[1];
+    o.ruleRepetition = text.split(m[1]).length - 1;
+    o.ruleSpaces = /[-*_][ \t]+[-*_]/.test(text);
+  }
+  if (kind === 'fence' && /^ {0,3}~/.test(text)) o.fence = '~';
+  if (kind === 'heading' && /\n *(=+|-+) *$/.test(text)) o.setext = true;
+  if (kind === 'table') {
+    // A hand-written compact table (rows of different length) is written back compact, an aligned one aligned.
+    const lens = text.split('\n').map((l) => l.length);
+    if (lens.some((l) => l !== lens[0])) o.gfm = { tablePipeAlign: false };
+  }
+  return o;
+}
+
+/** @type {WeakMap<object, Map<string, any>>} */
+const mdwSerializers = new WeakMap();
+
+/**
+ * The editor's serializer, or one with these stringify options. The attachers are found by object identity (the same
+ * `remark-stringify` / `remark-gfm` modules Milkdown uses); each gets a NEW options object, so the editor's own serializer
+ * is not changed.
+ * @param {MdwModules} mw
+ * @param {any} ctx
+ * @param {Record<string, any> | undefined} opts
+ */
+function mdwSerializerFor(mw, ctx, opts) {
+  const { serializerCtx, schemaCtx, remarkCtx } = mw.core;
+  if (!opts || !Object.keys(opts).length) return ctx.get(serializerCtx);
+  let cache = mdwSerializers.get(ctx);
+  if (!cache) mdwSerializers.set(ctx, (cache = new Map()));
+  const key = JSON.stringify(opts);
+  let serializer = cache.get(key);
+  if (!serializer) {
+    const base = ctx.get(remarkCtx);
+    const stringify = mw.remarkStringify.default;
+    const gfmPlugin = mw.remarkGfm.default;
+    if (!base.attachers.some((/** @type {any[]} */ [p]) => p === stringify)) throw new Error('remark-stringify instance mismatch');
+    // A copy of the processor with a NEW options object for the stringify step (unified's use() would merge into, and so
+    // change, the options object the editor's own serializer still uses).
+    const copy = base();
+    const i = copy.attachers.findIndex((/** @type {any[]} */ [p]) => p === stringify);
+    const { gfm, ...own } = opts;
+    copy.attachers[i] = [stringify, { ...(copy.attachers[i][1] || {}), ...own }];
+    if (gfm) {
+      const g = copy.attachers.findIndex((/** @type {any[]} */ [p]) => p === gfmPlugin);
+      if (g < 0) throw new Error('remark-gfm instance mismatch');
+      copy.attachers[g] = [gfmPlugin, { ...(copy.attachers[g][1] || {}), ...gfm }];
+    }
+    serializer = mw.transformer.SerializerState.create(ctx.get(schemaCtx), copy);
+    cache.set(key, serializer);
+  }
+  return serializer;
+}
+
+/**
+ * Whether the editor's serializer is built from the same remark modules this script imports (identity), the check the
+ * engine's style options rely on.
+ * @param {any} editor
+ * @param {MdwModules} mw
+ */
+function mdwCheckIdentity(editor, mw) {
+  return editor.action((/** @type {any} */ ctx) => {
+    const attachers = ctx.get(mw.core.remarkCtx).attachers;
+    const has = (/** @type {unknown} */ plugin) => attachers.some((/** @type {any[]} */ [p]) => p === plugin);
+    return has(mw.remarkStringify.default) && has(mw.remarkGfm.default);
+  });
+}
+
+/**
+ * A table's delimiter row is written back as the author wrote it when it means the same (column count + alignment).
+ * @param {string} out
+ * @param {string} old
+ */
+function mdwKeepTableDelimiters(out, old) {
+  const row = (/** @type {string} */ t) => t.split('\n')[1];
+  const cells = (/** @type {string} */ l) => l.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim());
+  const align = (/** @type {string} */ c) => (c.startsWith(':') ? 'l' : '') + (c.endsWith(':') ? 'r' : '');
+  const x = row(out);
+  const y = row(old);
+  if (x === undefined || y === undefined || x === y || !/^[\s|:-]+$/.test(x) || !/^[\s|:-]+$/.test(y)) return out;
+  const cx = cells(x);
+  const cy = cells(y);
+  if (cx.length !== cy.length || cx.some((c, i) => align(c) !== align(cy[i]))) return out;
+  const lines = out.split('\n');
+  lines[1] = y;
+  return lines.join('\n');
+}
+
+/**
+ * @param {MdwModules} mw
+ * @param {any} ctx
+ * @param {any[]} nodes
+ * @param {Record<string, any> | undefined} opts
+ */
+function mdwSerializeNodes(mw, ctx, nodes, opts) {
+  const doc = ctx.get(mw.core.schemaCtx).topNodeType.create(null, nodes);
+  return mdwSerializerFor(mw, ctx, opts)(doc).replace(/\n$/, '');
+}
+
+/**
+ * Builds the editor document block by block and makes it the editor's state. Each item keeps the exact source range of
+ * its block and the nodes made from it (load-time objects: an untouched node keeps its identity).
+ * @param {any} editor
+ * @param {MdwModules} mw
+ * @param {string} source exact document text
+ * @param {MdSourceBlock[]} blocks from the host
+ * @param {string} eol '\n' or '\r\n'
+ * @returns {MdwModel}
+ */
+function mdwLoadModel(editor, mw, source, blocks, eol) {
+  const { parserCtx, serializerCtx, editorViewCtx, schemaCtx } = mw.core;
+  return editor.action((/** @type {any} */ ctx) => {
+    const schema = ctx.get(schemaCtx);
+    const parse = ctx.get(parserCtx);
+    void serializerCtx;
+    /** @type {MdwItem[]} */
+    const items = [];
+    const stats = { blocks: blocks.length, editable: 0, raw: 0, fails: /** @type {{ kind: string, text: string, out: string }[]} */ ([]) };
+    for (const b of blocks) {
+      const text = mdwNl(source.slice(b.start, b.end));
+      /** @type {any[] | null} */
+      let nodes = null;
+      let why = b.fixed ? b.reason : undefined;
+      /** @type {Record<string, any> | undefined} */
+      let opts;
+      if (!b.fixed) {
+        try {
+          const d = parse(text);
+          opts = mdwStyleOf(text, b.kind);
+          const out = mdwKeepTableDelimiters(mdwSerializerFor(mw, ctx, opts)(d).replace(/\n$/, ''), text);
+          if (out === text && d.childCount > 0) {
+            nodes = [];
+            d.forEach((/** @type {any} */ n) => nodes?.push(n));
+          } else {
+            why = 'round trip';
+            if (stats.fails.length < 50) stats.fails.push({ kind: b.kind, text: text.slice(0, 200), out: out.slice(0, 200) });
+          }
+        } catch (err) {
+          why = `parse error ${mdErrorMessage(err)}`;
+        }
+      }
+      if (nodes) stats.editable++;
+      else {
+        stats.raw++;
+        nodes = [schema.nodes.fs_raw.create({ kind: b.kind }, text ? schema.text(text) : null)];
+      }
+      items.push({ start: b.start, end: b.end, kind: b.kind, opts, nodes, raw: why !== undefined, ...(why === undefined ? {} : { why }) });
+    }
+    const all = items.flatMap((i) => i.nodes);
+    if (!all.length) all.push(schema.nodes.paragraph.create());
+    const view = ctx.get(editorViewCtx);
+    // The whole document is replaced by one transaction (not a new EditorState): the plugin views of the editor (cursor,
+    // tooltips, ...) stay, so the focus and the toolbar are not lost on a reload. The nodes keep their identity.
+    mdw.loading = true;
+    try {
+      view.dispatch(view.state.tr.replaceWith(0, view.state.doc.content.size, all).setMeta('addToHistory', false));
+    } finally {
+      mdw.loading = false;
+    }
+    return { source, eol, items, stats, loadedDoc: view.state.doc };
+  });
+}
+
+/**
+ * Longest increasing subsequence of pairs [oldIndex, newIndex] sorted by newIndex.
+ * @param {number[][]} pairs
+ * @returns {number[][]}
+ */
+function mdwLisPairs(pairs) {
+  /** @type {number[]} */
+  const tails = [];
+  /** @type {number[]} */
+  const prev = new Array(pairs.length);
+  for (let i = 0; i < pairs.length; i++) {
+    let lo = 0;
+    let hi = tails.length;
+    while (lo < hi) {
+      const m = (lo + hi) >> 1;
+      if (pairs[tails[m]][0] < pairs[i][0]) lo = m + 1;
+      else hi = m;
+    }
+    prev[i] = lo > 0 ? tails[lo - 1] : -1;
+    tails[lo] = i;
+  }
+  /** @type {number[][]} */
+  const out = [];
+  for (let i = tails.length ? tails[tails.length - 1] : -1; i >= 0; i = prev[i]) out.push(pairs[i]);
+  return out.reverse();
+}
+
+/**
+ * Text edits that turn model.source into the Markdown of the current editor document. Untouched blocks (same node
+ * objects, same order) are never serialized; each changed region is serialized and trimmed to its common prefix / suffix.
+ * `next` is the model after the edits (committed when the host accepts them).
+ * @param {any} editor
+ * @param {MdwModules} mw
+ * @param {MdwModel} model
+ * @returns {{ edits: MdTextEdit[], next: MdwModel }}
+ */
+function mdwComputeEdits(editor, mw, model) {
+  return editor.action((/** @type {any} */ ctx) => {
+    const doc = ctx.get(mw.core.editorViewCtx).state.doc;
+    /** @type {any[]} */
+    const cur = [];
+    doc.forEach((/** @type {any} */ n) => cur.push(n));
+    /** @type {{ node: any, ii: number }[]} */
+    const flat = [];
+    model.items.forEach((it, ii) => it.nodes.forEach((n) => flat.push({ node: n, ii })));
+    const where = new Map(cur.map((n, i) => [n, i]));
+    /** @type {number[][]} */
+    const pairs = [];
+    /** @type {Set<number>} */
+    const usedNew = new Set();
+    /** @type {number[]} */
+    const unmatchedOld = [];
+    flat.forEach((f, oi) => {
+      const ni = where.get(f.node);
+      if (ni !== undefined && !usedNew.has(ni)) {
+        pairs.push([oi, ni]);
+        usedNew.add(ni);
+      } else unmatchedOld.push(oi);
+    });
+    // Second chance: plugins (e.g. the heading-id sync) replace nodes without changing their Markdown. Match the rest by
+    // a structural key without the derived `id` attribute.
+    if (unmatchedOld.length) {
+      const keyOf = (/** @type {any} */ n) => JSON.stringify(n.toJSON(), (k, v) => (k === 'id' ? undefined : v));
+      /** @type {Map<string, number[]>} */
+      const freeNew = new Map();
+      cur.forEach((n, ni) => {
+        if (usedNew.has(ni)) return;
+        const k = keyOf(n);
+        const list = freeNew.get(k);
+        if (list) list.push(ni);
+        else freeNew.set(k, [ni]);
+      });
+      for (const oi of unmatchedOld) {
+        const list = freeNew.get(keyOf(flat[oi].node));
+        if (list && list.length) {
+          const ni = /** @type {number} */ (list.shift());
+          pairs.push([oi, ni]);
+        }
+      }
+    }
+    pairs.sort((a, b) => a[1] - b[1]);
+    const kept = mdwLisPairs(pairs);
+    const keptOld = new Set(kept.map((p) => p[0]));
+    const intact = model.items.map(() => true);
+    flat.forEach((f, oi) => {
+      if (!keptOld.has(oi)) intact[f.ii] = false;
+    });
+    // An intact item must also map to consecutive new nodes.
+    const newIndexOfOld = new Map(kept.map((p) => /** @type {[number, number]} */ ([p[0], p[1]])));
+    /** @type {{ ii: number, from: number, to: number }[]} */
+    const anchors = [];
+    let oi = 0;
+    model.items.forEach((it, ii) => {
+      const first = oi;
+      oi += it.nodes.length;
+      if (!intact[ii]) return;
+      const from = /** @type {number} */ (newIndexOfOld.get(first));
+      const to = /** @type {number} */ (newIndexOfOld.get(oi - 1)) + 1;
+      if (to - from !== it.nodes.length || (anchors.length && from < anchors[anchors.length - 1].to)) return;
+      anchors.push({ ii, from, to });
+    });
+    const eol = model.eol;
+    const src = model.source;
+    const sep = eol + eol;
+    /** @type {MdTextEdit[]} */
+    const edits = [];
+    /** @type {MdwItem[]} */
+    const next = [];
+    let delta = 0;
+    /** @type {{ ii: number, from: number, to: number } | null} */
+    let prev = null;
+    /** @type {Record<string, any> | undefined} */
+    let emitOpts;
+    /**
+     * @param {number} start
+     * @param {number} end
+     * @param {string} ins
+     * @param {any[] | null} newNodes
+     * @param {number} [itemOffsetInIns]
+     * @param {number} [itemLen]
+     */
+    const emit = (start, end, ins, newNodes, itemOffsetInIns = 0, itemLen = 0) => {
+      const oldText = src.slice(start, end);
+      if (newNodes) {
+        next.push({
+          start: start + delta + itemOffsetInIns,
+          end: start + delta + itemOffsetInIns + itemLen,
+          kind: newNodes.length === 1 ? newNodes[0].type.name : 'mixed',
+          opts: emitOpts,
+          nodes: newNodes,
+          raw: false,
+        });
+      }
+      if (oldText !== ins) {
+        let p = 0;
+        const max = Math.min(oldText.length, ins.length);
+        while (p < max && oldText.charCodeAt(p) === ins.charCodeAt(p)) p++;
+        // Never split a surrogate pair or a CRLF.
+        while (p > 0 && (mdwIsLow(oldText.charCodeAt(p)) || (oldText.charCodeAt(p) === 10 && oldText.charCodeAt(p - 1) === 13))) p--;
+        let s = 0;
+        while (s < max - p && oldText.charCodeAt(oldText.length - 1 - s) === ins.charCodeAt(ins.length - 1 - s)) s++;
+        while (s > 0 && (mdwIsLow(oldText.charCodeAt(oldText.length - s)) || (oldText.charCodeAt(oldText.length - s) === 10 && oldText.charCodeAt(oldText.length - s - 1) === 13))) s--;
+        edits.push({ start: start + p, end: end - s, oldText: oldText.slice(p, oldText.length - s), text: ins.slice(p, ins.length - s) });
+      }
+      delta += ins.length - oldText.length;
+    };
+    for (const a of [...anchors, null]) {
+      const oldFrom = prev ? prev.ii + 1 : 0;
+      const oldTo = a ? a.ii : model.items.length;
+      const newFrom = prev ? prev.to : 0;
+      const newTo = a ? a.from : cur.length;
+      if (oldTo > oldFrom || newTo > newFrom) {
+        let nodes = cur.slice(newFrom, newTo);
+        // A lone empty paragraph at the very end (a ProseMirror artefact) is not text.
+        if (!a && nodes.length && nodes[nodes.length - 1].type.name === 'paragraph' && nodes[nodes.length - 1].content.size === 0) nodes = nodes.slice(0, -1);
+        // A re-serialized region keeps the style of the block it replaces (or of the block before it).
+        emitOpts = oldTo > oldFrom ? model.items[oldFrom].opts : prev ? model.items[prev.ii].opts : undefined;
+        let text = nodes.length ? mdwSerializeNodes(mw, ctx, nodes, emitOpts) : '';
+        if (oldTo - oldFrom === 1 && nodes.length === 1 && nodes[0].type.name === 'table') {
+          text = mdwKeepTableDelimiters(text, src.slice(model.items[oldFrom].start, model.items[oldFrom].end).replace(/\r\n?/g, '\n'));
+        }
+        text = text.replace(/\n/g, eol);
+        if (oldTo > oldFrom) {
+          let start = model.items[oldFrom].start;
+          let end = model.items[oldTo - 1].end;
+          if (!nodes.length) {
+            if (prev) start = model.items[prev.ii].end;
+            else if (a) end = model.items[a.ii].start;
+            emit(start, end, '', null);
+          } else {
+            // Never let a changed block merge with a neighbour that follows / precedes it without a blank line.
+            const lazy = (/** @type {MdwItem | undefined} */ it) => !!it && /^(paragraph|blockquote|bullet_list|ordered_list|gap)$/.test(it.kind || '');
+            const blank = /\r?\n[ \t]*\r?\n/;
+            const head = prev && !blank.test(src.slice(model.items[prev.ii].end, start)) && (nodes[0].type.name === 'paragraph' || lazy(model.items[prev.ii])) ? eol : '';
+            const tail = a && !blank.test(src.slice(end, model.items[a.ii].start)) && nodes[nodes.length - 1].type.name === 'paragraph' ? eol : '';
+            emit(start, end, head + text + tail, nodes, head.length, text.length);
+          }
+        } else if (nodes.length) {
+          if (prev) {
+            const at = model.items[prev.ii].end;
+            // A blank line on BOTH sides, so the new block never merges with its neighbours.
+            const after = a ? src.slice(at, model.items[a.ii].start) : '';
+            const needTail = a && !/\r?\n[ \t]*\r?\n/.test(after);
+            emit(at, at, sep + text + (needTail ? eol : ''), nodes, sep.length, text.length);
+          } else if (a) {
+            const at = model.items[a.ii].start;
+            emit(at, at, text + sep, nodes, 0, text.length);
+          } else emit(0, src.length, text, nodes, 0, text.length);
+        }
+      }
+      if (a) {
+        const it = model.items[a.ii];
+        next.push({ ...it, nodes: cur.slice(a.from, a.to), start: it.start + delta, end: it.end + delta });
+      }
+      prev = a;
+    }
+    const source = mdwApplyEdits(src, edits);
+    next.sort((x, y) => x.start - y.start);
+    return { edits, next: { source, eol, items: next } };
+  });
+}
+
+/**
+ * @param {string} source
+ * @param {MdTextEdit[]} edits
+ */
+function mdwApplyEdits(source, edits) {
+  let out = source;
+  for (const e of [...edits].sort((a, b) => b.start - a.start)) {
+    if (out.slice(e.start, e.end) !== e.oldText) throw new Error(`oldText mismatch at ${e.start}`);
+    out = out.slice(0, e.start) + e.text + out.slice(e.end);
+  }
+  return out;
+}
+
+/**
+ * Offset of the start of 0-based source `line` (a line break is \n, \r\n or a lone \r).
+ * @param {string} source
+ * @param {number} line
+ */
+function mdwOffsetOfLine(source, line) {
+  let offset = 0;
+  for (let l = 0; l < line && offset < source.length; l++) {
+    const lf = source.indexOf('\n', offset);
+    const cr = source.indexOf('\r', offset);
+    let end = lf < 0 ? cr : cr < 0 ? lf : Math.min(lf, cr);
+    if (end < 0) return source.length;
+    end += source.charCodeAt(end) === 13 && source.charCodeAt(end + 1) === 10 ? 2 : 1;
+    offset = end;
+  }
+  return offset;
+}
+
+/**
+ * 0-based source line of an offset.
+ * @param {string} source
+ * @param {number} offset
+ */
+function mdwLineOfOffset(source, offset) {
+  let line = 0;
+  const end = Math.min(offset, source.length);
+  for (let i = 0; i < end; i++) {
+    const c = source.charCodeAt(i);
+    if (c === 13) {
+      if (source.charCodeAt(i + 1) === 10) i++;
+      line++;
+    } else if (c === 10) line++;
+  }
+  return line;
+}
+
+// ----- MARKDOWN: WYSIWYG EDITOR -----
+// The WYSIWYG editor is Milkdown Crepe 7.22.3 with the minimal feature set only (list item, link tooltip, toolbar,
+// table, cursor, block edit, placeholder): no CodeMirror, LaTeX, image block, top bar or AI (D-037). Everything is
+// loaded lazily (dist/chunks/), only when WYSIWYG opens. `remark-stringify` / `remark-gfm` come from the same module
+// graph as Milkdown, so the editor can find their serializer attachers by object identity (contract §9.3).
+
+/**
+ * @typedef {object} MdwModules
+ * @property {typeof import('@milkdown/crepe/builder')} builder
+ * @property {typeof import('@milkdown/crepe/feature/list-item')} listItem
+ * @property {typeof import('@milkdown/crepe/feature/link-tooltip')} linkTooltip
+ * @property {typeof import('@milkdown/crepe/feature/toolbar')} toolbar
+ * @property {typeof import('@milkdown/crepe/feature/table')} table
+ * @property {typeof import('@milkdown/crepe/feature/cursor')} cursor
+ * @property {typeof import('@milkdown/crepe/feature/block-edit')} blockEdit
+ * @property {typeof import('@milkdown/crepe/feature/placeholder')} placeholder
+ * @property {typeof import('@milkdown/kit/core')} core
+ * @property {typeof import('@milkdown/kit/transformer')} transformer
+ * @property {typeof import('@milkdown/kit/utils')} utils
+ * @property {typeof import('@milkdown/kit/prose/state')} proseState
+ * @property {typeof import('@milkdown/kit/plugin/history')} history
+ * @property {typeof import('@milkdown/kit/plugin/trailing')} trailing
+ * @property {typeof import('@milkdown/kit/plugin/upload')} upload
+ * @property {typeof import('remark-stringify')} remarkStringify
+ * @property {typeof import('remark-gfm')} remarkGfm
+ */
+
+/** @type {Promise<MdwModules> | null} */
+let mdwLoading = null;
+
+/**
+ * Loads the WYSIWYG editor modules (one lazy load per page; a failed load can be retried).
+ * @returns {Promise<MdwModules>}
+ */
+function mdwLoad() {
+  if (!mdwLoading) {
+    mdwLoading = Promise.all([
+      import('@milkdown/crepe/builder'),
+      import('@milkdown/crepe/feature/list-item'),
+      import('@milkdown/crepe/feature/link-tooltip'),
+      import('@milkdown/crepe/feature/toolbar'),
+      import('@milkdown/crepe/feature/table'),
+      import('@milkdown/crepe/feature/cursor'),
+      import('@milkdown/crepe/feature/block-edit'),
+      import('@milkdown/crepe/feature/placeholder'),
+      import('@milkdown/kit/core'),
+      import('@milkdown/kit/transformer'),
+      import('@milkdown/kit/utils'),
+      import('@milkdown/kit/prose/state'),
+      import('@milkdown/kit/plugin/history'),
+      import('@milkdown/kit/plugin/trailing'),
+      import('@milkdown/kit/plugin/upload'),
+      import('remark-stringify'),
+      import('remark-gfm'),
+    ]).then(
+      ([builder, listItem, linkTooltip, toolbar, table, cursor, blockEdit, placeholder, core, transformer, utils,
+        proseState, history, trailing, upload, remarkStringify, remarkGfm]) => ({
+        builder, listItem, linkTooltip, toolbar, table, cursor, blockEdit, placeholder, core, transformer, utils,
+        proseState, history, trailing, upload, remarkStringify, remarkGfm,
+      }),
+      (err) => {
+        mdwLoading = null; // allow a retry
+        throw err;
+      },
+    );
+  }
+  return mdwLoading;
+}
+
+// ----- WYSIWYG state and flow -----
+// (contract §9.3, §9.5) The editor is created on first use and kept while the view lives. Typing is flushed to the host
+// 400 ms after the last change (at once on Enter, blur, a mode switch, `pagehide`, `visibilitychange`, `flushRequest` and
+// the key commands; never during IME composition); one edit is in flight at a time and the next one is computed from the
+// editor again when it is answered. The editor never keeps an undo history: Ctrl/Cmd+Z, Ctrl+Y, Ctrl/Cmd+Shift+Z and
+// Ctrl/Cmd+S flush, then ask the host (`command`) to run VS Code's undo / redo / save after the queued edit.
+
+const MD_WYSIWYG_FLUSH_MS = 400;
+/** An edit the host does not answer within this time is given up (the editor is reloaded from the source). */
+const MD_WYSIWYG_ANSWER_MS = 15_000;
+const MD_WYSIWYG_LOAD_FAILED = 'The WYSIWYG editor could not be loaded.';
+const MD_WYSIWYG_CHANGED = 'WYSIWYG cannot open this file without changing it. Use Split.';
+const MD_WYSIWYG_FILE_CHANGED = 'The file changed; your last change was not applied.';
+const MD_WYSIWYG_IMAGE_REFUSED = 'Pasting files is not supported here; add the image as a Markdown link.';
+
+const mdw = {
+  /** @type {MdwModules | null} */
+  mw: null,
+  /** @type {any} */
+  editor: null,
+  /** @type {HTMLElement | null} */
+  holder: null,
+  /** @type {MdwModel | null} */
+  model: null,
+  /** The editor shows the current document and may be typed in (or is read-only on purpose). */
+  ready: false,
+  /** Why the editor could not open (shown in the status line). */
+  failure: '',
+  readonly: true,
+  /** The document version the model was made from / last accepted edit. */
+  version: 0,
+  nextEditId: 0,
+  /** @type {{ editId: number, next: MdwModel, timer: number } | null} */
+  inflight: null,
+  /** @type {(() => void)[]} */
+  waiters: [],
+  /** @type {MdMessage | null} */
+  deferred: null,
+  timer: 0,
+  composing: false,
+  flushSoon: false,
+  /** Bumped by every enter / leave: an async step of an older one stops. */
+  session: 0,
+  /** The document is being replaced by mdwLoadModel (not a change by the user). */
+  loading: false,
+};
+
+/**
+ * Starts the editor for the current mode (called when the mode becomes WYSIWYG and when the view is shown in it).
+ * Loads the lazy chunk, creates the editor once, builds the document from the host's blocks and runs the self-check.
+ */
+async function mdwEnter() {
+  const frame = mdFrame;
+  if (!frame) return;
+  const session = ++mdw.session;
+  mdw.failure = '';
+  mdw.ready = false;
+  mdShowStatus();
+  /** @type {MdwModules} */
+  let mw;
+  try {
+    mw = await mdwLoad();
+  } catch (err) {
+    logError('Could not load the WYSIWYG editor', err);
+    if (session === mdw.session) mdFallbackToPreview(MD_WYSIWYG_LOAD_FAILED);
+    return;
+  }
+  if (session !== mdw.session || mdState.mode !== 'wysiwyg' || mdFrame !== frame) return;
+  mdw.mw = mw;
+  // The blocks arrive with the host's answer to `setMode` (or with the init): until then the preview stays.
+  if (!mdx.blocks) return;
+  try {
+    if (!mdw.editor) await mdwCreate(mw, frame, session);
+    if (session !== mdw.session || mdState.mode !== 'wysiwyg') return;
+    const loaded = mdwLoadSource(mdState.source, mdx.blocks, mdx.eol);
+    if (!loaded) {
+      mdFallbackToPreview(MD_WYSIWYG_CHANGED);
+      return;
+    }
+    mdw.version = mdState.version;
+    mdw.ready = true;
+    mdwShow(true);
+    mdwApplyReadonly();
+    mdFrameRefresh();
+    mdTocCurrentSoon();
+  } catch (err) {
+    logError('Could not open the WYSIWYG editor', err);
+    mdw.failure = MD_WYSIWYG_LOAD_FAILED;
+    mdFallbackToPreview(MD_WYSIWYG_LOAD_FAILED);
+  }
+}
+
+/**
+ * Creates the Crepe editor (minimal feature set, no history / trailing / upload) in the frame's holder.
+ * @param {MdwModules} mw
+ * @param {MdFrame} frame
+ * @param {number} session
+ */
+async function mdwCreate(mw, frame, session) {
+  const { CrepeBuilder } = mw.builder;
+  const holder = h('div', { class: 'md-wysiwyg-editor' });
+  frame.wysiwyg.replaceChildren(holder);
+  const builder = new CrepeBuilder({ root: holder, defaultValue: '' });
+  builder
+    .addFeature(mw.listItem.listItem)
+    .addFeature(mw.linkTooltip.linkTooltip)
+    .addFeature(mw.toolbar.toolbar)
+    .addFeature(mw.table.table)
+    .addFeature(mw.cursor.cursor)
+    .addFeature(mw.blockEdit.blockEdit)
+    .addFeature(mw.placeholder.placeholder);
+  const editor = builder.editor;
+  for (const plugin of mdwPlugins(mw, {
+    onChange: mdwOnChange,
+    onRefuse: (text) => mdFlash(text),
+    resolveImage: mdwResolveImage,
+  })) {
+    editor.use(plugin);
+  }
+  // No undo history of its own and no trailing paragraph: the document's undo is VS Code's, and the file never gets a
+  // line the user did not type. Nothing is uploaded: a dropped or pasted file is refused (mdwPlugins).
+  await editor.remove(mw.history.history);
+  await editor.remove(mw.trailing.trailing);
+  editor.config((/** @type {any} */ ctx) =>
+    ctx.update(mw.upload.uploadConfig.key, (/** @type {any} */ p) => ({
+      ...p,
+      uploader: async () => {
+        mdFlash(MD_WYSIWYG_IMAGE_REFUSED);
+        return [];
+      },
+    })),
+  );
+  await builder.create();
+  if (session !== mdw.session || !mdFrame) {
+    void builder.destroy();
+    return;
+  }
+  if (!mdwCheckIdentity(editor, mw)) {
+    void builder.destroy();
+    throw new Error('the editor does not use the remark modules of this script');
+  }
+  mdw.editor = builder;
+  mdw.holder = holder;
+  // Test seam: a test page defines `globalThis.__fsTestHooks = {}` before this script runs; the editor then registers
+  // itself there (the webview tests drive ProseMirror transactions through it). Without it nothing is exposed.
+  const testHooks = /** @type {any} */ (globalThis).__fsTestHooks;
+  if (testHooks && typeof testHooks === 'object') {
+    testHooks.mdw = { mw, editor: builder.editor, state: mdw, computeEdits: () => mdwComputeEdits(builder.editor, mw, /** @type {MdwModel} */ (mdw.model)) };
+  }
+  // Keys, composition, links and focus: on the holder, in the capture phase where VS Code must not see the key.
+  listen(holder, 'keydown', mdwOnKeyDown, true);
+  listen(holder, 'keydown', mdwOnEscape, true);
+  listen(holder, 'beforeinput', mdwOnBeforeInput, true);
+  listen(holder, 'compositionstart', () => (mdw.composing = true), true);
+  listen(holder, 'compositionend', () => {
+    mdw.composing = false;
+    mdwSchedule();
+  }, true);
+  listen(holder, 'click', mdwOnClick, true);
+  listen(holder, 'auxclick', mdwOnClick, true);
+  listen(holder, 'focusout', () => void mdwFlush(), true);
+  listen(frame.wysiwyg, 'scroll', mdTocCurrentSoon, { passive: true });
+  listen(document, 'visibilitychange', () => {
+    if (document.visibilityState === 'hidden') void mdwFlush();
+  });
+  listen(window, 'pagehide', () => void mdwFlush());
+}
+
+/**
+ * Makes the editor show `source` (blocks from the host) and runs the load self-check: serializing the document right after
+ * the load must give no edit at all, else the file would change without a keystroke.
+ * @param {string} source
+ * @param {MdSourceBlock[]} blocks
+ * @param {string} eol
+ * @returns {boolean} false: the editor cannot show this file without changing it
+ */
+function mdwLoadSource(source, blocks, eol) {
+  const mw = mdw.mw;
+  const editor = mdw.editor?.editor;
+  if (!mw || !editor) return false;
+  const view = editor.action((/** @type {any} */ ctx) => ctx.get(mw.core.editorViewCtx));
+  const before = view.state.selection.from;
+  const model = mdwLoadModel(editor, mw, source, blocks, eol);
+  const { edits } = mdwComputeEdits(editor, mw, model);
+  if (edits.length) {
+    logError(`WYSIWYG self-check failed: ${edits.length} edit(s) right after the load: ${JSON.stringify(edits[0]).slice(0, 300)}`);
+    return false;
+  }
+  mdw.model = model;
+  const size = view.state.doc.content.size;
+  try {
+    const { TextSelection } = mw.proseState;
+    view.dispatch(view.state.tr.setSelection(TextSelection.near(view.state.doc.resolve(Math.min(before, size)))).setMeta('addToHistory', false));
+  } catch {
+    // the caret goes to the start: no harm
+  }
+  if (model.stats) log('info', `WYSIWYG: ${model.stats.editable} editable and ${model.stats.raw} protected blocks of ${model.stats.blocks}`);
+  return true;
+}
+
+/** @param {string} src the image path as written in the Markdown */
+function mdwResolveImage(src) {
+  if (!src || MD_SCHEME_RE.test(src) || src.startsWith('//') || src.startsWith('#') || !mdx.resourceBase) return src;
+  const path = src.split(/[?#]/)[0];
+  if (/^[a-z]:[\\/]/i.test(path) || path.startsWith('/') || path.startsWith('\\')) return src;
+  try {
+    return new URL(path, new URL(mdx.resourceBase, location.href)).toString();
+  } catch {
+    return src;
+  }
+}
+
+// ----- WYSIWYG: typing -> edits -----
+
+/** A change of the editor document (called by the editor plugin for every transaction that changed it). */
+function mdwOnChange() {
+  if (!mdw.ready || mdw.loading) return;
+  if (mdw.flushSoon) {
+    mdw.flushSoon = false;
+    void mdwFlush();
+    return;
+  }
+  mdwSchedule();
+}
+
+function mdwSchedule() {
+  window.clearTimeout(mdw.timer);
+  mdw.timer = window.setTimeout(() => void mdwFlush(), MD_WYSIWYG_FLUSH_MS);
+}
+
+/**
+ * Sends the pending typing (as one edit) and waits for the answer; repeats while more typing came in meanwhile (at most a
+ * few rounds). Resolves when nothing is pending, the editor is read-only, or the host refused.
+ */
+async function mdwFlush() {
+  window.clearTimeout(mdw.timer);
+  for (let round = 0; round < 20; round++) {
+    if (mdw.inflight) await new Promise((resolve) => mdw.waiters.push(() => resolve(undefined)));
+    if (!mdw.ready || mdw.readonly || mdw.composing) return;
+    if (!mdwSendPending()) return;
+  }
+}
+
+/** @returns {boolean} an edit was sent */
+function mdwSendPending() {
+  const mw = mdw.mw;
+  const editor = mdw.editor?.editor;
+  const model = mdw.model;
+  if (!mw || !editor || !model || mdw.inflight) return false;
+  let result;
+  try {
+    result = mdwComputeEdits(editor, mw, model);
+  } catch (err) {
+    logError('WYSIWYG could not compute the change', err);
+    mdw.readonly = true;
+    mdFlash('FileStudio could not save your last change. The editor was reloaded from the file.');
+    mdwReloadFromSource();
+    return false;
+  }
+  if (!result.edits.length) return false;
+  const editId = ++mdw.nextEditId;
+  const timer = window.setTimeout(() => {
+    if (mdw.inflight?.editId !== editId) return;
+    logError(`WYSIWYG edit ${editId} was not answered by the host`);
+    mdwEditDone(false, 'The host did not answer; the editor was reloaded from the file.');
+  }, MD_WYSIWYG_ANSWER_MS);
+  mdw.inflight = { editId, next: result.next, timer };
+  post({ type: 'edit', editId, baseVersion: mdw.version, intent: { kind: 'mdText', edits: result.edits } });
+  return true;
+}
+
+/**
+ * The host's answer to an `edit` of this view.
+ * @param {EditResultMessage} msg
+ */
+function mdwOnEditResult(msg) {
+  if (currentKind() !== 'markdown') return;
+  const inflight = mdw.inflight;
+  if (!inflight || inflight.editId !== msg.editId) return;
+  if (msg.accepted) {
+    mdw.model = inflight.next;
+    mdw.version = msg.version;
+    mdwEditDone(true);
+  } else {
+    log('info', `WYSIWYG edit refused (${msg.code}): ${msg.reason}`);
+    mdwEditDone(false, msg.reason);
+  }
+}
+
+/**
+ * @param {boolean} accepted
+ * @param {string} [reason]
+ */
+function mdwEditDone(accepted, reason) {
+  const inflight = mdw.inflight;
+  if (inflight) window.clearTimeout(inflight.timer);
+  mdw.inflight = null;
+  const waiters = mdw.waiters.splice(0);
+  if (!accepted) {
+    // What the editor shows is not in the file: show the file again (the host sends a fresh rendering for the reasons
+    // that need one; this reload covers the others).
+    if (reason) mdFlash(reason);
+    mdw.deferred = null;
+    mdwReloadFromSource();
+  } else if (mdw.deferred) {
+    const msg = mdw.deferred;
+    mdw.deferred = null;
+    mdwOnUpdate(msg);
+  }
+  for (const resolve of waiters) resolve();
+}
+
+/** Rebuilds the editor from the latest source and blocks the host sent (they are the file as it is now). */
+function mdwReloadFromSource() {
+  if (!mdw.ready || !mdx.blocks) return;
+  const ok = mdwLoadSource(mdState.source, mdx.blocks, mdx.eol);
+  mdw.version = mdState.version;
+  if (!ok) mdFallbackToPreview(MD_WYSIWYG_CHANGED);
+}
+
+/**
+ * `markdownUpdate` of a panel in WYSIWYG mode (blocks, no html): the document changed. Our own accepted edit has the same
+ * text as the model: nothing to do. Anything else (another panel, undo, the file changed on disk) reloads the editor;
+ * typing that was not sent yet is dropped with a message.
+ * @param {MdMessage} msg
+ */
+function mdwOnUpdate(msg) {
+  if (mdw.inflight) {
+    mdw.deferred = msg; // after the answer to our edit
+    return;
+  }
+  if (!mdw.ready) {
+    if (mdState.mode === 'wysiwyg') void mdwEnter(); // the blocks have just arrived
+    return;
+  }
+  const model = mdw.model;
+  if (model && model.source === mdState.source) {
+    mdw.version = mdState.version;
+    mdwApplyReadonly();
+    return;
+  }
+  const mw = mdw.mw;
+  const editor = mdw.editor?.editor;
+  let typed = false;
+  try {
+    typed = !!(mw && editor && model && mdwComputeEdits(editor, mw, model).edits.length);
+  } catch {
+    typed = true;
+  }
+  if (typed) mdFlash(MD_WYSIWYG_FILE_CHANGED);
+  window.clearTimeout(mdw.timer);
+  mdwReloadFromSource();
+  mdwApplyReadonly();
+}
+
+/** The edit state changed (settings, read-only, the save check finished): read-only or editable, or back to Preview. */
+function mdwOnEditStateChange() {
+  if (mdState.mode !== 'wysiwyg') return;
+  const availability = mdWysiwygAvailability();
+  if (availability.state === 'disabled') {
+    void mdwFlush().then(() => mdFallbackToPreview(availability.reason));
+    return;
+  }
+  mdwApplyReadonly();
+}
+
+/** The editor is typed in only while the host allows it (`kinds` has `mdText`). */
+function mdwApplyReadonly() {
+  const mw = mdw.mw;
+  const holder = mdw.holder;
+  if (!mw || !holder || !mdw.editor) return;
+  const readonly = mdWysiwygAvailability().state !== 'ok';
+  mdw.readonly = readonly;
+  try {
+    const view = mdw.editor.editor.action((/** @type {any} */ ctx) => ctx.get(mw.core.editorViewCtx));
+    view.setProps({ editable: () => !readonly });
+  } catch (err) {
+    logError('Could not change the read-only state of the editor', err);
+  }
+  holder.classList.toggle('md-wysiwyg-readonly', readonly);
+  holder.querySelector('.ProseMirror')?.setAttribute('aria-readonly', String(readonly));
+  mdShowStatus();
+}
+
+/** The toolbar leaves WYSIWYG: pending typing is sent first. */
+async function mdwLeave() {
+  mdw.session++;
+  await mdwFlush();
+  mdw.ready = false;
+  mdwShow(false);
+}
+
+function mdwDispose() {
+  mdw.session++;
+  window.clearTimeout(mdw.timer);
+  if (mdw.inflight) window.clearTimeout(mdw.inflight.timer);
+  mdw.inflight = null;
+  for (const resolve of mdw.waiters.splice(0)) resolve();
+  mdw.deferred = null;
+  mdw.ready = false;
+  mdw.model = null;
+  mdw.failure = '';
+  const builder = mdw.editor;
+  mdw.editor = null;
+  mdw.holder = null;
+  if (builder) {
+    try {
+      void builder.destroy();
+    } catch (err) {
+      logError('Could not destroy the WYSIWYG editor', err);
+    }
+  }
+}
+
+// ----- WYSIWYG: keys, links, flush requests -----
+
+/** @param {KeyboardEvent} e */
+function mdwOnKeyDown(e) {
+  if (e.isComposing) return;
+  const mod = e.ctrlKey || e.metaKey;
+  if (!mod || e.altKey) {
+    if (e.key === 'Enter') mdw.flushSoon = true;
+    return;
+  }
+  const key = e.key.toLowerCase();
+  /** @type {'undo' | 'redo' | 'save' | null} */
+  let id = null;
+  if (key === 'z') id = e.shiftKey ? 'redo' : 'undo';
+  else if (key === 'y' && !e.shiftKey) id = 'redo';
+  else if (key === 's' && !e.shiftKey) id = 'save';
+  if (!id) return;
+  // The editor has no undo history: the key is VS Code's. Flush first, then the host runs it behind the queued edit.
+  e.preventDefault();
+  e.stopPropagation();
+  const command = id;
+  void mdwFlush().then(() => post({ type: 'command', id: command }));
+}
+
+/**
+ * Escape in the text is a way out of the editor: the focus goes to the button of the chosen mode (Tab comes back to the
+ * text). Only for a key pressed in the text itself and not yet used: the block menu takes its Escape in a listener on
+ * `window` (capture phase, before this one) and marks it as handled, and the boxes of the editor (link, toolbar) are not
+ * inside `.ProseMirror`. This runs in the capture phase because ProseMirror marks every Escape as handled itself, so
+ * after it nothing can tell a used key from an unused one.
+ * @param {KeyboardEvent} e
+ */
+function mdwOnEscape(e) {
+  if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  if (!(e.target instanceof Element) || !e.target.closest('.ProseMirror')) return;
+  const button = mdFrame?.radios[mdState.mode] ?? mdFrame?.radios.wysiwyg;
+  if (!button) return;
+  e.preventDefault();
+  e.stopPropagation();
+  button.focus();
+}
+
+/** The browser's own Undo / Redo (context menu, Edit menu) is the same as the keys. @param {InputEvent} e */
+function mdwOnBeforeInput(e) {
+  if (e.inputType !== 'historyUndo' && e.inputType !== 'historyRedo') return;
+  e.preventDefault();
+  e.stopPropagation();
+  const id = e.inputType === 'historyUndo' ? 'undo' : 'redo';
+  void mdwFlush().then(() => post({ type: 'command', id }));
+}
+
+/**
+ * A plain click in the editor only places the caret (a link is not followed); Ctrl / Cmd + click follows it through the
+ * link policy of the host. Never lets the webview navigate. @param {MouseEvent} e
+ */
+function mdwOnClick(e) {
+  const link = e.target instanceof Element ? e.target.closest('a[href]') : null;
+  if (!link) return;
+  e.preventDefault();
+  if (!(e.ctrlKey || e.metaKey) || (e.type === 'auxclick' && e.button !== 1)) return;
+  e.stopPropagation();
+  const href = (link.getAttribute('href') ?? '').trim();
+  if (!href) return;
+  if (href.startsWith('#')) {
+    let id = href.slice(1);
+    try {
+      id = decodeURIComponent(id);
+    } catch {
+      // use the raw text
+    }
+    const entry = mdState.toc.find((t) => t.slug === id) ?? mdState.toc.find((t) => t.slug.toLowerCase() === id.toLowerCase());
+    if (entry) mdwScrollToLine(entry.line);
+    return;
+  }
+  post({ type: 'openLink', href });
+}
+
+/**
+ * The host asks for the pending typing (Save All, auto save): send it, then say so.
+ * @param {number} id
+ */
+function mdwOnFlushRequest(id) {
+  if (currentKind() !== 'markdown') return;
+  const answer = () => post({ type: 'flushed', id });
+  if (mdState.mode !== 'wysiwyg' || !mdw.ready) {
+    answer();
+    return;
+  }
+  void mdwFlush().then(answer, answer);
+}
+
+// ----- WYSIWYG: position (TOC, scroll) -----
+
+/** Top-level node positions of the editor document and their DOM nodes (for the TOC and the scroll position). */
+function mdwBlockDom() {
+  const mw = mdw.mw;
+  const builder = mdw.editor;
+  if (!mw || !builder) return [];
+  const view = builder.editor.action((/** @type {any} */ ctx) => ctx.get(mw.core.editorViewCtx));
+  /** @type {{ pos: number, dom: HTMLElement | null }[]} */
+  const out = [];
+  view.state.doc.forEach((/** @type {any} */ node, /** @type {number} */ offset) => {
+    const dom = view.nodeDOM(offset);
+    out.push({ pos: offset, dom: dom instanceof HTMLElement ? dom : null });
+    void node;
+  });
+  return out;
+}
+
+/** The source item (and its first DOM node) that holds source line `line`. @param {number} line */
+function mdwItemDom(line) {
+  const model = mdw.model;
+  if (!model) return null;
+  const offset = mdwOffsetOfLine(model.source, line);
+  const blocks = mdwBlockDom();
+  let index = 0;
+  let found = null;
+  for (const item of model.items) {
+    const dom = blocks[index]?.dom ?? null;
+    if (dom && item.start <= offset) found = dom;
+    if (item.start > offset) break;
+    index += item.nodes.length;
+  }
+  return found;
+}
+
+/** Scrolls the editor to the block of a source line (a heading of the table of contents). @param {number} line */
+function mdwScrollToLine(line) {
+  const dom = mdwItemDom(line);
+  const frame = mdFrame;
+  if (!dom || !frame) return;
+  frame.wysiwyg.scrollTop += dom.getBoundingClientRect().top - frame.wysiwyg.getBoundingClientRect().top;
+  mdTocCurrentSoon();
+}
+
+/** The source line of the block at the top of the editor (for the highlighted TOC entry). */
+function mdwLineAtTop() {
+  const model = mdw.model;
+  const frame = mdFrame;
+  if (!model || !frame) return 0;
+  const blocks = mdwBlockDom();
+  const top = frame.wysiwyg.getBoundingClientRect().top;
+  let lo = 0;
+  let hi = blocks.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const dom = blocks[mid].dom;
+    if (dom && dom.getBoundingClientRect().bottom <= top + 1 + MD_TOC_TOP_SLACK) lo = mid + 1;
+    else hi = mid;
+  }
+  const nodeIndex = Math.min(lo, blocks.length - 1);
+  let index = 0;
+  for (const item of model.items) {
+    if (nodeIndex < index + item.nodes.length) return mdwLineOfOffset(model.source, item.start);
+    index += item.nodes.length;
+  }
+  return 0;
 }
 
 // ===== DOCX =====

@@ -8,28 +8,60 @@ The list was made from the esbuild metafile of the production build (`node esbui
 DOMPurify is offered under MPL-2.0 OR Apache-2.0: FileStudio uses it under the Apache License 2.0. 
 pako is licensed under MIT AND Zlib: both texts are included.
 
-## Packages (170)
+## Packages (278)
 
 | Package | Version | Licence | Used in | Repository |
 | --- | --- | --- | --- | --- |
 | [@babel/runtime](#babel-runtime-7-20-1) | 7.20.1 | MIT | extension host (inside pptxtojson) | https://github.com/babel/babel/tree/HEAD/packages/babel-runtime |
+| [@borgar/fx](#borgar-fx-5-1-3) | 5.1.3 | MIT | extension host | https://github.com/borgar/fx |
 | [@braintree/sanitize-url](#braintree-sanitize-url-7-1-2) | 7.1.2 | MIT | webview | https://github.com/braintree/sanitize-url |
 | [@chevrotain/gast](#chevrotain-gast-13-2-0) | 13.2.0 | Apache-2.0 | webview (also inside @mermaid-js/parser) | https://github.com/Chevrotain/chevrotain |
 | [@chevrotain/regexp-to-ast](#chevrotain-regexp-to-ast-13-2-0) | 13.2.0 | Apache-2.0 | webview (also inside @mermaid-js/parser) | https://github.com/Chevrotain/chevrotain |
 | [@chevrotain/utils](#chevrotain-utils-13-2-0) | 13.2.0 | Apache-2.0 | webview (also inside @mermaid-js/parser) | https://github.com/Chevrotain/chevrotain |
 | [@fast-csv/format](#fast-csv-format-4-3-5) | 4.3.5 | MIT | extension host | https://github.com/C2FO/fast-csv/tree/HEAD/packages/format |
 | [@fast-csv/parse](#fast-csv-parse-4-3-6) | 4.3.6 | MIT | extension host | https://github.com/C2FO/fast-csv/tree/HEAD/packages/parse |
+| [@floating-ui/core](#floating-ui-core-1-8-0) | 1.8.0 | MIT | webview | https://github.com/floating-ui/floating-ui/tree/HEAD/packages/core |
+| [@floating-ui/dom](#floating-ui-dom-1-8-0) | 1.8.0 | MIT | webview | https://github.com/floating-ui/floating-ui/tree/HEAD/packages/dom |
+| [@floating-ui/utils](#floating-ui-utils-0-2-12) | 0.2.12 | MIT | webview | https://github.com/floating-ui/floating-ui/tree/HEAD/packages/utils |
 | [@fluent/bundle](#fluent-bundle-embedded) | — | Apache-2.0 | webview (inside pdfjs-dist) | https://github.com/projectfluent/fluent.js |
 | [@fluent/dom](#fluent-dom-embedded) | — | Apache-2.0 | webview (inside pdfjs-dist) | https://github.com/projectfluent/fluent.js |
 | [@iconify/utils](#iconify-utils-3-1-7) | 3.1.7 | MIT | webview | https://github.com/iconify/iconify/tree/HEAD/packages/utils |
 | [@mermaid-js/parser](#mermaid-js-parser-2-0-1) | 2.0.1 | MIT | webview | https://github.com/mermaid-js/mermaid/tree/HEAD/packages/parser |
+| [@milkdown/components](#milkdown-components-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/components |
+| [@milkdown/core](#milkdown-core-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/core |
+| [@milkdown/crepe](#milkdown-crepe-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/crepe |
+| [@milkdown/ctx](#milkdown-ctx-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/ctx |
+| [@milkdown/exception](#milkdown-exception-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/exception |
+| [@milkdown/plugin-block](#milkdown-plugin-block-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-block |
+| [@milkdown/plugin-clipboard](#milkdown-plugin-clipboard-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-clipboard |
+| [@milkdown/plugin-cursor](#milkdown-plugin-cursor-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-cursor |
+| [@milkdown/plugin-diff](#milkdown-plugin-diff-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-diff |
+| [@milkdown/plugin-history](#milkdown-plugin-history-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-history |
+| [@milkdown/plugin-indent](#milkdown-plugin-indent-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-indent |
+| [@milkdown/plugin-listener](#milkdown-plugin-listener-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-listener |
+| [@milkdown/plugin-slash](#milkdown-plugin-slash-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-slash |
+| [@milkdown/plugin-streaming](#milkdown-plugin-streaming-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-streaming |
+| [@milkdown/plugin-tooltip](#milkdown-plugin-tooltip-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-tooltip |
+| [@milkdown/plugin-trailing](#milkdown-plugin-trailing-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-trailing |
+| [@milkdown/plugin-upload](#milkdown-plugin-upload-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-upload |
+| [@milkdown/preset-commonmark](#milkdown-preset-commonmark-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/preset-commonmark |
+| [@milkdown/preset-gfm](#milkdown-preset-gfm-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/preset-gfm |
+| [@milkdown/prose](#milkdown-prose-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/prose |
+| [@milkdown/transformer](#milkdown-transformer-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/transformer |
+| [@milkdown/utils](#milkdown-utils-7-22-3) | 7.22.3 | MIT | webview | https://github.com/Milkdown/milkdown/tree/HEAD/packages/utils |
+| [@ocavue/utils](#ocavue-utils-1-9-0) | 1.9.0 | MIT | webview | https://github.com/ocavue/utils |
 | [@upsetjs/venn.js](#upsetjs-venn-js-2-0-0) | 2.0.0 | MIT | webview | https://github.com/upsetjs/venn.js |
+| [@vue/reactivity](#vue-reactivity-3-5-44) | 3.5.44 | MIT | webview | https://github.com/vuejs/core/tree/HEAD/packages/reactivity |
+| [@vue/runtime-core](#vue-runtime-core-3-5-44) | 3.5.44 | MIT | webview | https://github.com/vuejs/core/tree/HEAD/packages/runtime-core |
+| [@vue/runtime-dom](#vue-runtime-dom-3-5-44) | 3.5.44 | MIT | webview | https://github.com/vuejs/core/tree/HEAD/packages/runtime-dom |
+| [@vue/shared](#vue-shared-3-5-44) | 3.5.44 | MIT | webview | https://github.com/vuejs/core/tree/HEAD/packages/shared |
 | [@xmldom/xmldom](#xmldom-xmldom-0-8-15) | 0.8.15 | MIT | extension host | https://github.com/xmldom/xmldom |
 | [archiver](#archiver-5-3-2) | 5.3.2 | MIT | extension host | https://github.com/archiverjs/node-archiver |
 | [archiver-utils](#archiver-utils-2-1-0) | 2.1.0 | MIT | extension host | https://github.com/archiverjs/archiver-utils |
 | [archiver-utils](#archiver-utils-3-0-4) | 3.0.4 | MIT | extension host | https://github.com/archiverjs/archiver-utils |
 | [async](#async-3-2-6) | 3.2.6 | MIT | extension host | https://github.com/caolan/async |
 | [Babel helpers (regenerator-runtime)](#babel-helpers-regenerator-runtime-embedded) | — | MIT | webview (inside dompurify) | https://github.com/babel/babel/tree/HEAD/packages/babel-helpers |
+| [bail](#bail-2-0-2) | 2.0.2 | MIT | webview | https://github.com/wooorm/bail |
 | [balanced-match](#balanced-match-1-0-2) | 1.0.2 | MIT | extension host | https://github.com/juliangruber/balanced-match |
 | [base64-js](#base64-js-1-5-1) | 1.5.1 | MIT | extension host | https://github.com/beatgammit/base64-js |
 | [bl](#bl-4-1-0) | 4.1.0 | MIT | extension host | https://github.com/rvagg/bl |
@@ -38,8 +70,10 @@ pako is licensed under MIT AND Zlib: both texts are included.
 | [buffer-crc32](#buffer-crc32-0-2-13) | 0.2.13 | MIT | extension host | https://github.com/brianloveswords/buffer-crc32 |
 | [buffer-es6](#buffer-es6-4-9-3) | 4.9.3 | MIT | extension host (inside pptxtojson) | https://github.com/calvinmetcalf/buffer-es6 |
 | [cached-iterable](#cached-iterable-embedded) | — | Apache-2.0 | webview (inside pdfjs-dist) | https://github.com/projectfluent/cached-iterable |
+| [ccount](#ccount-2-0-1) | 2.0.1 | MIT | webview | https://github.com/wooorm/ccount |
 | [chevrotain](#chevrotain-13-2-0) | 13.2.0 | Apache-2.0 | webview (also inside @mermaid-js/parser) | https://github.com/Chevrotain/chevrotain |
 | [chevrotain-allstar](#chevrotain-allstar-0-5-0) | 0.5.0 | MIT | webview (inside @mermaid-js/parser) | https://github.com/langium/chevrotain-allstar |
+| [clsx](#clsx-2-1-1) | 2.1.1 | MIT | webview | https://github.com/lukeed/clsx |
 | [compress-commons](#compress-commons-4-1-2) | 4.1.2 | MIT | extension host | https://github.com/archiverjs/node-compress-commons |
 | [concat-map](#concat-map-0-0-1) | 0.0.1 | MIT | extension host | https://github.com/substack/node-concat-map |
 | [core-util-is](#core-util-is-1-0-3) | 1.0.3 | MIT | extension host (also inside pptxtojson) | https://github.com/isaacs/core-util-is |
@@ -75,13 +109,16 @@ pako is licensed under MIT AND Zlib: both texts are included.
 | [d3-zoom](#d3-zoom-3-0-0) | 3.0.0 | ISC | webview | https://github.com/d3/d3-zoom |
 | [dagre-d3-es](#dagre-d3-es-7-0-14) | 7.0.14 | MIT | webview | https://github.com/tbo47/dagre-es |
 | [dayjs](#dayjs-1-11-23) | 1.11.23 | MIT | extension host, webview | https://github.com/iamkun/dayjs |
+| [decode-named-character-reference](#decode-named-character-reference-1-3-0) | 1.3.0 | MIT | webview | https://github.com/wooorm/decode-named-character-reference |
 | [dingbat-to-unicode](#dingbat-to-unicode-1-0-2) | 1.0.2 | BSD-2-Clause | extension host | https://github.com/mwilliamson/dingbat-to-unicode |
 | [dompurify](#dompurify-3-4-16) | 3.4.16 | (MPL-2.0 OR Apache-2.0) | webview | https://github.com/cure53/DOMPurify |
 | [echarts](#echarts-6-1-0) | 6.1.0 | Apache-2.0 | webview | https://github.com/apache/echarts |
 | [end-of-stream](#end-of-stream-1-4-5) | 1.4.5 | MIT | extension host | https://github.com/mafintosh/end-of-stream |
 | [entities](#entities-8-1-0) | 8.1.0 | BSD-2-Clause | extension host | https://github.com/fb55/entities |
 | [es-toolkit](#es-toolkit-1-52-0) | 1.52.0 | MIT | webview | https://github.com/toss/es-toolkit |
+| [escape-string-regexp](#escape-string-regexp-5-0-0) | 5.0.0 | MIT | webview | https://github.com/sindresorhus/escape-string-regexp |
 | [exceljs](#exceljs-4-4-0) | 4.4.0 | MIT | extension host | https://github.com/exceljs/exceljs |
+| [extend](#extend-3-0-2) | 3.0.2 | MIT | webview | https://github.com/justmoon/node-extend |
 | [fast-csv](#fast-csv-4-3-6) | 4.3.6 | MIT | extension host | https://github.com/C2FO/fast-csv/tree/HEAD/packages/fast-csv |
 | [fastdom](#fastdom-1-0-12) | 1.0.12 | MIT | webview (inside mermaid) | https://github.com/wilsonpage/fastdom |
 | [fs-constants](#fs-constants-1-0-0) | 1.0.0 | MIT | extension host | https://github.com/mafintosh/fs-constants |
@@ -94,6 +131,7 @@ pako is licensed under MIT AND Zlib: both texts are included.
 | [inflight](#inflight-1-0-6) | 1.0.6 | ISC | extension host | https://github.com/npm/inflight |
 | [inherits](#inherits-2-0-4) | 2.0.4 | ISC | extension host (also inside pptxtojson) | https://github.com/isaacs/inherits |
 | [internmap](#internmap-2-0-3) | 2.0.3 | ISC | webview | https://github.com/mbostock/internmap |
+| [is-plain-obj](#is-plain-obj-4-1-0) | 4.1.0 | MIT | webview | https://github.com/sindresorhus/is-plain-obj |
 | [isarray](#isarray-1-0-0) | 1.0.0 | MIT | extension host (also inside pptxtojson) | https://github.com/juliangruber/isarray |
 | [js-yaml](#js-yaml-4-3-0) | 4.3.0 | MIT | webview (inside mermaid) | https://github.com/nodeca/js-yaml |
 | [jszip](#jszip-3-10-1) | 3.10.1 | (MIT OR GPL-3.0-or-later) | extension host (inside pptxtojson) | https://github.com/Stuk/jszip |
@@ -121,19 +159,59 @@ pako is licensed under MIT AND Zlib: both texts are included.
 | [lodash.isundefined](#lodash-isundefined-3-0-1) | 3.0.1 | MIT | extension host | https://github.com/lodash/lodash |
 | [lodash.union](#lodash-union-4-6-0) | 4.6.0 | MIT | extension host | https://github.com/lodash/lodash |
 | [lodash.uniq](#lodash-uniq-4-5-0) | 4.5.0 | MIT | extension host | https://github.com/lodash/lodash |
+| [longest-streak](#longest-streak-3-1-0) | 3.1.0 | MIT | webview | https://github.com/wooorm/longest-streak |
 | [lop](#lop-0-4-2) | 0.4.2 | BSD-2-Clause | extension host | https://github.com/mwilliamson/lop |
 | [mammoth](#mammoth-1-13-0) | 1.13.0 | BSD-2-Clause | extension host | https://github.com/mwilliamson/mammoth.js |
 | [markdown-it](#markdown-it-15-0-2) | 15.0.2 | MIT | extension host | https://github.com/markdown-it/markdown-it |
 | [markdown-it-emoji](#markdown-it-emoji-3-1-0) | 3.1.0 | MIT | extension host | https://github.com/markdown-it/markdown-it-emoji |
 | [markdown-it-footnote](#markdown-it-footnote-4-0-0) | 4.0.0 | MIT | extension host | https://github.com/markdown-it/markdown-it-footnote |
+| [markdown-table](#markdown-table-3-0-4) | 3.0.4 | MIT | webview | https://github.com/wooorm/markdown-table |
 | [marked](#marked-16-4-2) | 16.4.2 | MIT | webview | https://github.com/markedjs/marked |
+| [mdast-util-definitions](#mdast-util-definitions-6-0-0) | 6.0.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-definitions |
+| [mdast-util-find-and-replace](#mdast-util-find-and-replace-3-0-3) | 3.0.3 | MIT | webview | https://github.com/syntax-tree/mdast-util-find-and-replace |
+| [mdast-util-from-markdown](#mdast-util-from-markdown-2-1-0) | 2.1.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-from-markdown |
+| [mdast-util-gfm](#mdast-util-gfm-3-1-0) | 3.1.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-gfm |
+| [mdast-util-gfm-autolink-literal](#mdast-util-gfm-autolink-literal-2-0-1) | 2.0.1 | MIT | webview | https://github.com/syntax-tree/mdast-util-gfm-autolink-literal |
+| [mdast-util-gfm-footnote](#mdast-util-gfm-footnote-2-1-0) | 2.1.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-gfm-footnote |
+| [mdast-util-gfm-strikethrough](#mdast-util-gfm-strikethrough-2-0-1) | 2.0.1 | MIT | webview | https://github.com/syntax-tree/mdast-util-gfm-strikethrough |
+| [mdast-util-gfm-table](#mdast-util-gfm-table-2-0-0) | 2.0.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-gfm-table |
+| [mdast-util-gfm-task-list-item](#mdast-util-gfm-task-list-item-2-0-0) | 2.0.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-gfm-task-list-item |
+| [mdast-util-phrasing](#mdast-util-phrasing-4-1-0) | 4.1.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-phrasing |
+| [mdast-util-to-markdown](#mdast-util-to-markdown-2-2-0) | 2.2.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-to-markdown |
+| [mdast-util-to-string](#mdast-util-to-string-4-0-0) | 4.0.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-to-string |
 | [mdurl](#mdurl-2-1-0) | 2.1.0 | MIT | extension host | https://github.com/markdown-it/mdurl |
 | [mermaid](#mermaid-12-1-0) | 12.1.0 | MIT | webview | https://github.com/mermaid-js/mermaid |
+| [micromark](#micromark-4-0-3) | 4.0.3 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark |
+| [micromark-core-commonmark](#micromark-core-commonmark-2-0-4) | 2.0.4 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-core-commonmark |
+| [micromark-extension-gfm](#micromark-extension-gfm-3-0-0) | 3.0.0 | MIT | webview | https://github.com/micromark/micromark-extension-gfm |
+| [micromark-extension-gfm-autolink-literal](#micromark-extension-gfm-autolink-literal-2-1-0) | 2.1.0 | MIT | webview | https://github.com/micromark/micromark-extension-gfm-autolink-literal |
+| [micromark-extension-gfm-footnote](#micromark-extension-gfm-footnote-2-1-0) | 2.1.0 | MIT | webview | https://github.com/micromark/micromark-extension-gfm-footnote |
+| [micromark-extension-gfm-strikethrough](#micromark-extension-gfm-strikethrough-2-1-0) | 2.1.0 | MIT | webview | https://github.com/micromark/micromark-extension-gfm-strikethrough |
+| [micromark-extension-gfm-table](#micromark-extension-gfm-table-2-1-2) | 2.1.2 | MIT | webview | https://github.com/micromark/micromark-extension-gfm-table |
+| [micromark-extension-gfm-task-list-item](#micromark-extension-gfm-task-list-item-2-1-0) | 2.1.0 | MIT | webview | https://github.com/micromark/micromark-extension-gfm-task-list-item |
+| [micromark-factory-destination](#micromark-factory-destination-2-0-1) | 2.0.1 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-factory-destination |
+| [micromark-factory-label](#micromark-factory-label-2-0-1) | 2.0.1 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-factory-label |
+| [micromark-factory-space](#micromark-factory-space-2-1-0) | 2.1.0 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-factory-space |
+| [micromark-factory-title](#micromark-factory-title-2-0-1) | 2.0.1 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-factory-title |
+| [micromark-factory-whitespace](#micromark-factory-whitespace-2-0-1) | 2.0.1 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-factory-whitespace |
+| [micromark-util-character](#micromark-util-character-2-1-1) | 2.1.1 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-util-character |
+| [micromark-util-chunked](#micromark-util-chunked-2-0-1) | 2.0.1 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-util-chunked |
+| [micromark-util-classify-character](#micromark-util-classify-character-2-0-1) | 2.0.1 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-util-classify-character |
+| [micromark-util-combine-extensions](#micromark-util-combine-extensions-2-0-1) | 2.0.1 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-util-combine-extensions |
+| [micromark-util-decode-numeric-character-reference](#micromark-util-decode-numeric-character-reference-2-0-2) | 2.0.2 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-util-decode-numeric-character-reference |
+| [micromark-util-decode-string](#micromark-util-decode-string-2-0-1) | 2.0.1 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-util-decode-string |
+| [micromark-util-edit-map](#micromark-util-edit-map-1-0-0) | 1.0.0 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-util-edit-map |
+| [micromark-util-html-tag-name](#micromark-util-html-tag-name-2-0-1) | 2.0.1 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-util-html-tag-name |
+| [micromark-util-normalize-identifier](#micromark-util-normalize-identifier-2-0-1) | 2.0.1 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-util-normalize-identifier |
+| [micromark-util-resolve-all](#micromark-util-resolve-all-2-0-1) | 2.0.1 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-util-resolve-all |
+| [micromark-util-subtokenize](#micromark-util-subtokenize-2-1-0) | 2.1.0 | MIT | webview | https://github.com/micromark/micromark/tree/main/packages/micromark-util-subtokenize |
 | [minimatch](#minimatch-3-1-5) | 3.1.5 | ISC | extension host | https://github.com/isaacs/minimatch |
 | [minimatch](#minimatch-5-1-9) | 5.1.9 | ISC | extension host | https://github.com/isaacs/minimatch |
+| [nanoid](#nanoid-6-0-2) | 6.0.2 | MIT | webview | https://github.com/ai/nanoid |
 | [normalize-path](#normalize-path-3-0-0) | 3.0.0 | MIT | extension host | https://github.com/jonschlinkert/normalize-path |
 | [once](#once-1-4-0) | 1.4.0 | ISC | extension host | https://github.com/isaacs/once |
 | [option](#option-0-2-4) | 0.2.4 | BSD-2-Clause | extension host | https://github.com/mwilliamson/node-options |
+| [orderedmap](#orderedmap-2-1-1) | 2.1.1 | MIT | webview | https://github.com/marijnh/orderedmap |
 | [pako](#pako-1-0-11) | 1.0.11 | (MIT AND Zlib) | extension host (also inside pptxtojson) | https://github.com/nodeca/pako |
 | [papaparse](#papaparse-5-7-0) | 5.7.0 | MIT | extension host | https://github.com/mholt/PapaParse |
 | [path-browserify](#path-browserify-1-0-1) | 1.0.1 | MIT | webview (inside vscode-uri) | https://github.com/browserify/path-browserify |
@@ -145,13 +223,33 @@ pako is licensed under MIT AND Zlib: both texts are included.
 | [pptxtojson](#pptxtojson-2-2-0) | 2.2.0 | MIT | extension host | https://github.com/pipipi-pikachu/pptxtojson |
 | [process-es6](#process-es6-0-11-6) | 0.11.6 | MIT | extension host (inside pptxtojson) | https://github.com/calvinmetcalf/node-process-es6 |
 | [process-nextick-args](#process-nextick-args-2-0-1) | 2.0.1 | MIT | extension host (also inside pptxtojson) | https://github.com/calvinmetcalf/process-nextick-args |
+| [prosemirror-changeset](#prosemirror-changeset-2-4-4) | 2.4.4 | MIT | webview | https://code.haverbeke.berlin/prosemirror/prosemirror-changeset |
+| [prosemirror-commands](#prosemirror-commands-1-7-2) | 1.7.2 | MIT | webview | https://code.haverbeke.berlin/prosemirror/prosemirror-commands |
+| [prosemirror-drop-indicator](#prosemirror-drop-indicator-0-1-4) | 0.1.4 | MIT | webview | https://github.com/prosekit/prosemirror-drop-indicator |
+| [prosemirror-gapcursor](#prosemirror-gapcursor-1-4-1) | 1.4.1 | MIT | webview | https://github.com/prosemirror/prosemirror-gapcursor |
+| [prosemirror-history](#prosemirror-history-1-5-1) | 1.5.1 | MIT | webview | https://code.haverbeke.berlin/prosemirror/prosemirror-history |
+| [prosemirror-inputrules](#prosemirror-inputrules-1-5-1) | 1.5.1 | MIT | webview | https://github.com/prosemirror/prosemirror-inputrules |
+| [prosemirror-keymap](#prosemirror-keymap-1-2-3) | 1.2.3 | MIT | webview | https://github.com/prosemirror/prosemirror-keymap |
+| [prosemirror-model](#prosemirror-model-1-25-12) | 1.25.12 | MIT | webview | https://code.haverbeke.berlin/prosemirror/prosemirror-model |
+| [prosemirror-safari-ime-span](#prosemirror-safari-ime-span-1-0-2) | 1.0.2 | MIT | webview | https://github.com/ocavue/prosemirror-safari-ime-span |
+| [prosemirror-schema-list](#prosemirror-schema-list-1-5-1) | 1.5.1 | MIT | webview | https://github.com/prosemirror/prosemirror-schema-list |
+| [prosemirror-state](#prosemirror-state-1-4-4) | 1.4.4 | MIT | webview | https://github.com/prosemirror/prosemirror-state |
+| [prosemirror-tables](#prosemirror-tables-1-8-5) | 1.8.5 | MIT | webview | https://github.com/ProseMirror/prosemirror-tables |
+| [prosemirror-transform](#prosemirror-transform-1-12-2) | 1.12.2 | MIT | webview | https://code.haverbeke.berlin/prosemirror/prosemirror-transform |
+| [prosemirror-view](#prosemirror-view-1-42-6) | 1.42.6 | MIT | webview | https://code.haverbeke.berlin/prosemirror/prosemirror-view |
+| [prosemirror-virtual-cursor](#prosemirror-virtual-cursor-0-4-2) | 0.4.2 | MIT | webview | https://github.com/ocavue/prosemirror-virtual-cursor |
 | [punycode.js](#punycode-js-2-3-1) | 2.3.1 | MIT | extension host | https://github.com/mathiasbynens/punycode.js |
 | [readable-stream](#readable-stream-2-3-7) | 2.3.7 | MIT | extension host (inside pptxtojson) | https://github.com/nodejs/readable-stream |
 | [readable-stream](#readable-stream-2-3-8) | 2.3.8 | MIT | extension host | https://github.com/nodejs/readable-stream |
 | [readable-stream](#readable-stream-3-6-2) | 3.6.2 | MIT | extension host | https://github.com/nodejs/readable-stream |
 | [readdir-glob](#readdir-glob-1-1-3) | 1.1.3 | Apache-2.0 | extension host | https://github.com/Yqnn/node-readdir-glob |
+| [remark-gfm](#remark-gfm-4-0-1) | 4.0.1 | MIT | webview | https://github.com/remarkjs/remark-gfm |
+| [remark-inline-links](#remark-inline-links-7-0-0) | 7.0.0 | MIT | webview | https://github.com/remarkjs/remark-inline-links |
+| [remark-parse](#remark-parse-11-0-0) | 11.0.0 | MIT | webview | https://github.com/remarkjs/remark/tree/main/packages/remark-parse |
+| [remark-stringify](#remark-stringify-11-0-0) | 11.0.0 | MIT | webview | https://github.com/remarkjs/remark/tree/main/packages/remark-stringify |
 | [rollup-plugin-node-builtins](#rollup-plugin-node-builtins-2-1-2) | 2.1.2 | ISC | extension host (inside pptxtojson) | https://github.com/calvinmetcalf/rollup-plugin-node-builtins |
 | [rollup-plugin-node-globals](#rollup-plugin-node-globals-1-4-0) | 1.4.0 | MIT | extension host (inside pptxtojson) | https://github.com/calvinmetcalf/rollup-plugin-node-globals |
+| [rope-sequence](#rope-sequence-1-3-4) | 1.3.4 | MIT | webview | https://github.com/marijnh/rope-sequence |
 | [roughjs](#roughjs-4-6-6) | 4.6.6 | MIT | webview | https://github.com/pshihn/rough |
 | [safe-buffer](#safe-buffer-5-1-2) | 5.1.2 | MIT | extension host (also inside pptxtojson) | https://github.com/feross/safe-buffer |
 | [safe-buffer](#safe-buffer-5-2-1) | 5.2.1 | MIT | extension host | https://github.com/feross/safe-buffer |
@@ -164,24 +262,34 @@ pako is licensed under MIT AND Zlib: both texts are included.
 | [tar-stream](#tar-stream-2-2-0) | 2.2.0 | MIT | extension host | https://github.com/mafintosh/tar-stream |
 | [tinycolor2](#tinycolor2-1-6-0) | 1.6.0 | MIT | extension host (inside pptxtojson) | https://github.com/bgrins/TinyColor |
 | [tmp](#tmp-0-2-7) | 0.2.7 | MIT | extension host | https://github.com/raszi/node-tmp |
+| [trough](#trough-2-2-0) | 2.2.0 | MIT | webview | https://github.com/wooorm/trough |
 | [ts-dedent](#ts-dedent-2-3-0) | 2.3.0 | MIT | webview | https://github.com/tamino-martinius/node-ts-dedent |
 | [tslib](#tslib-2-3-0) | 2.3.0 | 0BSD | webview | https://github.com/Microsoft/tslib |
 | [txml](#txml-5-1-1) | 5.1.1 | MIT | extension host (inside pptxtojson) | https://github.com/TobiasNickel/tXml |
 | [uc.micro](#uc-micro-3-0-0) | 3.0.0 | MIT | extension host | https://github.com/markdown-it/uc.micro |
 | [underscore](#underscore-1-13-8) | 1.13.8 | MIT | extension host | https://github.com/jashkenas/underscore |
+| [unified](#unified-11-0-5) | 11.0.5 | MIT | webview | https://github.com/unifiedjs/unified |
+| [unist-util-is](#unist-util-is-6-0-1) | 6.0.1 | MIT | webview | https://github.com/syntax-tree/unist-util-is |
+| [unist-util-stringify-position](#unist-util-stringify-position-4-0-0) | 4.0.0 | MIT | webview | https://github.com/syntax-tree/unist-util-stringify-position |
+| [unist-util-visit](#unist-util-visit-5-1-0) | 5.1.0 | MIT | webview | https://github.com/syntax-tree/unist-util-visit |
+| [unist-util-visit-parents](#unist-util-visit-parents-6-0-2) | 6.0.2 | MIT | webview | https://github.com/syntax-tree/unist-util-visit-parents |
 | [util-deprecate](#util-deprecate-1-0-2) | 1.0.2 | MIT | extension host (also inside pptxtojson) | https://github.com/TooTallNate/util-deprecate |
 | [uuid](#uuid-8-3-2) | 8.3.2 | MIT | extension host | https://github.com/uuidjs/uuid |
 | [uuid](#uuid-14-0-2) | 14.0.2 | MIT | webview | https://github.com/uuidjs/uuid |
+| [vfile](#vfile-6-0-3) | 6.0.3 | MIT | webview | https://github.com/vfile/vfile |
+| [vfile-message](#vfile-message-4-0-3) | 4.0.3 | MIT | webview | https://github.com/vfile/vfile-message |
 | [vscode-jsonrpc](#vscode-jsonrpc-9-0-3) | 9.0.3 | MIT | webview (inside @mermaid-js/parser) | https://github.com/Microsoft/vscode-languageserver-node/tree/HEAD/jsonrpc |
 | [vscode-languageserver-protocol](#vscode-languageserver-protocol-3-18-4) | 3.18.4 | MIT | webview (inside @mermaid-js/parser) | https://github.com/Microsoft/vscode-languageserver-node/tree/HEAD/protocol |
 | [vscode-languageserver-textdocument](#vscode-languageserver-textdocument-1-0-15) | 1.0.15 | MIT | webview (inside @mermaid-js/parser) | https://github.com/Microsoft/vscode-languageserver-node/tree/HEAD/textDocument |
 | [vscode-languageserver-types](#vscode-languageserver-types-3-18-4) | 3.18.4 | MIT | webview (inside @mermaid-js/parser) | https://github.com/Microsoft/vscode-languageserver-node/tree/HEAD/types |
 | [vscode-uri](#vscode-uri-3-1-0) | 3.1.0 | MIT | webview (inside @mermaid-js/parser) | https://github.com/microsoft/vscode-uri |
+| [w3c-keyname](#w3c-keyname-2-2-8) | 2.2.8 | MIT | webview | https://github.com/marijnh/w3c-keyname |
 | [wrappy](#wrappy-1-0-2) | 1.0.2 | ISC | extension host | https://github.com/npm/wrappy |
 | [xmlbuilder](#xmlbuilder-10-1-1) | 10.1.1 | MIT | extension host | https://github.com/oozcitak/xmlbuilder-js |
 | [xmlchars](#xmlchars-2-2-0) | 2.2.0 | MIT | extension host | https://github.com/lddubeau/xmlchars |
 | [zip-stream](#zip-stream-4-1-1) | 4.1.1 | MIT | extension host | https://github.com/archiverjs/node-zip-stream |
 | [zrender](#zrender-6-1-0) | 6.1.0 | BSD-3-Clause | webview | https://github.com/ecomfe/zrender |
+| [zwitch](#zwitch-2-0-4) | 2.0.4 | MIT | webview | https://github.com/wooorm/zwitch |
 
 ## Licence texts
 
@@ -214,6 +322,24 @@ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
 LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
+<a id="borgar-fx-5-1-3"></a>
+### @borgar/fx 5.1.3
+
+- **@borgar/fx** 5.1.3 — MIT — https://github.com/borgar/fx  
+  Copyright 2021 Borgar Þorsteinsson
+
+````text
+MIT License
+
+Copyright 2021 Borgar Þorsteinsson
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ````
 
 <a id="braintree-sanitize-url-7-1-2"></a>
@@ -517,6 +643,41 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ````
 
+<a id="floating-ui-core-1-8-0"></a>
+<a id="floating-ui-dom-1-8-0"></a>
+<a id="floating-ui-utils-0-2-12"></a>
+### @floating-ui/core 1.8.0 and 2 more
+
+- **@floating-ui/core** 1.8.0 — MIT — https://github.com/floating-ui/floating-ui/tree/HEAD/packages/core  
+  Copyright (c) 2021-present Floating UI contributors
+- **@floating-ui/dom** 1.8.0 — MIT — https://github.com/floating-ui/floating-ui/tree/HEAD/packages/dom  
+  Copyright (c) 2021-present Floating UI contributors
+- **@floating-ui/utils** 0.2.12 — MIT — https://github.com/floating-ui/floating-ui/tree/HEAD/packages/utils  
+  Copyright (c) 2021-present Floating UI contributors
+
+````text
+MIT License
+
+Copyright (c) 2021-present Floating UI contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
 <a id="iconify-utils-3-1-7"></a>
 ### @iconify/utils 3.1.7
 
@@ -577,6 +738,132 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ````
 
+<a id="milkdown-components-7-22-3"></a>
+<a id="milkdown-core-7-22-3"></a>
+<a id="milkdown-crepe-7-22-3"></a>
+<a id="milkdown-ctx-7-22-3"></a>
+<a id="milkdown-exception-7-22-3"></a>
+<a id="milkdown-plugin-block-7-22-3"></a>
+<a id="milkdown-plugin-clipboard-7-22-3"></a>
+<a id="milkdown-plugin-cursor-7-22-3"></a>
+<a id="milkdown-plugin-diff-7-22-3"></a>
+<a id="milkdown-plugin-history-7-22-3"></a>
+<a id="milkdown-plugin-indent-7-22-3"></a>
+<a id="milkdown-plugin-listener-7-22-3"></a>
+<a id="milkdown-plugin-slash-7-22-3"></a>
+<a id="milkdown-plugin-streaming-7-22-3"></a>
+<a id="milkdown-plugin-tooltip-7-22-3"></a>
+<a id="milkdown-plugin-trailing-7-22-3"></a>
+<a id="milkdown-plugin-upload-7-22-3"></a>
+<a id="milkdown-preset-commonmark-7-22-3"></a>
+<a id="milkdown-preset-gfm-7-22-3"></a>
+<a id="milkdown-prose-7-22-3"></a>
+<a id="milkdown-transformer-7-22-3"></a>
+<a id="milkdown-utils-7-22-3"></a>
+### @milkdown/components 7.22.3 and 21 more
+
+- **@milkdown/components** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/components  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/core** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/core  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/crepe** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/crepe  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/ctx** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/ctx  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/exception** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/exception  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/plugin-block** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-block  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/plugin-clipboard** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-clipboard  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/plugin-cursor** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-cursor  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/plugin-diff** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-diff  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/plugin-history** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-history  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/plugin-indent** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-indent  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/plugin-listener** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-listener  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/plugin-slash** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-slash  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/plugin-streaming** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-streaming  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/plugin-tooltip** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-tooltip  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/plugin-trailing** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-trailing  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/plugin-upload** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/plugin-upload  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/preset-commonmark** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/preset-commonmark  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/preset-gfm** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/plugins/preset-gfm  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/prose** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/prose  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/transformer** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/transformer  
+  Copyright (c) 2020-present Mirone
+- **@milkdown/utils** 7.22.3 — MIT — https://github.com/Milkdown/milkdown/tree/HEAD/packages/utils  
+  Copyright (c) 2020-present Mirone
+
+````text
+The MIT License (MIT)
+
+Copyright (c) 2020-present Mirone
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+````
+
+<a id="ocavue-utils-1-9-0"></a>
+<a id="prosemirror-drop-indicator-0-1-4"></a>
+### @ocavue/utils 1.9.0 and 1 more
+
+- **@ocavue/utils** 1.9.0 — MIT — https://github.com/ocavue/utils  
+  Copyright (c) 2025 ocavue
+- **prosemirror-drop-indicator** 0.1.4 — MIT — https://github.com/prosekit/prosemirror-drop-indicator  
+  Copyright (c) 2025 ocavue
+
+````text
+MIT License
+
+Copyright (c) 2025 ocavue
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+````
+
 <a id="upsetjs-venn-js-2-0-0"></a>
 ### @upsetjs/venn.js 2.0.0
 
@@ -607,6 +894,45 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+````
+
+<a id="vue-reactivity-3-5-44"></a>
+<a id="vue-runtime-core-3-5-44"></a>
+<a id="vue-runtime-dom-3-5-44"></a>
+<a id="vue-shared-3-5-44"></a>
+### @vue/reactivity 3.5.44 and 3 more
+
+- **@vue/reactivity** 3.5.44 — MIT — https://github.com/vuejs/core/tree/HEAD/packages/reactivity  
+  Copyright (c) 2018-present, Yuxi (Evan) You
+- **@vue/runtime-core** 3.5.44 — MIT — https://github.com/vuejs/core/tree/HEAD/packages/runtime-core  
+  Copyright (c) 2018-present, Yuxi (Evan) You
+- **@vue/runtime-dom** 3.5.44 — MIT — https://github.com/vuejs/core/tree/HEAD/packages/runtime-dom  
+  Copyright (c) 2018-present, Yuxi (Evan) You
+- **@vue/shared** 3.5.44 — MIT — https://github.com/vuejs/core/tree/HEAD/packages/shared  
+  Copyright (c) 2018-present, Yuxi (Evan) You
+
+````text
+The MIT License (MIT)
+
+Copyright (c) 2018-present, Yuxi (Evan) You
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 ````
 
 <a id="xmldom-xmldom-0-8-15"></a>
@@ -752,6 +1078,49 @@ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
 LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
+<a id="bail-2-0-2"></a>
+<a id="ccount-2-0-1"></a>
+<a id="mdast-util-to-string-4-0-0"></a>
+<a id="remark-inline-links-7-0-0"></a>
+<a id="unist-util-visit-5-1-0"></a>
+### bail 2.0.2 and 4 more
+
+- **bail** 2.0.2 — MIT — https://github.com/wooorm/bail  
+  Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>
+- **ccount** 2.0.1 — MIT — https://github.com/wooorm/ccount  
+  Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>
+- **mdast-util-to-string** 4.0.0 — MIT — https://github.com/syntax-tree/mdast-util-to-string  
+  Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>
+- **remark-inline-links** 7.0.0 — MIT — https://github.com/remarkjs/remark-inline-links  
+  Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>
+- **unist-util-visit** 5.1.0 — MIT — https://github.com/syntax-tree/unist-util-visit  
+  Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>
+
+````text
+(The MIT License)
+
+Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+'Software'), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ````
 
 <a id="balanced-match-1-0-2"></a>
@@ -986,6 +1355,24 @@ BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR P
 NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
+<a id="clsx-2-1-1"></a>
+### clsx 2.1.1
+
+- **clsx** 2.1.1 — MIT — https://github.com/lukeed/clsx  
+  Copyright (c) Luke Edwards <luke.edwards05@gmail.com> (lukeed.com)
+
+````text
+MIT License
+
+Copyright (c) Luke Edwards <luke.edwards05@gmail.com> (lukeed.com)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ````
 
 <a id="compress-commons-4-1-2"></a>
@@ -1838,6 +2225,121 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ````
 
+<a id="decode-named-character-reference-1-3-0"></a>
+<a id="markdown-table-3-0-4"></a>
+<a id="mdast-util-find-and-replace-3-0-3"></a>
+<a id="mdast-util-from-markdown-2-1-0"></a>
+<a id="mdast-util-gfm-3-1-0"></a>
+<a id="mdast-util-gfm-footnote-2-1-0"></a>
+<a id="mdast-util-gfm-strikethrough-2-0-1"></a>
+<a id="mdast-util-to-markdown-2-2-0"></a>
+<a id="micromark-4-0-3"></a>
+<a id="micromark-core-commonmark-2-0-4"></a>
+<a id="micromark-extension-gfm-table-2-1-2"></a>
+<a id="micromark-factory-destination-2-0-1"></a>
+<a id="micromark-factory-label-2-0-1"></a>
+<a id="micromark-factory-space-2-1-0"></a>
+<a id="micromark-factory-title-2-0-1"></a>
+<a id="micromark-factory-whitespace-2-0-1"></a>
+<a id="micromark-util-character-2-1-1"></a>
+<a id="micromark-util-chunked-2-0-1"></a>
+<a id="micromark-util-classify-character-2-0-1"></a>
+<a id="micromark-util-combine-extensions-2-0-1"></a>
+<a id="micromark-util-decode-numeric-character-reference-2-0-2"></a>
+<a id="micromark-util-decode-string-2-0-1"></a>
+<a id="micromark-util-edit-map-1-0-0"></a>
+<a id="micromark-util-html-tag-name-2-0-1"></a>
+<a id="micromark-util-normalize-identifier-2-0-1"></a>
+<a id="micromark-util-resolve-all-2-0-1"></a>
+<a id="micromark-util-subtokenize-2-1-0"></a>
+<a id="remark-gfm-4-0-1"></a>
+<a id="vfile-message-4-0-3"></a>
+### decode-named-character-reference 1.3.0 and 28 more
+
+- **decode-named-character-reference** 1.3.0 — MIT — https://github.com/wooorm/decode-named-character-reference  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **markdown-table** 3.0.4 — MIT — https://github.com/wooorm/markdown-table  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **mdast-util-find-and-replace** 3.0.3 — MIT — https://github.com/syntax-tree/mdast-util-find-and-replace  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **mdast-util-from-markdown** 2.1.0 — MIT — https://github.com/syntax-tree/mdast-util-from-markdown  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **mdast-util-gfm** 3.1.0 — MIT — https://github.com/syntax-tree/mdast-util-gfm  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **mdast-util-gfm-footnote** 2.1.0 — MIT — https://github.com/syntax-tree/mdast-util-gfm-footnote  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **mdast-util-gfm-strikethrough** 2.0.1 — MIT — https://github.com/syntax-tree/mdast-util-gfm-strikethrough  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **mdast-util-to-markdown** 2.2.0 — MIT — https://github.com/syntax-tree/mdast-util-to-markdown  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark** 4.0.3 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-core-commonmark** 2.0.4 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-core-commonmark  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-extension-gfm-table** 2.1.2 — MIT — https://github.com/micromark/micromark-extension-gfm-table  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-factory-destination** 2.0.1 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-factory-destination  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-factory-label** 2.0.1 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-factory-label  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-factory-space** 2.1.0 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-factory-space  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-factory-title** 2.0.1 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-factory-title  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-factory-whitespace** 2.0.1 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-factory-whitespace  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-util-character** 2.1.1 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-util-character  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-util-chunked** 2.0.1 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-util-chunked  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-util-classify-character** 2.0.1 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-util-classify-character  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-util-combine-extensions** 2.0.1 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-util-combine-extensions  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-util-decode-numeric-character-reference** 2.0.2 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-util-decode-numeric-character-reference  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-util-decode-string** 2.0.1 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-util-decode-string  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-util-edit-map** 1.0.0 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-util-edit-map  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-util-html-tag-name** 2.0.1 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-util-html-tag-name  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-util-normalize-identifier** 2.0.1 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-util-normalize-identifier  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-util-resolve-all** 2.0.1 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-util-resolve-all  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **micromark-util-subtokenize** 2.1.0 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark-util-subtokenize  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **remark-gfm** 4.0.1 — MIT — https://github.com/remarkjs/remark-gfm  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+- **vfile-message** 4.0.3 — MIT — https://github.com/vfile/vfile-message  
+  Copyright (c) Titus Wormer <tituswormer@gmail.com>
+
+````text
+(The MIT License)
+
+Copyright (c) Titus Wormer <tituswormer@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+'Software'), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
 <a id="dingbat-to-unicode-1-0-2"></a>
 ### dingbat-to-unicode 1.0.2
 
@@ -2192,6 +2694,27 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ````
 
+<a id="escape-string-regexp-5-0-0"></a>
+<a id="is-plain-obj-4-1-0"></a>
+### escape-string-regexp 5.0.0 and 1 more
+
+- **escape-string-regexp** 5.0.0 — MIT — https://github.com/sindresorhus/escape-string-regexp  
+  Copyright (c) Sindre Sorhus <sindresorhus@gmail.com> (https://sindresorhus.com)
+- **is-plain-obj** 4.1.0 — MIT — https://github.com/sindresorhus/is-plain-obj  
+  Copyright (c) Sindre Sorhus <sindresorhus@gmail.com> (https://sindresorhus.com)
+
+````text
+MIT License
+
+Copyright (c) Sindre Sorhus <sindresorhus@gmail.com> (https://sindresorhus.com)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
 <a id="exceljs-4-4-0"></a>
 ### exceljs 4.4.0
 
@@ -2220,6 +2743,37 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+````
+
+<a id="extend-3-0-2"></a>
+### extend 3.0.2
+
+- **extend** 3.0.2 — MIT — https://github.com/justmoon/node-extend  
+  Copyright (c) 2014 Stefan Thomas
+
+````text
+The MIT License (MIT)
+
+Copyright (c) 2014 Stefan Thomas
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ````
 
 <a id="fastdom-1-0-12"></a>
@@ -3700,6 +4254,37 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ````
 
+<a id="longest-streak-3-1-0"></a>
+### longest-streak 3.1.0
+
+- **longest-streak** 3.1.0 — MIT — https://github.com/wooorm/longest-streak  
+  Copyright (c) 2015 Titus Wormer <mailto:tituswormer@gmail.com>
+
+````text
+(The MIT License)
+
+Copyright (c) 2015 Titus Wormer <mailto:tituswormer@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+'Software'), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
 <a id="lop-0-4-2"></a>
 <a id="mammoth-1-13-0"></a>
 <a id="option-0-2-4"></a>
@@ -3885,6 +4470,119 @@ Redistribution and use in source and binary forms, with or without modification,
 This software is provided by the copyright holders and contributors “as is” and any express or implied warranties, including, but not limited to, the implied warranties of merchantability and fitness for a particular purpose are disclaimed. In no event shall the copyright owner or contributors be liable for any direct, indirect, incidental, special, exemplary, or consequential damages (including, but not limited to, procurement of substitute goods or services; loss of use, data, or profits; or business interruption) however caused and on any theory of liability, whether in contract, strict liability, or tort (including negligence or otherwise) arising in any way out of the use of this software, even if advised of the possibility of such damage.
 ````
 
+<a id="mdast-util-definitions-6-0-0"></a>
+### mdast-util-definitions 6.0.0
+
+- **mdast-util-definitions** 6.0.0 — MIT — https://github.com/syntax-tree/mdast-util-definitions  
+  Copyright (c) 2015-2016 Titus Wormer <tituswormer@gmail.com>
+
+````text
+(The MIT License)
+
+Copyright (c) 2015-2016 Titus Wormer <tituswormer@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+'Software'), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
+<a id="mdast-util-gfm-autolink-literal-2-0-1"></a>
+<a id="mdast-util-gfm-table-2-0-0"></a>
+<a id="mdast-util-gfm-task-list-item-2-0-0"></a>
+<a id="micromark-extension-gfm-3-0-0"></a>
+<a id="micromark-extension-gfm-autolink-literal-2-1-0"></a>
+<a id="micromark-extension-gfm-strikethrough-2-1-0"></a>
+<a id="micromark-extension-gfm-task-list-item-2-1-0"></a>
+### mdast-util-gfm-autolink-literal 2.0.1 and 6 more
+
+- **mdast-util-gfm-autolink-literal** 2.0.1 — MIT — https://github.com/syntax-tree/mdast-util-gfm-autolink-literal  
+  Copyright (c) 2020 Titus Wormer <tituswormer@gmail.com>
+- **mdast-util-gfm-table** 2.0.0 — MIT — https://github.com/syntax-tree/mdast-util-gfm-table  
+  Copyright (c) 2020 Titus Wormer <tituswormer@gmail.com>
+- **mdast-util-gfm-task-list-item** 2.0.0 — MIT — https://github.com/syntax-tree/mdast-util-gfm-task-list-item  
+  Copyright (c) 2020 Titus Wormer <tituswormer@gmail.com>
+- **micromark-extension-gfm** 3.0.0 — MIT — https://github.com/micromark/micromark-extension-gfm  
+  Copyright (c) 2020 Titus Wormer <tituswormer@gmail.com>
+- **micromark-extension-gfm-autolink-literal** 2.1.0 — MIT — https://github.com/micromark/micromark-extension-gfm-autolink-literal  
+  Copyright (c) 2020 Titus Wormer <tituswormer@gmail.com>
+- **micromark-extension-gfm-strikethrough** 2.1.0 — MIT — https://github.com/micromark/micromark-extension-gfm-strikethrough  
+  Copyright (c) 2020 Titus Wormer <tituswormer@gmail.com>
+- **micromark-extension-gfm-task-list-item** 2.1.0 — MIT — https://github.com/micromark/micromark-extension-gfm-task-list-item  
+  Copyright (c) 2020 Titus Wormer <tituswormer@gmail.com>
+
+````text
+(The MIT License)
+
+Copyright (c) 2020 Titus Wormer <tituswormer@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+'Software'), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
+<a id="mdast-util-phrasing-4-1-0"></a>
+### mdast-util-phrasing 4.1.0
+
+- **mdast-util-phrasing** 4.1.0 — MIT — https://github.com/syntax-tree/mdast-util-phrasing  
+  Copyright (c) 2017 Titus Wormer <tituswormer@gmail.com>  
+  Copyright (c) 2017 Victor Felder <victor@draft.li>
+
+````text
+(The MIT License)
+
+Copyright (c) 2017 Titus Wormer <tituswormer@gmail.com>
+Copyright (c) 2017 Victor Felder <victor@draft.li>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+'Software'), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
 <a id="mdurl-2-1-0"></a>
 ### mdurl 2.1.0
 
@@ -3970,6 +4668,37 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ````
 
+<a id="micromark-extension-gfm-footnote-2-1-0"></a>
+### micromark-extension-gfm-footnote 2.1.0
+
+- **micromark-extension-gfm-footnote** 2.1.0 — MIT — https://github.com/micromark/micromark-extension-gfm-footnote  
+  Copyright (c) 2021 Titus Wormer <tituswormer@gmail.com>
+
+````text
+(The MIT License)
+
+Copyright (c) 2021 Titus Wormer <tituswormer@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+'Software'), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
 <a id="minimatch-3-1-5"></a>
 <a id="once-1-4-0"></a>
 <a id="wrappy-1-0-2"></a>
@@ -4024,6 +4753,35 @@ ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR
 IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ````
 
+<a id="nanoid-6-0-2"></a>
+### nanoid 6.0.2
+
+- **nanoid** 6.0.2 — MIT — https://github.com/ai/nanoid  
+  Copyright 2017 Andrey Sitnik <andrey@sitnik.es>
+
+````text
+The MIT License (MIT)
+
+Copyright 2017 Andrey Sitnik <andrey@sitnik.es>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
 <a id="normalize-path-3-0-0"></a>
 ### normalize-path 3.0.0
 
@@ -4034,6 +4792,37 @@ IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 The MIT License (MIT)
 
 Copyright (c) 2014-2018, Jon Schlinkert.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+````
+
+<a id="orderedmap-2-1-1"></a>
+<a id="w3c-keyname-2-2-8"></a>
+### orderedmap 2.1.1 and 1 more
+
+- **orderedmap** 2.1.1 — MIT — https://github.com/marijnh/orderedmap  
+  Copyright (C) 2016 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+- **w3c-keyname** 2.2.8 — MIT — https://github.com/marijnh/w3c-keyname  
+  Copyright (C) 2016 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+
+````text
+Copyright (C) 2016 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -4898,6 +5687,177 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.**
 ````
 
+<a id="prosemirror-changeset-2-4-4"></a>
+### prosemirror-changeset 2.4.4
+
+- **prosemirror-changeset** 2.4.4 — MIT — https://code.haverbeke.berlin/prosemirror/prosemirror-changeset  
+  Copyright (C) 2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+
+````text
+Copyright (C) 2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+````
+
+<a id="prosemirror-commands-1-7-2"></a>
+<a id="prosemirror-gapcursor-1-4-1"></a>
+<a id="prosemirror-history-1-5-1"></a>
+<a id="prosemirror-inputrules-1-5-1"></a>
+<a id="prosemirror-keymap-1-2-3"></a>
+<a id="prosemirror-model-1-25-12"></a>
+<a id="prosemirror-schema-list-1-5-1"></a>
+<a id="prosemirror-state-1-4-4"></a>
+<a id="prosemirror-transform-1-12-2"></a>
+<a id="prosemirror-view-1-42-6"></a>
+### prosemirror-commands 1.7.2 and 9 more
+
+- **prosemirror-commands** 1.7.2 — MIT — https://code.haverbeke.berlin/prosemirror/prosemirror-commands  
+  Copyright (C) 2015-2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+- **prosemirror-gapcursor** 1.4.1 — MIT — https://github.com/prosemirror/prosemirror-gapcursor  
+  Copyright (C) 2015-2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+- **prosemirror-history** 1.5.1 — MIT — https://code.haverbeke.berlin/prosemirror/prosemirror-history  
+  Copyright (C) 2015-2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+- **prosemirror-inputrules** 1.5.1 — MIT — https://github.com/prosemirror/prosemirror-inputrules  
+  Copyright (C) 2015-2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+- **prosemirror-keymap** 1.2.3 — MIT — https://github.com/prosemirror/prosemirror-keymap  
+  Copyright (C) 2015-2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+- **prosemirror-model** 1.25.12 — MIT — https://code.haverbeke.berlin/prosemirror/prosemirror-model  
+  Copyright (C) 2015-2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+- **prosemirror-schema-list** 1.5.1 — MIT — https://github.com/prosemirror/prosemirror-schema-list  
+  Copyright (C) 2015-2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+- **prosemirror-state** 1.4.4 — MIT — https://github.com/prosemirror/prosemirror-state  
+  Copyright (C) 2015-2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+- **prosemirror-transform** 1.12.2 — MIT — https://code.haverbeke.berlin/prosemirror/prosemirror-transform  
+  Copyright (C) 2015-2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+- **prosemirror-view** 1.42.6 — MIT — https://code.haverbeke.berlin/prosemirror/prosemirror-view  
+  Copyright (C) 2015-2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+
+````text
+Copyright (C) 2015-2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+````
+
+<a id="prosemirror-safari-ime-span-1-0-2"></a>
+### prosemirror-safari-ime-span 1.0.2
+
+- **prosemirror-safari-ime-span** 1.0.2 — MIT — https://github.com/ocavue/prosemirror-safari-ime-span  
+  Copyright (c) 2024 ocavue
+
+````text
+MIT License
+
+Copyright (c) 2024 ocavue
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+````
+
+<a id="prosemirror-tables-1-8-5"></a>
+### prosemirror-tables 1.8.5
+
+- **prosemirror-tables** 1.8.5 — MIT — https://github.com/ProseMirror/prosemirror-tables  
+  Copyright (C) 2015-2016 by Marijn Haverbeke <marijnh@gmail.com> and others
+
+````text
+Copyright (C) 2015-2016 by Marijn Haverbeke <marijnh@gmail.com> and others
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+````
+
+<a id="prosemirror-virtual-cursor-0-4-2"></a>
+### prosemirror-virtual-cursor 0.4.2
+
+- **prosemirror-virtual-cursor** 0.4.2 — MIT — https://github.com/ocavue/prosemirror-virtual-cursor  
+  Copyright (c) 2022 ocavue
+
+````text
+MIT License
+
+Copyright (c) 2022 ocavue
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+````
+
 <a id="punycode-js-2-3-1"></a>
 <a id="uc-micro-3-0-0"></a>
 ### punycode.js 2.3.1 and 1 more
@@ -5213,6 +6173,39 @@ IN THE SOFTWARE.
    limitations under the License.
 ````
 
+<a id="remark-parse-11-0-0"></a>
+<a id="remark-stringify-11-0-0"></a>
+### remark-parse 11.0.0 and 1 more
+
+- **remark-parse** 11.0.0 — MIT — https://github.com/remarkjs/remark/tree/main/packages/remark-parse  
+  Copyright (c) 2014 Titus Wormer <tituswormer@gmail.com>
+- **remark-stringify** 11.0.0 — MIT — https://github.com/remarkjs/remark/tree/main/packages/remark-stringify  
+  Copyright (c) 2014 Titus Wormer <tituswormer@gmail.com>
+
+````text
+(The MIT License)
+
+Copyright (c) 2014 Titus Wormer <tituswormer@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+````
+
 <a id="rollup-plugin-node-builtins-2-1-2"></a>
 ### rollup-plugin-node-builtins 2.1.2
 
@@ -5262,6 +6255,34 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+````
+
+<a id="rope-sequence-1-3-4"></a>
+### rope-sequence 1.3.4
+
+- **rope-sequence** 1.3.4 — MIT — https://github.com/marijnh/rope-sequence  
+  Copyright (C) 2016 by Marijn Haverbeke <marijn@haverbeke.berlin>
+
+````text
+Copyright (C) 2016 by Marijn Haverbeke <marijn@haverbeke.berlin>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
 ````
 
 <a id="roughjs-4-6-6"></a>
@@ -5730,6 +6751,36 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ````
 
+<a id="trough-2-2-0"></a>
+### trough 2.2.0
+
+- **trough** 2.2.0 — MIT — https://github.com/wooorm/trough  
+  Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com>
+
+````text
+(The MIT License)
+
+Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+````
+
 <a id="ts-dedent-2-3-0"></a>
 ### ts-dedent 2.3.0
 
@@ -5840,6 +6891,107 @@ HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
 WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
+````
+
+<a id="unified-11-0-5"></a>
+<a id="vfile-6-0-3"></a>
+### unified 11.0.5 and 1 more
+
+- **unified** 11.0.5 — MIT — https://github.com/unifiedjs/unified  
+  Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>
+- **vfile** 6.0.3 — MIT — https://github.com/vfile/vfile  
+  Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>
+
+````text
+(The MIT License)
+
+Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+````
+
+<a id="unist-util-is-6-0-1"></a>
+### unist-util-is 6.0.1
+
+- **unist-util-is** 6.0.1 — MIT — https://github.com/syntax-tree/unist-util-is  
+  Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>
+
+````text
+(The MIT license)
+
+Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+'Software'), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+````
+
+<a id="unist-util-stringify-position-4-0-0"></a>
+<a id="unist-util-visit-parents-6-0-2"></a>
+<a id="zwitch-2-0-4"></a>
+### unist-util-stringify-position 4.0.0 and 2 more
+
+- **unist-util-stringify-position** 4.0.0 — MIT — https://github.com/syntax-tree/unist-util-stringify-position  
+  Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com>
+- **unist-util-visit-parents** 6.0.2 — MIT — https://github.com/syntax-tree/unist-util-visit-parents  
+  Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com>
+- **zwitch** 2.0.4 — MIT — https://github.com/wooorm/zwitch  
+  Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com>
+
+````text
+(The MIT License)
+
+Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+'Software'), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ````
 
 <a id="util-deprecate-1-0-2"></a>
