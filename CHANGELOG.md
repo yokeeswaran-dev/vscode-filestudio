@@ -28,12 +28,23 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 #### Excel (.xlsx)
 
-- Groundwork for editing (not visible yet): workbooks are now saved by changing only the cells that were edited,
+- You can now **edit cells**: type to start, F2 or double-click to edit in the cell, edit in the formula bar,
+  Enter / Tab / Esc as in Excel, Delete clears, and paste a block from Excel or a text table. Numbers, dates,
+  percentages, `TRUE` / `FALSE` and formulas (`=SUM(A1:A3)`, also newer functions) are understood. One action is one
+  undo step; Undo, Redo, Save and Revert work as in any VS Code editor.
+- Several editors of the same workbook (Split Editor) stay in step.
+- Formulas you type are saved, but not calculated yet: their cell shows no result until the file is opened in Excel.
+- Cut (Ctrl+X) is not available yet: use Copy and then Delete.
+- Cells in a table header, array formulas, merged blocks that do not fit, and protected sheets are not changed;
+  FileStudio says why. A workbook with content FileStudio cannot update (charts, pivot tables, external links and
+  similar) asks **Edit anyway** first and keeps that content as it is.
+- Workbooks are saved by changing only the cells that were edited,
   so charts, pivot tables, comments and other content stay exactly as they are. A file is checked before it is
   written and is never replaced half-written. The first save keeps a copy as `<name>.xlsx.bak` (setting
   **FileStudio > Xlsx: Backup On Save**).
 - Known limitation: a workbook with more than about 100,000 cells (used rows x columns of all sheets) or a file
-  whose sheets, strings and styles unpack to more than 25 MB opens read-only, with a banner. You can view, scroll and copy, but not edit. Saving very large
+  whose sheets, strings and styles unpack to more than 25 MB opens read-only, with a banner. You can view, scroll and copy, but not edit. An edit or paste that
+  would make a workbook larger than this is not applied. Saving very large
   files safely needs a new save method; it is planned for a later version.
 
 ## [0.1.2] - 2026-10-11

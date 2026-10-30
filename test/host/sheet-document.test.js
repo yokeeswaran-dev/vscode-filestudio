@@ -180,7 +180,7 @@ test('poison: a failing undo step poisons the document; save and backup still wr
   assert.equal(doc.testState.poisoned, true);
   assert.equal(doc.testState.pos, 1, 'pos does not move');
   assert.equal(api.state(uri.toString()).poisoned, true);
-  const state = doc.computeEditState();
+  const state = await doc.computeEditState();
   assert.equal(state.editable, false);
   assert.equal(state.code, 'internal');
   assert.match(state.reason, /Use Revert File/);
@@ -566,7 +566,7 @@ test('backup writes a verified workbook + sidecar; restore opens it dirty with l
   assert.equal(restored.testState.journalLength, 0);
   assert.equal(restoredEvents.length, 1, 'one content event keeps VS Code dirty');
   assert.equal(restoredEvents[0].label, 'Unsaved changes');
-  assert.equal(restored.computeEditState().code, undefined, 'lossy accepted from the sidecar');
+  assert.equal((await restored.computeEditState()).code, undefined, 'lossy accepted from the sidecar');
 
   // restore -> edit -> undo -> the no-op's undo re-fires, so VS Code cannot reach its "clean" point
   await restored.queue.run(() => restored.commit({ label: 'e', after: { ops: [A1('more')], expect: [] } }));
@@ -659,7 +659,7 @@ test('a sheet other than the edited one with rows out of order makes the documen
   const { doc } = await open('order.xlsx', bytes);
   await doc.ensureScan();
   assert.match(doc.gateState.block, /FileStudio cannot edit this file safely: .*rows/i);
-  const state = doc.computeEditState();
+  const state = await doc.computeEditState();
   assert.equal(state.editable, false);
   assert.equal(state.code, 'blocked');
   // Save As of the clean, hard read-only file still writes the original bytes.
@@ -671,7 +671,7 @@ test('a sheet other than the edited one with rows out of order makes the documen
 test('lossy workbook: editState code lossy with canEditAnyway; acceptLossy clears it; revert keeps it only for the same list', async () => {
   const chart = await xlsxBytes((zip) => zip.file('xl/charts/chart1.xml', '<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"/>'));
   const { uri, doc } = await open('lossy.xlsx', chart);
-  let state = doc.computeEditState();
+  let state = await doc.computeEditState();
   assert.equal(state.code, 'lossy');
   assert.ok(state.canEditAnyway.details.length > 0);
   doc.acceptLossy();
@@ -681,13 +681,13 @@ test('lossy workbook: editState code lossy with canEditAnyway; acceptLossy clear
   fs.writeFileSync(uri.fsPath, await xlsxBytes((zip) => zip.file('xl/embeddings/o.bin', 'x')));
   await doc.revert();
   assert.equal(doc.gateState.lossy.accepted, false, 'another list: asked again');
-  state = doc.computeEditState();
+  state = await doc.computeEditState();
   assert.equal(state.code, 'lossy');
 });
 
-test('a plain workbook stays view-only (xlsx editing waits for P2) with no banner or message', async () => {
+test('a plain workbook is editable (cell intents) with no banner or message', async () => {
   const { doc } = await open();
-  assert.deepEqual(doc.computeEditState(), { editable: false, kinds: [] });
+  assert.deepEqual(await doc.computeEditState(), { editable: true, kinds: ['setCells', 'clear'] });
 });
 
 test('the version rule bookkeeping: structural edits raise structureVersion, value edits do not', async () => {
@@ -846,7 +846,7 @@ test('size limit: a workbook over the limit is hard read-only and nothing can wr
   const { uri, doc, events } = await open('over.xlsx', bytes);
   assert.match(doc.gateState.block, /too large to edit safely in this version/);
   assert.match(doc.gateState.block, /later version/);
-  const state = doc.computeEditState();
+  const state = await doc.computeEditState();
   assert.equal(state.editable, false);
   assert.equal(state.code, 'blocked');
   await assert.rejects(() => api.pushPackageOps(uri.toString(), [cells([[0, 0, { value: str('x') }]])]), /too large to edit safely/);
@@ -874,7 +874,7 @@ test('F-R3: a too-large workbook with a chart is blocked, with no "Edit anyway" 
   zip.file('xl/charts/chart1.xml', '<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"/>');
   const { doc } = await open('big-chart.xlsx', await zip.generateAsync({ type: 'nodebuffer' }));
   assert.ok(doc.lossyFeatures.length > 0, 'fixture is lossy');
-  const state = doc.computeEditState();
+  const state = await doc.computeEditState();
   assert.equal(state.code, 'blocked');
   assert.equal(state.canEditAnyway, undefined);
 });

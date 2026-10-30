@@ -962,6 +962,21 @@ test('F7: <dimension ref> grows when cells are written outside it (and is left a
   assert.match(await part(inside.bytes, 'xl/worksheets/sheet1.xml'), /<dimension ref="A1:A3"\/>/);
 });
 
+test('fix1: V2 row-by-row check (big sheet part) accepts a widened <dimension ref> and nothing else outside the rows', async () => {
+  // The row-by-row V2 runs for sheet parts over 32 MB; the limit is lowered so a small part takes the same path.
+  const saved = S.verifyTuning.fullParseBytes;
+  S.verifyTuning.fullParseBytes = 0;
+  try {
+    const head = { head: '<dimension ref="A1:A3"/>' };
+    const base = await makeXlsx({ sheets: [{ name: 'S1', xml: sheetXml('<row r="1"><c r="A1"><v>1</v></c></row><row r="3"><c r="A3"><v>3</v></c></row>', head) }] });
+    const { bytes } = await save(base, [cells(1, [[4, 3, { value: num(5) }]])], [{ sheet: 1, r: 4, c: 3, value: num(5) }]);
+    assert.match(await part(bytes, 'xl/worksheets/sheet1.xml'), /<dimension ref="A1:D5"\/>/);
+    await save(base, [cells(1, [[1, 0, { value: num(2) }]])], [{ sheet: 1, r: 1, c: 0, value: num(2) }]); // inside: unchanged tag
+  } finally {
+    S.verifyTuning.fullParseBytes = saved;
+  }
+});
+
 test('F8: V4 does not refuse a correct save for cells the loader shows differently (merged non-anchor cell, empty string)', async () => {
   const xml = sheetXml('<row r="1"><c r="A1"><v>1</v></c><c r="B1"><v>2</v></c></row>', { tail: '<mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells>' });
   const base = await makeXlsx({ sheets: [{ name: 'S1', xml }] });

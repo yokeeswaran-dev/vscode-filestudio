@@ -1431,6 +1431,151 @@ export function fxEmit(formula: string, tokens: readonly FxToken[], replace: (to
   return out;
 }
 
+// ----- formula syntax -----
+// (v0.2.0, P2) Formula INPUT: what the user types in the cell editor (editor syntax: English function names, ',' as
+// separator, no _xlfn. prefixes) -> what the file stores (file syntax: the same text with the _xlfn. prefixes Excel
+// writes for functions newer than Excel 2007). Built on the fx adapter above. A formula that fx cannot parse is refused
+// BEFORE it can reach the file: Excel would "repair" a workbook with a broken <f>.
+// (The import sits here, not in LIBRARIES, so this section never touches lines other tracks edit.)
+import { parse as fxParseAst } from '@borgar/fx/xlsx';
+
+/** Functions Excel stores with a prefix (names newer than Excel 2007): NAME -> prefix. Checked against Excel's own files (see test). */
+const FILE_FUNCTION_PREFIX: ReadonlyMap<string, string> = new Map(
+  (
+    'ACOT ACOTH AGGREGATE ARABIC ARRAYTOTEXT BASE BETA.DIST BETA.INV BINOM.DIST BINOM.DIST.RANGE BINOM.INV BITAND BITLSHIFT BITOR ' +
+    'BITRSHIFT BITXOR CEILING.MATH CEILING.PRECISE CHISQ.DIST CHISQ.DIST.RT CHISQ.INV CHISQ.INV.RT CHISQ.TEST COMBINA CONCAT ' +
+    'CONFIDENCE.NORM CONFIDENCE.T COT COTH COVARIANCE.P COVARIANCE.S CSC CSCH DAYS DECIMAL ENCODEURL ERF.PRECISE ERFC.PRECISE ' +
+    'EXPON.DIST F.DIST F.DIST.RT F.INV F.INV.RT F.TEST FILTERXML FLOOR.MATH FLOOR.PRECISE FORECAST.ETS FORECAST.ETS.CONFINT ' +
+    'FORECAST.ETS.SEASONALITY FORECAST.ETS.STAT FORECAST.LINEAR FORMULATEXT GAMMA GAMMA.DIST GAMMA.INV GAMMALN.PRECISE GAUSS ' +
+    'HYPGEOM.DIST IFNA IFS IMCOSH IMCOT IMCSC IMCSCH IMSEC IMSECH IMSINH IMTAN ISFORMULA ISOWEEKNUM LOGNORM.DIST LOGNORM.INV ' +
+    'MAXIFS MINIFS MODE.MULT MODE.SNGL MUNIT NEGBINOM.DIST NETWORKDAYS.INTL NORM.DIST NORM.INV NORM.S.DIST NORM.S.INV NUMBERVALUE ' +
+    'PDURATION PERCENTILE.EXC PERCENTILE.INC PERCENTRANK.EXC PERCENTRANK.INC PERMUTATIONA PHI POISSON.DIST QUARTILE.EXC ' +
+    'QUARTILE.INC QUERYSTRING RANK.AVG RANK.EQ RRI SEC SECH SHEET SHEETS SKEW.P STDEV.P STDEV.S SWITCH T.DIST T.DIST.2T T.DIST.RT ' +
+    'T.INV T.INV.2T T.TEST TEXTAFTER TEXTBEFORE TEXTJOIN UNICHAR UNICODE VALUETOTEXT VAR.P VAR.S WEBSERVICE WEIBULL.DIST ' +
+    'WORKDAY.INTL XLOOKUP XMATCH XOR Z.TEST'
+  )
+    .split(' ')
+    .map((name): [string, string] => [name, '_xlfn.']),
+);
+// Functions the file stores with the worksheet-function namespace too (used by the spilling functions, which are refused
+// for input below; kept for the tests that read Excel's own formulas back).
+const FILE_FUNCTION_PREFIX_WS: ReadonlyMap<string, string> = new Map([['FILTER', '_xlfn._xlws.'], ['SORT', '_xlfn._xlws.']]);
+
+/** Functions whose result spills into neighbouring cells (Excel 365): refused in new formulas (§5.3). */
+const SPILLING_FUNCTIONS: ReadonlySet<string> = new Set(
+  'SEQUENCE FILTER SORT SORTBY UNIQUE RANDARRAY TEXTSPLIT VSTACK HSTACK TOCOL TOROW TAKE DROP EXPAND WRAPROWS WRAPCOLS CHOOSEROWS CHOOSECOLS TRANSPOSE'.split(' '),
+);
+/** Functions whose parameters are written with special file prefixes (_xlpm.): refused in new formulas. */
+const LAMBDA_FUNCTIONS: ReadonlySet<string> = new Set('LET LAMBDA MAP REDUCE SCAN BYROW BYCOL MAKEARRAY ISOMITTED'.split(' '));
+
+export const FORMULA_PROBLEM_TEXT = "There's a problem with this formula.";
+const FORMULA_LIMITS = { depth: 64, args: 255, text: 255 } as const;
+
+export type FormulaCheck =
+  | { ok: true; /** File syntax, without '='. */ file: string; /** Editor / display syntax, without '='. */ editor: string }
+  | { ok: false; reason: 'invalid'; message: string }
+  | { ok: false; reason: 'blocked'; block: BlockReason };
+
+/** A name that looks like a cell reference outside the grid (A1048577, XFE1): refused, as Excel's formula bar would. */
+const OUT_OF_GRID_NAME_RE = /^\$?[A-Za-z]{1,3}\$?\d{1,8}$/;
+
+function hasLoneSurrogate(text: string): boolean {
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (c >= 0xd800 && c <= 0xdbff) {
+      const d = text.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) i++;
+      else return true;
+    } else if (c >= 0xdc00 && c <= 0xdfff) return true;
+  }
+  return false;
+}
+
+/**
+ * Checks a formula typed into a cell (`body` = text after the '=') and converts it to file syntax. Refused as
+ * 'invalid' (cell keeps its content): not parseable, unbalanced quotes / parentheses, a reference outside the grid or
+ * to an unknown sheet, over Excel's limits (8,192 characters, 64 nesting levels, 255 arguments, 255 characters per
+ * text constant). Refused as 'blocked': what FileStudio cannot write safely yet (spilling functions, LET / LAMBDA,
+ * references to other workbooks, table references, spill references `A1#`). Unknown function names are allowed (the
+ * cell shows #NAME? like in Excel). `sheetNames`: every sheet of the workbook (compared ignoring case).
+ */
+export function checkFormulaInput(body: string, sheetNames: readonly string[]): FormulaCheck {
+  const invalid = (): FormulaCheck => ({ ok: false, reason: 'invalid', message: FORMULA_PROBLEM_TEXT });
+  const blocked = (message: string): FormulaCheck => ({ ok: false, reason: 'blocked', block: { code: 'unsupported', message, where: [] } });
+  if (!body.trim() || body.length > FX_MAX_FORMULA_CHARS || body.trimStart().startsWith('=')) return invalid();
+  if (/[\u0000-\u0008\u000b-\u001f￾￿]/.test(body) || hasLoneSurrogate(body)) return invalid();
+  const tokens = fxTokenize(body);
+  if (tokens.some((t) => t.type === 'UNKNOWN')) return invalid();
+  const known = new Set(sheetNames.map((n) => n.toLowerCase()));
+  const text = (t: FxToken): string => body.slice(t.start, t.end);
+  // fx's grammar is lenient at the ends: a formula starts with an operand, '(', '{' or a sign, and does not end on a binary operator.
+  const significant = tokens.filter((t) => t.type !== 'whitespace' && t.type !== 'newline');
+  const first = significant[0];
+  const last = significant[significant.length - 1];
+  if (first.type === 'operator' && !'({+-'.includes(text(first))) return invalid();
+  if (last.type === 'operator' && !')}%#'.includes(text(last))) return invalid();
+  const bounds = (a: FxArea): boolean => a.r0 >= 0 && a.c0 >= 0 && a.r1 < MAX_ROWS && a.c1 < MAX_COLS;
+  // Meaning of every token (before the grammar check, so a blocked formula says why).
+  for (const t of tokens) {
+    if (t.type === 'func') {
+      // _xlfn. / _xlws. are the file prefixes of newer functions: typed by hand they must not get past the checks.
+      const name = text(t).toUpperCase().replace(/^(?:_XLFN\.|_XLWS\.)+/, '');
+      if (SPILLING_FUNCTIONS.has(name)) return blocked("FileStudio can't create spilling (dynamic array) formulas yet. Enter this formula in Excel.");
+      if (LAMBDA_FUNCTIONS.has(name)) return blocked("FileStudio can't create formulas with LET or LAMBDA yet. Enter this formula in Excel.");
+    } else if (t.type === 'operator' && text(t) === '@') {
+      return invalid();
+    } else if (t.type === 'REF' && t.ref) {
+      if (t.ref.spill) return blocked("FileStudio can't create spilling (dynamic array) formulas yet. Enter this formula in Excel.");
+      if (!bounds(t.ref)) return invalid();
+    } else if (t.type === 'STRUCT') {
+      return blocked("FileStudio can't create formulas with table references yet. Enter this formula in Excel.");
+    } else if (t.type === 'NAME' && !t.prefix && OUT_OF_GRID_NAME_RE.test(text(t))) {
+      return invalid();
+    } else if (t.type === 'string') {
+      if (text(t).length - 2 - (text(t).match(/""/g)?.length ?? 0) > FORMULA_LIMITS.text) return invalid();
+    } else if (t.type === 'number') {
+      if (!Number.isFinite(Number(text(t)))) return invalid();
+    }
+    const prefix = t.ref ? t.ref.prefix : t.prefix;
+    if ((t.type === 'REF' || t.type === 'NAME' || t.type === 'STRUCT' || t.type === 'ERR') && prefix) {
+      if (prefix.book !== null) return blocked("FileStudio can't create formulas that refer to other workbooks yet. Enter this formula in Excel.");
+      for (const sheet of [prefix.sheet1, prefix.sheet2]) if (sheet !== null && !known.has(sheet.toLowerCase())) return invalid();
+    }
+  }
+  // Grammar (fx parser) and Excel's nesting limits.
+  try {
+    // The parser wants merged references and negative numbers as one token (unlike the adapter's own tokens).
+    const raw = fxTokenizeRaw(body, { mergeRefs: true, negativeNumbers: true, allowTernary: false, r1c1: false });
+    fxParseAst(raw);
+    const stack: { func: boolean; args: number }[] = [];
+    let prev = '';
+    for (const r of raw) {
+      if (r.type === 'operator') {
+        if (r.value === '(' || r.value === '{') {
+          stack.push({ func: r.value === '(' && prev === 'func', args: 1 });
+          if (stack.length > FORMULA_LIMITS.depth) return invalid();
+        } else if (r.value === ')' || r.value === '}') {
+          stack.pop();
+        } else if (r.value === ',' && stack.length) {
+          const top = stack[stack.length - 1];
+          if (++top.args > FORMULA_LIMITS.args && top.func) return invalid();
+        }
+      }
+      if (r.type !== 'whitespace' && r.type !== 'newline') prev = r.type;
+    }
+  } catch {
+    return invalid();
+  }
+  const file = fxEmit(body, tokens, (t) => {
+    if (t.type !== 'func') return null;
+    const name = text(t);
+    if (/^_xl/i.test(name)) return null; // typed with its prefix: kept
+    const upper = name.toUpperCase();
+    return (FILE_FUNCTION_PREFIX.get(upper) ?? FILE_FUNCTION_PREFIX_WS.get(upper) ?? '') + upper;
+  });
+  return { ok: true, file, editor: file.includes('_xl') ? file.replace(/_xl(?:fn|ws|pm)\./g, '') : file };
+}
+
 /** 'A' -> 0, 'XFD' -> 16383; -1 when not letters. */
 function colToIndex(letters: string): number {
   let n = 0;
@@ -3842,6 +3987,16 @@ function columnWindow(c0: number | undefined, c1: number | undefined): [number, 
 interface SheetContext {
   ws: XWorksheet;
   index: number;
+  /** (v0.2.0, P2) Stable sheet id ('s' + the <sheet sheetId> attribute); the position in `index` can change, this cannot. */
+  id: SheetId;
+  /** (v0.2.0, P2) Position -> id maps and the cell overlay of the sheet (EDITING); every read goes through it. */
+  view: SheetView;
+  /** (v0.2.0, P2) Every array / spill range of the sheet as loaded (dynamic ones too): value edits inside are blocked. */
+  arrays: ArrayFormulaInfo[];
+  /** (v0.2.0, P2) Lazy lookups of the loaded merges and tables, and the used range of the loaded sheet. */
+  mergeIndex?: RangeIndex;
+  tables?: LoadedTable[];
+  loadedExtent?: { rowCount: number; colCount: number };
   /** Resolved list values per validation formula. */
   lists: Map<string, string[] | undefined>;
   /** Masters of the sheet's dynamic-array formulas (row * MAX_COLS + col), shown without braces. */
@@ -3880,6 +4035,18 @@ export class WorkbookModel implements GridSource {
   private readonly threadedNotes: ReadonlyMap<number, ReadonlyMap<number, string>> | undefined;
   private sheets: SheetContext[] = [];
   private meta: Omit<WorkbookMeta, 'styles'> = { sheets: [], activeSheet: 0, defaultFont: { name: 'Calibri', size: 11 }, date1904: false };
+  /** (v0.2.0, P2) Sheet position by id. */
+  private sheetById = new Map<SheetId, number>();
+  /**
+   * (v0.2.0, P2) Set when the workbook's sheet ids cannot identify its sheets (two sheets with the same <sheet sheetId>, or
+   * none): the model then refuses every edit (planEdit) and says why.
+   */
+  idProblem: string | undefined;
+  /**
+   * (v0.2.0, P2) Set by the host for facts only the package knows (a cell with `vm` = in-cell picture / linked data type,
+   * a pivot range): returns the message of the block, or undefined. Asked for every cell a value edit changes.
+   */
+  extraCellBlock: ((sheet: SheetId, r: number, c: number) => string | undefined) | undefined;
 
   constructor(workbook: ExcelJS.Workbook) {
     this.workbook = workbook;
@@ -3911,11 +4078,19 @@ export class WorkbookModel implements GridSource {
   /** Recomputes the sheet structure from the workbook (after edits / sheet changes). */
   refresh(): WorkbookMeta {
     this.styleTable.forgetObjects();
+    // Stable ids (EDITING): 's' + the sheetId attribute. A missing or repeated attribute cannot identify a sheet: such a
+    // sheet gets a fresh id and the model refuses edits (idProblem) instead of addressing the wrong sheet.
+    const ids = assignSheetIds(this.wb.worksheets);
+    this.idProblem = ids.problem;
+    this.sheetById = new Map(ids.ids.map((id, index) => [id, index]));
     this.sheets = this.wb.worksheets.map((ws, index) => {
       const arrays = (typeof ws.id === 'number' ? this.arrayFormulas?.get(ws.id) : undefined) ?? [];
       return {
         ws,
         index,
+        id: ids.ids[index],
+        view: newSheetView(ids.ids[index], ws),
+        arrays,
         lists: new Map(),
         dynamicArrays: new Set(arrays.filter((a) => a.dynamic).map((a) => a.r * MAX_COLS + a.c)),
         arrayRanges: arrays
@@ -3929,11 +4104,304 @@ export class WorkbookModel implements GridSource {
     return this.getMeta();
   }
 
+  // ----- editing support (v0.2.0): the EDITING section (planEdit / applyEdit / invertEdit) reads and changes the model through these -----
+
+  /** Position of the sheet with this id, -1 when there is none. */
+  sheetIndexOf(id: SheetId): number {
+    return this.sheetById.get(id) ?? -1;
+  }
+
+  /** Id of the sheet at a position. */
+  sheetIdAt(index: number): SheetId | undefined {
+    return this.sheets[index]?.id;
+  }
+
+  /** Names of all sheets (hidden ones too), in tab order. */
+  sheetNames(): string[] {
+    return this.sheets.map((s) => String(s.ws.name));
+  }
+
+  get usesDate1904(): boolean {
+    return this.date1904;
+  }
+
+  /** The view (maps + overlay) of a sheet. */
+  viewOf(id: SheetId): SheetView | undefined {
+    return this.sheets[this.sheetById.get(id) ?? -1]?.view;
+  }
+
+  /** Meta of one sheet as the webview needs it now (after the used range changed). */
+  sheetMeta(id: SheetId): SheetMeta | undefined {
+    return this.meta.sheets[this.sheetById.get(id) ?? -1];
+  }
+
+  /**
+   * Recomputes the meta of one sheet (used range, ...) after edits and returns it (undefined: no such sheet). The base
+   * workbook never changes, so this is only needed when the view changed something the meta shows.
+   */
+  refreshSheet(id: SheetId): SheetMeta | undefined {
+    const index = this.sheetById.get(id);
+    const ctx = index === undefined ? undefined : this.sheets[index];
+    if (!ctx || index === undefined) return undefined;
+    ctx.lists.clear();
+    const meta = this.safeSheetMeta(ctx);
+    this.meta.sheets[index] = meta;
+    return meta;
+  }
+
+  /** The cached lists of data validations read from cells: dropped after any edit (the next read looks again). */
+  dropListCaches(): void {
+    for (const ctx of this.sheets) ctx.lists.clear();
+  }
+
+  /** What planEdit needs to know about the cell at logical (r, c) of a sheet. */
+  cellState(id: SheetId, r: number, c: number): CellState | undefined {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    if (!ctx) return undefined;
+    const view = ctx.view;
+    const rowId = view.contentMap.get(r);
+    const colId = view.colMap.get(c);
+    const key = cellKey(rowId, colId);
+    const over = view.over.get(key);
+    const brow = rowId < NEW_ROW_BASE ? ctx.ws._rows[rowId] : undefined;
+    const base = colId < NEW_COL_BASE ? brow?._cells[colId] : undefined;
+    const style = over?.s ?? this.baseStyleIndex(ctx, base, rowId, colId);
+    const st = this.styleTable.styles[style];
+    let value: FileValue | undefined;
+    let formula: string | undefined;
+    let sharedMaster = false;
+    if (over) {
+      if (over.f !== undefined) formula = over.f;
+      if (over.t === 'e') value = typeof over.v === 'string' ? { t: 'e', v: over.v } : undefined;
+      else if (over.t === 'z' || over.v === undefined || over.v === null) value = undefined;
+      else if (typeof over.v === 'number') value = { t: 'n', v: over.v };
+      else if (typeof over.v === 'boolean') value = { t: 'b', v: over.v };
+      else value = { t: 's', v: over.v };
+    } else if (base) {
+      const xv = base._value;
+      const m = xv.model;
+      switch (xv.type) {
+        case VT.Number:
+          if (typeof m.value === 'number') value = { t: 'n', v: m.value };
+          break;
+        case VT.Date: {
+          const serial = m.value instanceof Date ? this.dateSerial(m.value) : undefined;
+          if (serial !== undefined) value = { t: 'n', v: serial };
+          break;
+        }
+        case VT.String:
+        case VT.SharedString:
+          if (typeof m.value === 'string') value = { t: 's', v: m.value };
+          break;
+        case VT.RichText:
+          value = { t: 's', v: richTextPlain(m.value) };
+          break;
+        case VT.Boolean:
+          if (typeof m.value === 'boolean') value = { t: 'b', v: m.value };
+          break;
+        case VT.Error:
+          value = { t: 'e', v: String((m.value as { error?: unknown } | undefined)?.error ?? '#VALUE!') };
+          break;
+        case VT.Hyperlink:
+          value = typeof m.text === 'string' ? { t: 's', v: m.text } : typeof m.text === 'number' ? { t: 'n', v: m.text } : undefined;
+          break;
+        case VT.Formula: {
+          value = this.resultValue(m.result);
+          if (typeof m.formula === 'string' && m.formula) {
+            formula = m.formula.startsWith('=') ? m.formula.slice(1) : m.formula;
+            sharedMaster = m.shareType === 'shared';
+          } else if (typeof m.sharedFormula === 'string') {
+            const master = decodeCell(m.sharedFormula);
+            const masterFormula = master ? ctx.ws._rows[master.r]?._cells[master.c]?._value?.model?.formula : undefined;
+            if (master && typeof masterFormula === 'string') {
+              formula = translateFormula(masterFormula.startsWith('=') ? masterFormula.slice(1) : masterFormula, rowId - master.r, colId - master.c);
+            }
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+    return {
+      rowId,
+      colId,
+      key,
+      override: over,
+      value,
+      formula,
+      style,
+      numFmt: st.numFmt ?? 'General',
+      wrap: !!st.align?.wrap,
+      locked: this.cellLocked(ctx, base, rowId, colId),
+      sharedMaster: sharedMaster && !over,
+      hasHyperlink: !!base && base._value.type === VT.Hyperlink,
+    };
+  }
+
+  /** A formula's cached result (ExcelJS value) as the file stores it; undefined when there is none. */
+  private resultValue(result: unknown): FileValue | undefined {
+    if (typeof result === 'number') return Number.isFinite(result) ? { t: 'n', v: result } : undefined;
+    if (typeof result === 'string') return { t: 's', v: result };
+    if (typeof result === 'boolean') return { t: 'b', v: result };
+    if (result instanceof Date) {
+      const serial = this.dateSerial(result);
+      return serial === undefined ? undefined : { t: 'n', v: serial };
+    }
+    if (isErrorValue(result)) return { t: 'e', v: String((result as { error: unknown }).error) };
+    return undefined;
+  }
+
+  /** Visits the cells inside `range` that exist (loaded or in the overlay), row by row, with their logical position. */
+  forEachExistingCell(id: SheetId, range: Range, visit: (r: number, c: number) => void): void {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    if (!ctx) return;
+    const view = ctx.view;
+    const last = Math.min(range.r1, viewRowLimit(view) - 1);
+    for (let r = range.r0; r <= last; r++) {
+      this.visitRowCells(ctx, view.contentMap.get(r), range.c0, range.c1, (c) => {
+        visit(r, c);
+        return true;
+      });
+    }
+  }
+
+  /** Is the cell locked (the default) in the file's own style? Only matters on a protected sheet. */
+  private cellLocked(ctx: SheetContext, base: XCell | undefined, rowId: number, colId: number): boolean {
+    const own = (st: XStyle | undefined): boolean | undefined => (st as { protection?: { locked?: boolean } } | undefined)?.protection?.locked;
+    const row = rowId < NEW_ROW_BASE ? ctx.ws._rows[rowId] : undefined;
+    const column = colId < NEW_COL_BASE ? ctx.ws._columns?.[colId] : undefined;
+    return (own(base?.style) ?? (base ? undefined : own(row?.style) ?? own(column?.style))) !== false;
+  }
+
+  /** The array / spill range (legacy or dynamic) of the loaded sheet that holds the base cell (rowId, colId). */
+  arrayRangeAt(id: SheetId, rowId: number, colId: number): Range | undefined {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    return ctx?.arrays.find((a) => rowId >= a.range.r0 && rowId <= a.range.r1 && colId >= a.range.c0 && colId <= a.range.c1)?.range;
+  }
+
+  /** The merged area (loaded merges) that holds logical (r, c), if any. */
+  mergeAt(id: SheetId, r: number, c: number): Range | undefined {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    if (!ctx) return undefined;
+    ctx.mergeIndex ??= buildRangeIndex(this.sheetMerges(ctx.ws));
+    return findInRangeIndex(ctx.mergeIndex, r, c);
+  }
+
+  /** The table whose header or totals row holds logical (r, c), if any. */
+  tableCellAt(id: SheetId, r: number, c: number): { name: string; part: 'header' | 'totals' } | undefined {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    if (!ctx) return undefined;
+    ctx.tables ??= loadedTables(ctx.ws);
+    for (const t of ctx.tables) {
+      if (c < t.range.c0 || c > t.range.c1) continue;
+      if (t.header && r === t.range.r0) return { name: t.name, part: 'header' };
+      if (t.totals && r === t.range.r1) return { name: t.name, part: 'totals' };
+    }
+    return undefined;
+  }
+
+  /** The sheet has "Protect Sheet" on (cells with the default locked state cannot be changed in Excel). */
+  sheetProtected(id: SheetId): boolean {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    return !!(ctx?.ws as { sheetProtection?: { sheet?: boolean } | null } | undefined)?.sheetProtection?.sheet;
+  }
+
+  /**
+   * Is logical row r a data row of the sheet's autofilter that is hidden (filtered out)? Excel's Clear Contents skips
+   * such rows, so the user never loses data they cannot see. Rows added by edits are never hidden.
+   */
+  filterHidesRow(id: SheetId, r: number): boolean {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    if (!ctx) return false;
+    const filter = decodeAutoFilter(ctx.ws.autoFilter);
+    if (!filter || r <= filter.r0 || r > filter.r1) return false;
+    const rowId = ctx.view.contentMap.get(r);
+    const row = rowId < NEW_ROW_BASE ? ctx.ws._rows[rowId] : undefined;
+    return !!(row as { hidden?: boolean } | undefined)?.hidden;
+  }
+
+  /**
+   * The other cells of the shared formula whose master is at base cell (rowId, colId): [r, c, formula (file syntax), cached
+   * value]. 'large' when the group is too big to separate in one edit. Cells already replaced by the overlay are left out.
+   */
+  sharedClones(id: SheetId, rowId: number, colId: number): { r: number; c: number; formula: string; cached: FileValue | null }[] | 'large' | undefined {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    const master = ctx?.ws._rows[rowId]?._cells[colId]?._value;
+    if (!ctx || !master || master.type !== VT.Formula || master.model.shareType !== 'shared' || typeof master.model.formula !== 'string') return undefined;
+    const ref = typeof master.model.ref === 'string' ? decodeRange(master.model.ref) : undefined;
+    if (!ref) return undefined;
+    if ((ref.r1 - ref.r0 + 1) * (ref.c1 - ref.c0 + 1) > SHARED_GROUP_CAP) return 'large';
+    const address = `${indexToCol(colId)}${rowId + 1}`;
+    const masterText = master.model.formula.startsWith('=') ? master.model.formula.slice(1) : master.model.formula;
+    const view = ctx.view;
+    const out: { r: number; c: number; formula: string; cached: FileValue | null }[] = [];
+    for (let r = ref.r0; r <= Math.min(ref.r1, ctx.ws._rows.length - 1); r++) {
+      const cells = ctx.ws._rows[r]?._cells;
+      if (!cells) continue;
+      for (let c = ref.c0; c <= Math.min(ref.c1, cells.length - 1); c++) {
+        const xv = cells[c]?._value;
+        if (!xv || xv.type !== VT.Formula || xv.model.sharedFormula !== address) continue;
+        const own = view.over.get(cellKey(r, c));
+        if (own && (own.f !== undefined || own.v !== undefined || own.t !== undefined)) continue; // already its own cell
+        out.push({ r, c, formula: translateFormula(masterText, r - rowId, c - colId), cached: this.resultValue(xv.model.result) ?? null });
+      }
+    }
+    return out;
+  }
+
+  /** Style-table index of `base` with number format / wrap changes applied (display only; the file derives its own xf). */
+  deriveStyle(base: number, deltas: readonly StyleDelta[]): number {
+    const from = this.styleTable.styles[base] ?? {};
+    let next: CellStyle | undefined;
+    for (const d of deltas) {
+      if (d.numFmt !== undefined && (d.numFmt === 'General' ? from.numFmt !== undefined : d.numFmt !== from.numFmt)) {
+        next = { ...(next ?? from) };
+        if (d.numFmt === 'General') delete next.numFmt;
+        else next.numFmt = d.numFmt;
+      }
+      if (d.wrap !== undefined && !!(next ?? from).align?.wrap !== d.wrap) {
+        next = { ...(next ?? from), align: { ...(next ?? from).align, wrap: d.wrap } };
+      }
+    }
+    return next ? this.styleTable.add(next) : base;
+  }
+
+  /** Recomputes how far the overlay reaches and, when that changed the used range of the sheet, its meta. true = meta changed. */
+  updateExtent(id: SheetId): boolean {
+    const index = this.sheetById.get(id);
+    const ctx = index === undefined ? undefined : this.sheets[index];
+    const meta = index === undefined ? undefined : this.meta.sheets[index];
+    if (!ctx || !meta) return false;
+    const extent = viewExtent(ctx.view);
+    // The used range grows with edits and goes back when the edit is undone; it never drops below the loaded one.
+    const loaded = ctx.loadedExtent ?? (ctx.loadedExtent = this.loadedUsedRange(ctx));
+    const rowCount = Math.max(loaded.rowCount, extent.rows);
+    const colCount = Math.max(loaded.colCount, extent.cols);
+    if (rowCount === meta.rowCount && colCount === meta.colCount) return false;
+    this.meta.sheets[index as number] = { ...meta, rowCount, colCount };
+    return true;
+  }
+
+  private loadedUsedRange(ctx: SheetContext): { rowCount: number; colCount: number } {
+    const ws = ctx.ws;
+    const props = ws.properties ?? {};
+    const rowPx = typeof props.defaultRowHeight === 'number' && props.defaultRowHeight > 0 ? ptToPx(props.defaultRowHeight) : ptToPx(DEFAULT_ROW_HEIGHT_PT);
+    const colPx = typeof props.defaultColWidth === 'number' && props.defaultColWidth > 0 ? widthToPx(props.defaultColWidth) : DEFAULT_COL_WIDTH_PX;
+    try {
+      return this.usedRange(ws, this.sheetMerges(ws), this.sheetImages(ws), decodeAutoFilter(ws.autoFilter), colPx, rowPx);
+    } catch {
+      return { rowCount: 1, colCount: 1 };
+    }
+  }
+
   getRows(sheet: number, start: number, end: number, c0?: number, c1?: number): { rows: RowData[]; styles: [number, CellStyle][] } {
     const ctx = this.sheets[sheet];
     if (!ctx) {
       return { rows: [], styles: [] };
     }
+    // (v0.2.0) A sheet with edits reads through its view; an unedited one keeps the loop below (identity fast path).
+    if (!viewIsPlain(ctx.view)) return this.getRowsThroughView(ctx, start, end, c0, c1);
     const xrows = ctx.ws._rows;
     const lo = Math.max(0, Math.floor(start) || 0);
     const hi = Math.min(Math.floor(end) || 0, xrows.length, MAX_ROWS);
@@ -3969,6 +4437,132 @@ export class WorkbookModel implements GridSource {
     return { rows, styles: this.styleTable.entries(used) };
   }
 
+  // ----- reading through a sheet view (v0.2.0, EDITING) -----
+
+  /** getRows for a sheet with edits: positions go through the view's maps, the overlay replaces and adds cells. */
+  private getRowsThroughView(ctx: SheetContext, start: number, end: number, c0?: number, c1?: number): { rows: RowData[]; styles: [number, CellStyle][] } {
+    const view = ctx.view;
+    const lo = Math.max(0, Math.floor(start) || 0);
+    const hi = Math.min(Math.floor(end) || 0, viewRowLimit(view), MAX_ROWS);
+    const [colLo, colHi] = columnWindow(c0, c1);
+    // Multi-cell legacy array formulas of the (unmoved) base positions reaching into this window.
+    const arrays = view.contentMap.identity && ctx.arrayRanges.length ? ctx.arrayRanges.filter((a) => a.range.r0 < hi && a.range.r1 >= lo) : [];
+    const rows: RowData[] = [];
+    const used = new Set<number>();
+    for (let r = lo; r < hi; r++) {
+      const rowId = view.contentMap.get(r);
+      const cells: CellData[] = [];
+      this.visitRowCells(ctx, rowId, colLo, colHi, (c, cell, colId, o) => {
+        const data = o ? this.overrideCellData(ctx, cell, rowId, colId, c, o) : cell ? this.safeCellData(cell, rowId, colId, ctx) : undefined;
+        if (data) {
+          data.c = c;
+          if (!o && arrays.length && data.f === undefined) this.markArrayMember(data, r, c, arrays, ctx);
+          cells.push(data);
+          if (data.s) used.add(data.s);
+        }
+        return true;
+      });
+      if (cells.length) rows.push({ r, cells });
+    }
+    return { rows, styles: this.styleTable.entries(used) };
+  }
+
+  /**
+   * Visits the cells of one content row that exist (in the base workbook or in the overlay) with logical column in
+   * [colLo, colHi], ascending. `visit(c, base cell, column id, override)` returns false to stop.
+   */
+  private visitRowCells(
+    ctx: SheetContext,
+    rowId: number,
+    colLo: number,
+    colHi: number,
+    visit: (c: number, cell: XCell | undefined, colId: number, o: CellOverride | undefined) => boolean,
+  ): void {
+    const view = ctx.view;
+    const brow = rowId < NEW_ROW_BASE ? ctx.ws._rows[rowId] : undefined;
+    const extra = view.overRows.get(rowId);
+    if (!brow && !extra) return;
+    const cells = brow?._cells ?? [];
+    if (view.colMap.identity) {
+      // Logical column = column id: the base cells in order, the overlay-only cells merged in.
+      const ex = extra ? [...extra].filter((id) => id >= colLo && id <= colHi && !cells[id]).sort((a, b) => a - b) : [];
+      let k = 0;
+      const last = Math.min(cells.length - 1, colHi);
+      for (let c = colLo; c <= last; c++) {
+        while (k < ex.length && ex[k] < c) {
+          if (!visit(ex[k], undefined, ex[k], view.over.get(cellKey(rowId, ex[k])))) return;
+          k++;
+        }
+        const cell = cells[c];
+        if (!cell) continue; // an overlay-only cell is visited through `ex`
+        const o = extra?.has(c) ? view.over.get(cellKey(rowId, c)) : undefined;
+        if (!visit(c, cell, c, o)) return;
+      }
+      for (; k < ex.length; k++) if (!visit(ex[k], undefined, ex[k], view.over.get(cellKey(rowId, ex[k])))) return;
+      return;
+    }
+    // Moved columns: walk the logical columns (P4 may add an inverse map; only edit-model tests get here before that).
+    const lim = Math.min(colHi, view.colMap.len - 1);
+    for (let c = colLo; c <= lim; c++) {
+      const colId = view.colMap.get(c);
+      const cell = colId < NEW_COL_BASE ? cells[colId] : undefined;
+      const o = extra?.has(colId) ? view.over.get(cellKey(rowId, colId)) : undefined;
+      if ((cell || o) && !visit(c, cell, colId, o)) return;
+    }
+  }
+
+  /** Style index a cell has before any override: its own style, else the row's / column's default for a missing cell. */
+  private baseStyleIndex(ctx: SheetContext, cell: XCell | undefined, rowId: number, colId: number): number {
+    if (cell) return this.styleTable.indexOf(cell.style);
+    const row = rowId < NEW_ROW_BASE ? ctx.ws._rows[rowId] : undefined;
+    if (row && !isStyleEmpty(row.style)) return this.styleTable.indexOf(row.style);
+    const column = colId < NEW_COL_BASE ? ctx.ws._columns?.[colId] : undefined;
+    return column && !isStyleEmpty(column.style) ? this.styleTable.indexOf(column.style) : 0;
+  }
+
+  /** A cell the overlay replaces: its content comes from the override, its style / note from the override / the base cell. */
+  private overrideCellData(ctx: SheetContext, cell: XCell | undefined, rowId: number, colId: number, c: number, o: CellOverride): CellData | undefined {
+    const s = o.s ?? this.baseStyleIndex(ctx, cell, rowId, colId);
+    const fmt = this.styleTable.styles[s].numFmt ?? 'General';
+    let out: CellData;
+    if (o.f !== undefined) {
+      out = o.v === undefined || o.v === null ? { c, t: 's', v: '', w: '' } : this.overrideValueCell(c, o, fmt);
+      // Overrides keep the FILE syntax (_xlfn. prefixes); the grid shows the formula without them, as for loaded cells.
+      out.f = displayFormula(o.f);
+      if (o.calc) out.calc = o.calc;
+      const link = this.normalizeLink(hyperlinkFormulaTarget(out.f));
+      if (link) out.link = link;
+    } else if (o.t === 'z' || o.v === undefined || o.v === null) {
+      out = { c, t: 'z' };
+    } else {
+      out = this.overrideValueCell(c, o, fmt);
+      // A hyperlink stays on its cell when the text is replaced (the link is a property of the cell).
+      const link = cell && cell._value.type === VT.Hyperlink ? this.normalizeLink(cell._value.model.hyperlink) : undefined;
+      if (link) out.link = link;
+    }
+    if (s) out.s = s;
+    const note = ctx.threadedNotes?.get(rowId * MAX_COLS + colId) ?? (cell ? noteText(cell) : undefined);
+    if (note) out.note = note;
+    if (out.t === 'z' && !out.s && !out.note) return undefined;
+    return out;
+  }
+
+  private overrideValueCell(c: number, o: CellOverride, fmt: string): CellData {
+    if (o.t === 'e') return { c, t: 'e', v: String(o.v), w: String(o.v) };
+    return this.valueCell(c, o.v, fmt, undefined);
+  }
+
+  /** Stats contribution of an overridden cell (same meaning as statValue). */
+  private overrideStat(o: CellOverride): StatValue {
+    if (o.f !== undefined) {
+      if (o.t === 'e') return 'error';
+      return typeof o.v === 'number' ? (Number.isFinite(o.v) ? o.v : 'error') : null;
+    }
+    if (o.t === 'z' || o.v === undefined || o.v === null) return undefined;
+    if (o.t === 'e') return 'error';
+    return typeof o.v === 'number' ? (Number.isFinite(o.v) ? o.v : 'error') : null;
+  }
+
   /** A cell inside a multi-cell legacy array formula shows the range's formula, as Excel's formula bar does. */
   private markArrayMember(data: CellData, r: number, c: number, arrays: readonly ArrayFormulaInfo[], ctx: SheetContext): void {
     for (const a of arrays) {
@@ -3991,6 +4585,7 @@ export class WorkbookModel implements GridSource {
     if (!ctx) {
       return acc.result();
     }
+    if (!viewIsPlain(ctx.view)) return this.getStatsThroughView(ctx, ranges, acc);
     const xrows = ctx.ws._rows;
     forEachRangeRow(ranges, xrows.length, MAX_COLS, (r, c0, c1) => {
       const row = xrows[r];
@@ -4016,12 +4611,31 @@ export class WorkbookModel implements GridSource {
     return acc.result((fmt, value) => this.formatter.number(fmt, value));
   }
 
+  /** getStats for a sheet with edits (see getRowsThroughView). */
+  private getStatsThroughView(ctx: SheetContext, ranges: Range[], acc: StatsAccumulator): SelectionStats {
+    const view = ctx.view;
+    forEachRangeRow(ranges, viewRowLimit(view), MAX_COLS, (r, c0, c1) => {
+      let go = true;
+      this.visitRowCells(ctx, view.contentMap.get(r), c0, c1, (_c, cell, _colId, o) => {
+        if (!acc.tick()) return (go = false);
+        acc.add(o ? this.overrideStat(o) : cell ? this.statValue(cell) : undefined);
+        return true;
+      });
+      return go;
+    });
+    if (acc.hasNumbers) {
+      acc.numFmt = this.firstNumberFormat(ctx, ranges);
+    }
+    return acc.result((fmt, value) => this.formatter.number(fmt, value));
+  }
+
   /**
    * Number format of the first numeric cell in the selection's own order (range by range, each one row by row), in
    * which Excel 16 shows Sum / Average / Min / Max: 'D1,D4' with a date in D1 sums as a date, 'D4,D1' as D4's General.
    * Undefined when the search passes the stats' work cap.
    */
   private firstNumberFormat(ctx: SheetContext, ranges: readonly Range[]): string | undefined {
+    if (!viewIsPlain(ctx.view)) return this.firstNumberFormatThroughView(ctx, ranges);
     const xrows = ctx.ws._rows;
     let work = 0;
     for (const g of ranges) {
@@ -4054,6 +4668,43 @@ export class WorkbookModel implements GridSource {
     return undefined;
   }
 
+  private firstNumberFormatThroughView(ctx: SheetContext, ranges: readonly Range[]): string | undefined {
+    const view = ctx.view;
+    const limit = viewRowLimit(view);
+    let work = 0;
+    for (const g of ranges) {
+      if (!g || ![g.r0, g.r1, g.c0, g.c1].every((n) => typeof n === 'number' && Number.isFinite(n))) {
+        continue;
+      }
+      const r1 = Math.min(limit - 1, Math.floor(Math.max(g.r0, g.r1)));
+      const c0 = Math.max(0, Math.floor(Math.min(g.c0, g.c1)));
+      const c1 = Math.min(MAX_COLS - 1, Math.floor(Math.max(g.c0, g.c1)));
+      for (let r = Math.max(0, Math.floor(Math.min(g.r0, g.r1))); r <= r1; r++) {
+        if (++work > STATS_CELL_CAP) {
+          return undefined;
+        }
+        const rowId = view.contentMap.get(r);
+        let found: string | undefined;
+        this.visitRowCells(ctx, rowId, c0, c1, (_c, cell, colId, o) => {
+          if (++work > STATS_CELL_CAP) return false;
+          if (o) {
+            if (this.overrideStat(o) !== undefined && typeof this.overrideStat(o) === 'number') {
+              found = this.styleTable.styles[o.s ?? this.baseStyleIndex(ctx, cell, rowId, colId)].numFmt ?? 'General';
+              return false;
+            }
+          } else if (cell && typeof this.statValue(cell) === 'number') {
+            found = this.statNumFmt(cell);
+            return false;
+          }
+          return true;
+        });
+        if (found !== undefined) return found;
+        if (work > STATS_CELL_CAP) return undefined;
+      }
+    }
+    return undefined;
+  }
+
   // ----- sheet meta -----
 
   /** Sheet meta; a sheet with unexpected data degrades to a plain grid instead of failing the workbook. */
@@ -4068,6 +4719,7 @@ export class WorkbookModel implements GridSource {
       });
       return {
         index: ctx.index,
+        id: ctx.id,
         name: String(ws.name ?? `Sheet${ctx.index + 1}`),
         state: ws.state === 'hidden' || ws.state === 'veryHidden' ? ws.state : 'visible',
         rowCount: Math.max(1, ws._rows?.length ?? 0),
@@ -4095,9 +4747,15 @@ export class WorkbookModel implements GridSource {
     const merges = this.sheetMerges(ws);
     const images = this.sheetImages(ws);
     const autoFilter = decodeAutoFilter(ws.autoFilter);
-    const { rowCount, colCount } = this.usedRange(ws, merges, images, autoFilter, defaultColWidth, defaultRowHeight);
+    const used = this.usedRange(ws, merges, images, autoFilter, defaultColWidth, defaultRowHeight);
+    ctx.loadedExtent = used;
+    // Edited cells beyond the loaded used range extend it (the overlay of EDITING).
+    const extent = viewExtent(ctx.view);
+    const rowCount = Math.max(used.rowCount, extent.rows);
+    const colCount = Math.max(used.colCount, extent.cols);
     const meta: SheetMeta = {
       index: ctx.index,
+      id: ctx.id,
       name: ws.name,
       state: ws.state === 'hidden' || ws.state === 'veryHidden' ? ws.state : 'visible',
       rowCount,
@@ -4738,6 +5396,21 @@ export class WorkbookModel implements GridSource {
       return undefined;
     }
     const values: string[] = [];
+    if (!viewIsPlain(target.view)) {
+      // A source sheet with edits: the cells as the grid shows them now.
+      const tv = target.view;
+      const limit = Math.min(range.r1 + 1, viewRowLimit(tv));
+      for (let r = range.r0; r < limit && values.length < LIST_VALUES_CAP; r++) {
+        const rowId = tv.contentMap.get(r);
+        this.visitRowCells(target, rowId, range.c0, range.c1, (c, cell, colId, o) => {
+          const data = o ? this.overrideCellData(target, cell, rowId, colId, c, o) : cell ? this.safeCellData(cell, rowId, colId, target) : undefined;
+          const display = data && data.t !== 'z' ? data.w ?? String(data.v ?? '') : '';
+          if (display !== '') values.push(display);
+          return values.length < LIST_VALUES_CAP;
+        });
+      }
+      return values;
+    }
     const xrows = target.ws._rows;
     const lastRow = Math.min(range.r1, xrows.length - 1);
     for (let r = range.r0; r <= lastRow && values.length < LIST_VALUES_CAP; r++) {
@@ -4893,6 +5566,844 @@ function normalizeCfvo(cfvo: XCfvo | undefined): CfValueObject {
 
 function clampInt(value: unknown, min: number, max: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(min, Math.min(max, Math.round(value))) : min;
+}
+
+// ===== EDITING =====
+// (v0.2.0, P2) Cell editing of xlsx workbooks in the extension host: the model, not the file. An edit is planned
+// (planEdit: checks, one Edit with the file operations it needs), applied to the display model (applyEdit, also redo)
+// and taken back (invertEdit). The ExcelJS model is never changed: every sheet has a VIEW over it - position -> id maps
+// and a cell overlay - so undo restores exactly what an edit replaced (ids and overlay entries), nothing is copied.
+// Sections: ids and index maps, sheet views, cell input (what a typed text means), plan, apply / invert.
+// P4 adds structure, sort, styles and sheet operations as sub-sections at the end; P5 recalculation results.
+// Not built here: SheetView.objects / .formulas and UndoData.formulas / .objects / .sheets (P4 adds them, additive).
+
+// ----- ids and index maps -----
+
+/** Row ids of rows that were not in the loaded sheet (inserted rows) start here; loaded rows keep their index as id. */
+const NEW_ROW_BASE = 2 ** 21;
+/** Column ids of inserted columns start here (a sheet has at most 16,384 columns). */
+const NEW_COL_BASE = MAX_COLS;
+const CELL_KEY_COLS = 2 ** 18;
+
+/** Overlay key of a cell: rowId * 2**18 + colId (below 2**53; for a loaded cell (rowId, colId) is its base position). */
+export function cellKey(rowId: number, colId: number): number {
+  return rowId * CELL_KEY_COLS + colId;
+}
+
+/** A run of consecutive ids ({s, n}: s, s+1, ...) or an explicit list. */
+export type IndexPiece = { s: number; n: number } | { ids: Int32Array };
+
+const pieceLen = (pc: IndexPiece): number => ('ids' in pc ? pc.ids.length : pc.n);
+
+/**
+ * Logical position -> stable id, as pieces (identity runs or explicit id lists): moving rows costs a few pieces, not a
+ * million numbers. splice returns the removed pieces: that is the whole undo data of an insert / delete / sort.
+ */
+export class IndexMap {
+  pieces: IndexPiece[];
+  /** Number of positions. */
+  len: number;
+  private pre: Float64Array | null = null;
+
+  constructor(n: number) {
+    this.pieces = n > 0 ? [{ s: 0, n }] : [];
+    this.len = n;
+  }
+
+  /** Position p holds id p everywhere (nothing moved): readers use their plain loops. */
+  get identity(): boolean {
+    const pc = this.pieces.length === 1 ? this.pieces[0] : undefined;
+    return !!pc && !('ids' in pc) && pc.s === 0 && pc.n === this.len;
+  }
+
+  private prefix(): Float64Array {
+    if (this.pre) return this.pre;
+    const pre = new Float64Array(this.pieces.length + 1);
+    for (let i = 0; i < this.pieces.length; i++) pre[i + 1] = pre[i] + pieceLen(this.pieces[i]);
+    return (this.pre = pre);
+  }
+
+  /** Id at position p. */
+  get(p: number): number {
+    if (!Number.isInteger(p) || p < 0 || p >= this.len) throw new RangeError(`IndexMap: position ${p} outside 0..${this.len - 1}`);
+    if (this.pieces.length === 1) {
+      const only = this.pieces[0];
+      return 'ids' in only ? only.ids[p] : only.s + p;
+    }
+    const pre = this.prefix();
+    let lo = 0;
+    let hi = this.pieces.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (pre[mid] <= p) lo = mid;
+      else hi = mid - 1;
+    }
+    const pc = this.pieces[lo];
+    const off = p - pre[lo];
+    return 'ids' in pc ? pc.ids[off] : pc.s + off;
+  }
+
+  /** Splits so that a piece boundary exists at p; returns the index of the piece starting at p. */
+  private cut(p: number): number {
+    const pre = this.prefix();
+    let i = 0;
+    while (i < this.pieces.length && pre[i + 1] <= p) i++;
+    if (i >= this.pieces.length || pre[i] === p) return i;
+    const pc = this.pieces[i];
+    const off = p - pre[i];
+    const a: IndexPiece = 'ids' in pc ? { ids: pc.ids.subarray(0, off) } : { s: pc.s, n: off };
+    const b: IndexPiece = 'ids' in pc ? { ids: pc.ids.subarray(off) } : { s: pc.s + off, n: pc.n - off };
+    this.pieces.splice(i, 1, a, b);
+    this.pre = null;
+    return i + 1;
+  }
+
+  /** Removes [p, p + count) and puts `insert` there. Returns the removed pieces (the undo data). */
+  splice(p: number, count: number, insert: readonly IndexPiece[]): IndexPiece[] {
+    if (!Number.isInteger(p) || !Number.isInteger(count) || p < 0 || count < 0 || p + count > this.len) throw new RangeError(`IndexMap: splice(${p}, ${count}) outside 0..${this.len}`);
+    const i = this.cut(p);
+    const j = this.cut(p + count);
+    const removed = this.pieces.splice(i, j - i, ...insert);
+    this.len += insert.reduce((n, pc) => n + pieceLen(pc), 0) - count;
+    this.pre = null;
+    this.coalesce(Math.max(0, i - 1), i + insert.length + 1);
+    return removed;
+  }
+
+  /** Joins neighbouring identity runs ({s, n} + {s + n, m}) in [from, to): undoing an insert gives back one piece. */
+  private coalesce(from: number, to: number): void {
+    for (let i = Math.min(to, this.pieces.length - 1); i > from; i--) {
+      const a = this.pieces[i - 1];
+      const b = this.pieces[i];
+      if (!('ids' in a) && !('ids' in b) && a.s + a.n === b.s) {
+        this.pieces.splice(i - 1, 2, { s: a.s, n: a.n + b.n });
+        this.pre = null;
+      } else if (pieceLen(b) === 0) {
+        this.pieces.splice(i, 1);
+        this.pre = null;
+      }
+    }
+  }
+
+  /** Explicit ids of positions [p0, p1]. */
+  ids(p0: number, p1: number): Int32Array {
+    const out = new Int32Array(p1 - p0 + 1);
+    for (let p = p0; p <= p1; p++) out[p - p0] = this.get(p);
+    return out;
+  }
+}
+
+// ----- sheet views -----
+
+/** What the overlay says about one cell: replaces the loaded cell's content (and style, when `s` is set). */
+export interface CellOverride {
+  /** Value (a number, text, boolean; for t 'e' the error text). Absent with `f`: the formula's result is not known. */
+  v?: string | number | boolean | null;
+  /** 'z' = cleared (contents gone, style kept); 'e' = error value; 'n' | 's' | 'b' = the type of `v`. */
+  t?: CellType;
+  /** Formula in FILE syntax (_xlfn. prefixes), without '='. */
+  f?: string;
+  /** Style-table index when the edit changed the style (a number format preset); absent = the cell's own style. */
+  s?: number;
+  /** Recalc state of a formula cell (P5): until a result is calculated a new formula is 'stale'. */
+  calc?: 'stale' | 'unsupported' | 'circular';
+}
+
+/** One sheet of a WorkbookModel: ids of what is where, and the cells the user changed. */
+export interface SheetView {
+  id: SheetId;
+  ws: XWorksheet;
+  /** Row position -> row id (row properties follow this). */
+  rowMap: IndexMap;
+  /** Row position -> content row id (the cells of a row follow this one; a sort changes only this). */
+  contentMap: IndexMap;
+  /** Column position -> column id. */
+  colMap: IndexMap;
+  /** Cells changed by edits, by cellKey(rowId, colId). Entries are replaced, never changed in place. */
+  over: Map<number, CellOverride>;
+  /** rowId -> column ids with an override (derived from `over`; setOverride keeps it in step). */
+  overRows: Map<number, Set<number>>;
+  /** Largest row id ever in `over`: how far reads must look beyond the loaded rows. */
+  maxOverRowId: number;
+}
+
+function newSheetView(id: SheetId, ws: XWorksheet): SheetView {
+  return { id, ws, rowMap: new IndexMap(MAX_ROWS), contentMap: new IndexMap(MAX_ROWS), colMap: new IndexMap(MAX_COLS), over: new Map(), overRows: new Map(), maxOverRowId: -1 };
+}
+
+/** Nothing moved, nothing replaced: the loaded loops are exact (identity fast path of getRows / getStats). */
+function viewIsPlain(view: SheetView): boolean {
+  return view.over.size === 0 && view.rowMap.identity && view.contentMap.identity && view.colMap.identity;
+}
+
+/** Rows a reader has to look at: the loaded rows, and further down the rows of overlay cells. */
+function viewRowLimit(view: SheetView): number {
+  return view.contentMap.identity ? Math.min(MAX_ROWS, Math.max(view.ws._rows.length, view.maxOverRowId + 1)) : MAX_ROWS;
+}
+
+/** The only place that changes `over` (and its row index): set an entry, or remove it (undefined). */
+function setOverride(view: SheetView, rowId: number, colId: number, o: CellOverride | undefined): void {
+  const key = cellKey(rowId, colId);
+  if (o === undefined) {
+    if (!view.over.delete(key)) return;
+    const cols = view.overRows.get(rowId);
+    if (cols) {
+      cols.delete(colId);
+      if (!cols.size) view.overRows.delete(rowId);
+    }
+    return;
+  }
+  view.over.set(key, o);
+  let cols = view.overRows.get(rowId);
+  if (!cols) view.overRows.set(rowId, (cols = new Set()));
+  cols.add(colId);
+  if (rowId > view.maxOverRowId) view.maxOverRowId = rowId;
+}
+
+/** Used range the overlay adds: rows / columns up to the last overlay cell that has content or a style (loaded ids = positions). */
+function viewExtent(view: SheetView): { rows: number; cols: number } {
+  let rows = 0;
+  let cols = 0;
+  if (!view.contentMap.identity || !view.colMap.identity) return { rows, cols };
+  for (const [key, o] of view.over) {
+    const filled = (o.t !== undefined && o.t !== 'z' && o.v !== undefined && o.v !== null) || o.f !== undefined || !!o.s;
+    if (!filled) continue;
+    const rowId = Math.floor(key / CELL_KEY_COLS);
+    const colId = key - rowId * CELL_KEY_COLS;
+    if (rowId + 1 > rows) rows = rowId + 1;
+    if (colId + 1 > cols) cols = colId + 1;
+  }
+  return { rows, cols };
+}
+
+/**
+ * 's' + the sheetId attribute (ExcelJS: worksheet.id). A missing / repeated / invalid id gets a fresh one so every sheet
+ * still has a unique id, and `problem` says why edits are refused.
+ */
+function assignSheetIds(worksheets: readonly XWorksheet[]): { ids: SheetId[]; problem: string | undefined } {
+  const seen = new Set<number>();
+  let max = 0;
+  for (const ws of worksheets) if (typeof ws.id === 'number' && Number.isInteger(ws.id) && ws.id > max) max = ws.id;
+  let problem: string | undefined;
+  const ids = worksheets.map((ws) => {
+    let n = ws.id;
+    if (typeof n !== 'number' || !Number.isInteger(n) || n < 1 || seen.has(n)) {
+      problem = 'Two sheets of this workbook have the same internal id, so FileStudio cannot tell them apart safely. The workbook is read-only.';
+      n = ++max;
+    }
+    seen.add(n);
+    return `s${n}`;
+  });
+  return { ids, problem };
+}
+
+/** Rectangles with a lookup by cell (loaded merges): 256-row buckets, rectangles taller than 4,096 rows on a side list. */
+interface RangeIndex {
+  buckets: Map<number, Range[]>;
+  tall: Range[];
+}
+
+function buildRangeIndex(list: readonly Range[]): RangeIndex {
+  const idx: RangeIndex = { buckets: new Map(), tall: [] };
+  for (const g of list) {
+    if (g.r1 - g.r0 > 4096) {
+      idx.tall.push(g);
+      continue;
+    }
+    for (let b = g.r0 >> 8; b <= g.r1 >> 8; b++) {
+      const bucket = idx.buckets.get(b);
+      if (bucket) bucket.push(g);
+      else idx.buckets.set(b, [g]);
+    }
+  }
+  return idx;
+}
+
+function findInRangeIndex(idx: RangeIndex, r: number, c: number): Range | undefined {
+  const inside = (g: Range): boolean => r >= g.r0 && r <= g.r1 && c >= g.c0 && c <= g.c1;
+  return idx.buckets.get(r >> 8)?.find(inside) ?? idx.tall.find(inside);
+}
+
+/** A table of the loaded sheet (ExcelJS keeps its model in `table`). */
+interface LoadedTable {
+  name: string;
+  range: Range;
+  header: boolean;
+  totals: boolean;
+}
+
+function loadedTables(ws: XWorksheet): LoadedTable[] {
+  const out: LoadedTable[] = [];
+  const tables = (ws as { tables?: Record<string, { table?: { name?: string; tableRef?: string; ref?: string; headerRow?: boolean; totalsRow?: boolean } } | undefined> }).tables;
+  for (const name in tables ?? {}) {
+    const t = tables?.[name]?.table;
+    const range = typeof t?.tableRef === 'string' ? decodeRange(t.tableRef) : typeof t?.ref === 'string' ? decodeRange(t.ref) : undefined;
+    // ExcelJS sets headerRow = (headerRowCount === '1'), so a table without the attribute (OOXML default: 1 header row) reads as
+    // "no header". The header row is always treated as there (safe: a header-less table only loses edits of its first row).
+    if (t && range) out.push({ name: t.name ?? name, range, header: true, totals: t.totalsRow === true });
+  }
+  return out;
+}
+
+/** Plain text of an ExcelJS rich-text value. */
+function richTextPlain(value: unknown): string {
+  const runs = (value as { richText?: { text?: unknown }[] } | undefined)?.richText;
+  return Array.isArray(runs) ? runs.map((r) => (typeof r?.text === 'string' ? r.text : '')).join('') : '';
+}
+
+/** Most cells a shared-formula group may span to be separated in one edit (a bigger group is refused). */
+const SHARED_GROUP_CAP = 2_000_000;
+
+// ----- types of edits -----
+
+/** What planEdit knows about one cell (positions are logical; ids are what the overlay uses). */
+export interface CellState {
+  rowId: number;
+  colId: number;
+  key: number;
+  override: CellOverride | undefined;
+  /** Effective content (undefined = empty); a formula cell: its cached result. */
+  value: FileValue | undefined;
+  /** Effective formula in FILE syntax (a shared formula's clones expanded), undefined = no formula. */
+  formula: string | undefined;
+  /** Effective style-table index and its number format ('General' when none) / wrap flag. */
+  style: number;
+  numFmt: string;
+  wrap: boolean;
+  /** The cell is locked (matters on a protected sheet). */
+  locked: boolean;
+  /** The cell is the master of a shared formula that is still shared (no overlay entry yet). */
+  sharedMaster: boolean;
+  hasHyperlink: boolean;
+}
+
+/** One user action = one Edit = one journal entry = one VS Code undo step (contract §2.2). */
+export interface Edit {
+  /** The state id this edit produces; the document assigns it when it commits (planEdit leaves 0). */
+  id: number;
+  kind: EditKind;
+  sheetId: SheetId | null;
+  /** The cells the edit touches (logical positions at edit time). */
+  range: Range | null;
+  /** VS Code undo label, e.g. "Edit B4". */
+  label: string;
+  /** Positions moved (rows / columns / sheets / sort) or merge / unmerge: bumps structureVersion. false for cell edits. */
+  structural: boolean;
+  /**
+   * What the file needs, positions at edit time. Convention for `cells` edits: operations before the last one are
+   * file-only fixes (separating a shared formula); the LAST operation holds the cells the user changed, and the display
+   * (applyEdit) is derived from it.
+   */
+  after: { ops: PackageOp[]; newIds?: { rows?: [number, number]; cols?: [number, number]; sheet?: number } };
+  /** Display-only restore data, filled by the first applyEdit; never written to the file. */
+  before?: UndoData;
+}
+
+/** Only what an edit changed (compact). P4 adds formulas / objects / sheets. */
+export interface UndoData {
+  /** Overlay entries before the edit (undefined = there was none). */
+  cells?: [key: number, prev: CellOverride | undefined][];
+  /** Index map pieces an edit replaced (structure, sort: P4). */
+  maps?: { axis: 'rows' | 'content' | 'cols'; at: number; removed: IndexPiece[]; insertedCount: number }[];
+}
+
+/** The rows whose display changed: logical rows [start, end) of the sheet; `meta`: the sheet's meta changed (used range). */
+export interface RowsChange {
+  sheetId: SheetId | null;
+  rows?: [start: number, end: number];
+  structural: boolean;
+  meta: boolean;
+}
+
+/** What planEdit answers: an Edit, or why there is none. */
+export type PlanResult = Edit | { blocked: BlockReason[] } | { invalid: string } | { noop: true };
+
+export const EDIT_TOO_LARGE_TEXT = 'This change is too large (max 1,000,000 cells).';
+export const EDIT_NOT_AVAILABLE_TEXT = 'This action is not available yet.';
+const EDIT_UNKNOWN_SHEET_TEXT = 'This sheet is no longer in the workbook.';
+const EDIT_BAD_REQUEST_TEXT = 'This change is not valid.';
+const EDIT_BAD_TEXT = 'The text contains a character Excel cannot store.';
+const MAX_EDIT_CELLS = 1_000_000;
+const MAX_CELL_TEXT = 32_767;
+const MAX_EDIT_CHARS = 16 * 1024 * 1024;
+const MAX_CLEAR_RANGES = 1000;
+
+// ----- cell input -----
+// What a typed text means (en-US, contract §5.2). Anything not recognised stays text: a text is never changed into a
+// number by a guess, and a number with more than 15 significant digits stays text (Excel would round it silently).
+
+/** Result of parseCellInput. */
+export type CellInput =
+  | { kind: 'empty' }
+  /** `quotePrefix`: typed with a leading apostrophe (stored text, the apostrophe is not part of it). */
+  | { kind: 'text'; text: string; quotePrefix: boolean }
+  /** `numFmt`: preset applied when the cell is General (percent, currency, grouping, date, time). */
+  | { kind: 'number'; value: number; numFmt?: string }
+  | { kind: 'boolean'; value: boolean }
+  | { kind: 'error'; value: string }
+  /** '=' + more: `body` is what follows the '='; checkFormulaInput decides whether it is acceptable. */
+  | { kind: 'formula'; body: string };
+
+const ERROR_LITERALS: ReadonlySet<string> = new Set(['#NULL!', '#DIV/0!', '#VALUE!', '#REF!', '#NAME?', '#NUM!', '#N/A']);
+const NUMBER_RE = /^(\()?([+-])?(\$)?([+-])?((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)([eE][+-]?\d+)?(%)?(\))?$/;
+const ISO_DATE_RE = /^(\d{4})-(\d{1,2})-(\d{1,2})$/;
+const US_DATE_RE = /^(\d{1,2})\/(\d{1,2})\/(\d{4}|\d{2})$/;
+const TIME_RE = /^(\d{1,2}):(\d{2})(?::(\d{2})(\.\d{1,3})?)?(?:\s?([AaPp][Mm]))?$/;
+
+/** Does the number format show a percent (a % outside quotes, escapes and [..] codes, first section)? */
+export function isPercentFormat(fmt: string | undefined): boolean {
+  if (!fmt) return false;
+  const first = fmt.replace(/"[^"]*"|\\.|\[[^\]]*\]/g, '').split(';')[0];
+  return first.includes('%');
+}
+
+/**
+ * Cell text -> what to store. `cell.numFmt` is the number format of the cell ('General' / undefined = General, '@' = Text).
+ * `cell.autoPercent`: typed into a cell (not pasted); Excel's automatic percent entry then reads a plain number of 1 or
+ * more in a percent-formatted cell as a percent (5 -> 5%, 0.25 stays 25%).
+ * Pure; no knowledge of the workbook beyond that and the date system.
+ */
+export function parseCellInput(text: string, cell: { numFmt?: string; date1904?: boolean; autoPercent?: boolean } = {}): CellInput {
+  if (text === '') return { kind: 'empty' };
+  const fmt = cell.numFmt ?? 'General';
+  if (fmt === '@') return { kind: 'text', text, quotePrefix: false };
+  if (text.startsWith("'")) return text.length === 1 ? { kind: 'empty' } : { kind: 'text', text: text.slice(1), quotePrefix: true };
+  if (text.startsWith('=') && text.length > 1) return { kind: 'formula', body: text.slice(1) };
+  const t = text.trim();
+  if (t === '') return { kind: 'text', text, quotePrefix: false };
+  if (/^(true|false)$/i.test(t)) return { kind: 'boolean', value: t.toLowerCase() === 'true' };
+  const upper = t.toUpperCase();
+  if (upper.startsWith('#') && ERROR_LITERALS.has(upper)) return { kind: 'error', value: upper };
+  const num = parseNumberText(t);
+  if (num && cell.autoPercent && isPercentFormat(fmt) && (!num.numFmt || num.numFmt.startsWith('#,##0')) && Math.abs(num.value) >= 1) {
+    const scaled = Number(`${num.value}e-2`);
+    return { kind: 'number', value: Number.isFinite(scaled) ? scaled : num.value / 100 };
+  }
+  if (num) return { kind: 'number', value: num.value, ...(num.numFmt ? { numFmt: num.numFmt } : {}) };
+  const when = parseDateTimeText(t, !!cell.date1904);
+  if (when) return { kind: 'number', value: when.value, numFmt: when.numFmt };
+  return { kind: 'text', text, quotePrefix: false };
+}
+
+function parseNumberText(t: string): { value: number; numFmt?: string } | undefined {
+  const m = NUMBER_RE.exec(t);
+  if (!m) return undefined;
+  const [, open, sign1, currency, sign2, body, exp, percent, close] = m;
+  if (!!open !== !!close || (sign1 && sign2) || (open && (sign1 || sign2))) return undefined;
+  if (currency && exp) return undefined;
+  const grouped = body.includes(',');
+  if (grouped && exp) return undefined;
+  const mantissa = body.replace(/,/g, '');
+  // Excel keeps 15 significant digits and writes zeros for the rest: such a number stays text here, so no digit is lost.
+  if (mantissa.replace('.', '').replace(/^0+/, '').replace(/0+$/, '').length > 15) return undefined;
+  const power = exp ? parseInt(exp.slice(1), 10) : 0;
+  let value = Number(`${mantissa}e${power - (percent ? 2 : 0)}`);
+  if (!Number.isFinite(value)) return undefined;
+  if (open || sign1 === '-' || sign2 === '-') value = -value;
+  if (value === 0) value = 0; // no negative zero
+  const decimals = body.includes('.') ? body.length - body.indexOf('.') - 1 : 0;
+  let numFmt: string | undefined;
+  if (percent) numFmt = decimals ? '0.00%' : '0%';
+  else if (currency) numFmt = decimals ? '"$"#,##0.00' : '"$"#,##0';
+  else if (grouped) numFmt = decimals ? '#,##0.00' : '#,##0';
+  return { value, ...(numFmt ? { numFmt } : {}) };
+}
+
+/** Days from 1899-12-30 for a valid calendar date; undefined when the date does not exist. 1900-02-29 is Excel's fake day 60. */
+function excelDateSerial(y: number, mo: number, d: number, date1904: boolean): number | undefined {
+  if (y < 1900 || y > 9999 || mo < 1 || mo > 12 || d < 1 || d > 31) return undefined;
+  if (y === 1900 && mo === 2 && d === 29) return date1904 ? undefined : 60;
+  const ms = Date.UTC(2000, mo - 1, d);
+  const date = new Date(ms);
+  date.setUTCFullYear(y);
+  if (date.getUTCFullYear() !== y || date.getUTCMonth() !== mo - 1 || date.getUTCDate() !== d) return undefined;
+  const days = Math.round(date.getTime() / MS_PER_DAY) + 25569; // 1970-01-01 = 25569
+  const serial = days < 61 ? days - 1 : days; // before 1900-03-01 Excel's 1900 system skips the fake Feb 29
+  if (date1904) return serial - DATE1904_OFFSET >= 0 ? serial - DATE1904_OFFSET : undefined;
+  return serial;
+}
+
+function parseDateTimeText(t: string, date1904: boolean): { value: number; numFmt: string } | undefined {
+  let datePart = t;
+  let timePart: string | undefined;
+  const split = /^(\S+?)(?:[ T](\d{1,2}:\d{2}.*))?$/.exec(t);
+  if (split) {
+    datePart = split[1];
+    timePart = split[2];
+  }
+  let serial: number | undefined;
+  if (timePart === undefined && TIME_RE.test(t)) {
+    const time = parseTimeText(t);
+    return time ? { value: time.fraction, numFmt: time.numFmt } : undefined;
+  }
+  const iso = ISO_DATE_RE.exec(datePart);
+  const us = iso ? null : US_DATE_RE.exec(datePart);
+  if (iso) serial = excelDateSerial(+iso[1], +iso[2], +iso[3], date1904);
+  else if (us) {
+    let y = +us[3];
+    if (us[3].length === 2) y += y < 30 ? 2000 : 1900;
+    serial = excelDateSerial(y, +us[1], +us[2], date1904);
+  }
+  if (serial === undefined) return undefined;
+  if (timePart === undefined) return { value: serial, numFmt: BUILTIN_NUMFMTS[14] };
+  const time = parseTimeText(timePart);
+  return time ? { value: serial + time.fraction, numFmt: BUILTIN_NUMFMTS[22] } : undefined;
+}
+
+function parseTimeText(t: string): { fraction: number; numFmt: string } | undefined {
+  const m = TIME_RE.exec(t);
+  if (!m) return undefined;
+  let hour = +m[1];
+  const minute = +m[2];
+  const second = m[3] === undefined ? 0 : +m[3] + (m[4] ? Number(m[4]) : 0);
+  const ampm = m[5]?.toUpperCase();
+  if (ampm) {
+    if (hour < 1 || hour > 12) return undefined;
+    hour = (hour % 12) + (ampm === 'PM' ? 12 : 0);
+  }
+  if (hour > 23 || minute > 59 || second >= 60) return undefined;
+  const numFmt = ampm ? (m[3] === undefined ? BUILTIN_NUMFMTS[18] : BUILTIN_NUMFMTS[19]) : m[3] === undefined ? BUILTIN_NUMFMTS[20] : BUILTIN_NUMFMTS[21];
+  return { fraction: (hour * 3600 + minute * 60 + second) / 86400, numFmt };
+}
+
+// ----- plan -----
+
+/** Where the blocks of one edit are collected: one BlockReason per code and message, `where` capped at 12 (+ "+N more"). */
+class BlockCollector {
+  private readonly byKey = new Map<string, { code: BlockReason['code']; message: string; where: string[]; more: number }>();
+
+  add(code: BlockReason['code'], message: string, where: string): void {
+    const key = `${code}\n${message}`;
+    let entry = this.byKey.get(key);
+    if (!entry) this.byKey.set(key, (entry = { code, message, where: [], more: 0 }));
+    if (entry.where.length < 12) entry.where.push(where);
+    else entry.more++;
+  }
+
+  get any(): boolean {
+    return this.byKey.size > 0;
+  }
+
+  result(): BlockReason[] {
+    return [...this.byKey.values()].map((e) => ({ code: e.code, message: e.message, where: e.more ? [...e.where, `+${e.more} more`] : e.where }));
+  }
+}
+
+const rangeText = (g: Range): string => (g.r0 === g.r1 && g.c0 === g.c1 ? `${indexToCol(g.c0)}${g.r0 + 1}` : `${indexToCol(g.c0)}${g.r0 + 1}:${indexToCol(g.c1)}${g.r1 + 1}`);
+
+/** Plans one edit; changes nothing (except that the style table may learn a derived style). See PlanResult. */
+export function planEdit(m: WorkbookModel, i: EditIntent): PlanResult {
+  if (i.kind !== 'setCells' && i.kind !== 'clear') return { blocked: [{ code: 'unsupported', message: EDIT_NOT_AVAILABLE_TEXT, where: [] }] };
+  if (m.sheetIndexOf(i.sheetId) < 0) return { invalid: EDIT_UNKNOWN_SHEET_TEXT };
+  if (m.idProblem) return { blocked: [{ code: 'unsupported', message: m.idProblem, where: [] }] };
+  return i.kind === 'setCells' ? planSetCells(m, i) : planClear(m, i);
+}
+
+/** The blocks that apply to a value edit of one cell (array, table, protected sheet, host facts), added to `blocks`; true = the cell is blocked. */
+function blockCell(m: WorkbookModel, sheetId: SheetId, sheetName: string, protectedSheet: boolean, r: number, c: number, st: CellState, blocks: BlockCollector): boolean {
+  let hit = false;
+  const where = (): string => `${quoteSheetForRef(sheetName)}!${indexToCol(c)}${r + 1}`;
+  const array = m.arrayRangeAt(sheetId, st.rowId, st.colId);
+  if (array) {
+    blocks.add('array', `This cell is part of an array formula (${rangeText(array)}). Edit it in Excel.`, where());
+    hit = true;
+  }
+  const table = m.tableCellAt(sheetId, r, c);
+  if (table) {
+    blocks.add('table', `${indexToCol(c)}${r + 1} is part of the ${table.part === 'header' ? 'header row' : 'totals row'} of table “${table.name}”. Change it in Excel.`, where());
+    hit = true;
+  }
+  if (protectedSheet && st.locked) {
+    blocks.add('protected', 'The sheet is protected in Excel.', where());
+    hit = true;
+  }
+  const extra = m.extraCellBlock?.(sheetId, r, c);
+  if (extra) {
+    blocks.add('unsupported', extra, where());
+    hit = true;
+  }
+  return hit;
+}
+
+/** File operations that separate a shared formula whose master is about to change: every other cell gets its own <f>. */
+function separateSharedFormula(m: WorkbookModel, sheetId: SheetId, st: CellState, r: number, c: number, blocks: BlockCollector, into: Map<number, [number, number, CellPatch]>): void {
+  const clones = m.sharedClones(sheetId, st.rowId, st.colId);
+  if (clones === undefined) return;
+  if (clones === 'large') {
+    blocks.add('unsupported', 'This shared formula covers too many cells to change safely here. Edit it in Excel.', `${indexToCol(c)}${r + 1}`);
+    return;
+  }
+  for (const k of clones) {
+    // A translation that leaves the grid (#REF!) is not what Excel computes for the clone: refuse instead of writing it.
+    if (k.formula.includes('#REF!')) {
+      blocks.add('unsupported', 'A formula copied from this one cannot be separated safely here. Edit it in Excel.', `${indexToCol(k.c)}${k.r + 1}`);
+      return;
+    }
+    into.set(cellKey(k.r, k.c), [k.r, k.c, { formula: k.formula, cached: k.cached }]);
+  }
+}
+
+function sheetNumber(id: SheetId): number {
+  return Number(id.slice(1));
+}
+
+function boxOf(cells: readonly [number, number, unknown][]): Range {
+  let r0 = Infinity;
+  let r1 = -1;
+  let c0 = Infinity;
+  let c1 = -1;
+  for (const [r, c] of cells) {
+    if (r < r0) r0 = r;
+    if (r > r1) r1 = r;
+    if (c < c0) c0 = c;
+    if (c > c1) c1 = c;
+  }
+  return { r0, c0, r1, c1 };
+}
+
+function sortedCells<T extends [number, number, unknown]>(cells: Iterable<T>): T[] {
+  return [...cells].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+}
+
+function planSetCells(m: WorkbookModel, i: Extract<EditIntent, { kind: 'setCells' }>): PlanResult {
+  const sheetId = i.sheetId;
+  const cells = i.cells;
+  if (!Array.isArray(cells)) return { invalid: EDIT_BAD_REQUEST_TEXT };
+  if (cells.length === 0) return { noop: true };
+  if (cells.length > MAX_EDIT_CELLS) return { invalid: EDIT_TOO_LARGE_TEXT };
+  const multi = cells.length > 1;
+  const date1904 = m.usesDate1904;
+  const names = m.sheetNames();
+  const sheetName = names[m.sheetIndexOf(sheetId)];
+  const protectedSheet = m.sheetProtected(sheetId);
+  const blocks = new BlockCollector();
+  const planned = new Map<number, [number, number, CellPatch]>();
+  const separated = new Map<number, [number, number, CellPatch]>();
+  const separatedMasters = new Set<number>();
+  const formulas = new Map<string, FormulaCheck>();
+  let chars = 0;
+  for (const entry of multi ? lastWriteWins(cells) : cells) {
+    if (!Array.isArray(entry) || entry.length !== 3 || typeof entry[2] !== 'string') return { invalid: EDIT_BAD_REQUEST_TEXT };
+    let [r, c] = entry;
+    const text = entry[2].includes('\r') ? entry[2].replace(/\r\n?/g, '\n') : entry[2];
+    if (!Number.isInteger(r) || !Number.isInteger(c) || r < 0 || c < 0 || r >= MAX_ROWS || c >= MAX_COLS) return { invalid: EDIT_BAD_REQUEST_TEXT };
+    if (text.length > MAX_CELL_TEXT) return { invalid: `This text is too long for a cell (max ${MAX_CELL_TEXT.toLocaleString('en-US')} characters).` };
+    if ((chars += text.length) > MAX_EDIT_CHARS) return { invalid: EDIT_TOO_LARGE_TEXT };
+    if (hasLoneSurrogate(text)) return { invalid: EDIT_BAD_TEXT };
+    // A merged cell holds its value in the top-left cell: a single edit goes there (Excel); in a block the other cells of the merge are skipped when empty and refuse the edit otherwise.
+    const merge = m.mergeAt(sheetId, r, c);
+    if (merge && (r !== merge.r0 || c !== merge.c0)) {
+      if (!multi) {
+        r = merge.r0;
+        c = merge.c0;
+      } else {
+        if (text !== '') blocks.add('merge', `${rangeText(merge)} is a merged cell. Paste a block that matches the merged cells, or unmerge first.`, `${quoteSheetForRef(sheetName)}!${indexToCol(c)}${r + 1}`);
+        continue;
+      }
+    }
+    const st = m.cellState(sheetId, r, c);
+    if (!st) return { invalid: EDIT_UNKNOWN_SHEET_TEXT };
+    const input = parseCellInput(text, { numFmt: st.numFmt, date1904, autoPercent: !multi });
+    const patch: CellPatch = {};
+    const deltas: StyleDelta[] = [];
+    switch (input.kind) {
+      case 'empty':
+        if (st.value === undefined && st.formula === undefined) continue;
+        patch.value = null;
+        break;
+      case 'text': {
+        const wantWrap = input.text.includes('\n') && !st.wrap;
+        if (st.formula === undefined && st.value?.t === 's' && st.value.v === input.text && !wantWrap) continue;
+        patch.value = { t: 's', v: input.text };
+        if (wantWrap) deltas.push({ wrap: true });
+        if (input.quotePrefix) deltas.push({ quotePrefix: true });
+        break;
+      }
+      case 'number': {
+        const preset = st.numFmt === 'General' && input.numFmt ? input.numFmt : undefined;
+        if (st.formula === undefined && st.value?.t === 'n' && st.value.v === input.value && !preset) continue;
+        patch.value = { t: 'n', v: input.value };
+        if (preset) deltas.push({ numFmt: preset });
+        break;
+      }
+      case 'boolean':
+        if (st.formula === undefined && st.value?.t === 'b' && st.value.v === input.value) continue;
+        patch.value = { t: 'b', v: input.value };
+        break;
+      case 'error':
+        if (st.formula === undefined && st.value?.t === 'e' && st.value.v === input.value) continue;
+        patch.value = { t: 'e', v: input.value };
+        break;
+      case 'formula': {
+        let check = formulas.get(input.body);
+        if (!check) formulas.set(input.body, (check = checkFormulaInput(input.body, names)));
+        if (!check.ok) {
+          if (check.reason === 'invalid') return { invalid: check.message };
+          blocks.add(check.block.code, check.block.message, `${quoteSheetForRef(sheetName)}!${indexToCol(c)}${r + 1}`);
+          continue;
+        }
+        if (st.formula === check.file) continue;
+        patch.formula = check.file;
+        patch.cached = null; // no <v> until the formula is calculated (P5): the cell shows 'stale'
+        break;
+      }
+    }
+    blockCell(m, sheetId, sheetName, protectedSheet, r, c, st, blocks);
+    if (deltas.length) patch.style = deltas;
+    if (st.sharedMaster && !separatedMasters.has(st.key)) {
+      separatedMasters.add(st.key);
+      separateSharedFormula(m, sheetId, st, r, c, blocks, separated);
+    }
+    planned.set(st.key, [r, c, patch]);
+  }
+  if (blocks.any) return { blocked: blocks.result() };
+  if (!planned.size) return { noop: true };
+  return buildCellsEdit(sheetId, 'setCells', planned, separated, planned.size === 1 ? `Edit ${rangeText(boxOf([...planned.values()]))}` : `Edit ${planned.size.toLocaleString('en-US')} cells`);
+}
+
+/** One entry per cell, the last one sent for it (the order of the rest is kept); malformed entries stay for the checks. */
+function lastWriteWins<T>(cells: readonly T[]): T[] {
+  const seen = new Set<number>();
+  const out: T[] = [];
+  for (let k = cells.length - 1; k >= 0; k--) {
+    const e = cells[k] as unknown;
+    if (Array.isArray(e) && Number.isInteger(e[0]) && Number.isInteger(e[1])) {
+      const key = (e[0] as number) * MAX_COLS + (e[1] as number);
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+    out.push(cells[k]);
+  }
+  return out.reverse();
+}
+
+function planClear(m: WorkbookModel, i: Extract<EditIntent, { kind: 'clear' }>): PlanResult {
+  const sheetId = i.sheetId;
+  if (i.what !== 'contents') return { blocked: [{ code: 'unsupported', message: EDIT_NOT_AVAILABLE_TEXT, where: [] }] };
+  if (!Array.isArray(i.ranges)) return { invalid: EDIT_BAD_REQUEST_TEXT };
+  if (i.ranges.length > MAX_CLEAR_RANGES) return { invalid: EDIT_TOO_LARGE_TEXT };
+  const sheetName = m.sheetNames()[m.sheetIndexOf(sheetId)];
+  const protectedSheet = m.sheetProtected(sheetId);
+  const blocks = new BlockCollector();
+  const planned = new Map<number, [number, number, CellPatch]>();
+  const separated = new Map<number, [number, number, CellPatch]>();
+  const separatedMasters = new Set<number>();
+  for (const g of i.ranges) {
+    if (!g || ![g.r0, g.c0, g.r1, g.c1].every((n) => Number.isInteger(n) && n >= 0) || g.r0 > g.r1 || g.c0 > g.c1 || g.r1 >= MAX_ROWS || g.c1 >= MAX_COLS) return { invalid: EDIT_BAD_REQUEST_TEXT };
+    m.forEachExistingCell(sheetId, g, (r, c) => {
+      if (m.filterHidesRow(sheetId, r)) return; // Excel: rows hidden by a filter keep their data
+      const st = m.cellState(sheetId, r, c);
+      if (!st || (st.value === undefined && st.formula === undefined) || planned.has(st.key)) return;
+      if (blockCell(m, sheetId, sheetName, protectedSheet, r, c, st, blocks)) return;
+      if (st.sharedMaster && !separatedMasters.has(st.key)) {
+        separatedMasters.add(st.key);
+        separateSharedFormula(m, sheetId, st, r, c, blocks, separated);
+      }
+      planned.set(st.key, [r, c, { value: null }]);
+      if (planned.size > MAX_EDIT_CELLS) blocks.add('limit', EDIT_TOO_LARGE_TEXT, `${quoteSheetForRef(sheetName)}!${indexToCol(c)}${r + 1}`);
+    });
+  }
+  if (blocks.any) return { blocked: blocks.result() };
+  if (!planned.size) return { noop: true };
+  const box = boxOf([...planned.values()]);
+  const label = i.ranges.length === 1 ? `Clear ${rangeText(i.ranges[0])}` : 'Clear contents';
+  return buildCellsEdit(sheetId, 'clear', planned, separated, planned.size === 1 ? `Clear ${rangeText(box)}` : label);
+}
+
+function buildCellsEdit(
+  sheetId: SheetId,
+  kind: 'setCells' | 'clear',
+  planned: Map<number, [number, number, CellPatch]>,
+  separated: Map<number, [number, number, CellPatch]>,
+  label: string,
+): Edit {
+  // A cell the user changes needs no separate fix.
+  for (const key of planned.keys()) separated.delete(key);
+  const sheet = sheetNumber(sheetId);
+  const ops: PackageOp[] = [];
+  if (separated.size) ops.push({ kind: 'cells', sheet, cells: sortedCells(separated.values()) });
+  ops.push({ kind: 'cells', sheet, cells: sortedCells(planned.values()) });
+  return { id: 0, kind, sheetId, range: boxOf([...planned.values()]), label, structural: false, after: { ops } };
+}
+
+// ----- apply / invert -----
+
+/** The overlay entry a cell patch stands for (the display side of the file operation), given the cell as it is now. */
+function overrideOfPatch(m: WorkbookModel, st: CellState, patch: CellPatch): CellOverride {
+  const o: CellOverride = {};
+  const set = (v: FileValue): void => {
+    o.t = v.t === 'n' ? 'n' : v.t === 's' ? 's' : v.t === 'b' ? 'b' : 'e';
+    o.v = v.v;
+  };
+  if (patch.formula !== undefined) {
+    o.f = patch.formula;
+    if (patch.cached) set(patch.cached);
+    else o.calc = 'stale';
+  } else if (patch.value === null) {
+    o.t = 'z';
+  } else if (patch.value) {
+    set(patch.value);
+  } else {
+    throw new Error('applyEdit: a cell patch without a value or formula is not supported yet');
+  }
+  if (patch.style?.length) {
+    const s = m.deriveStyle(st.style, patch.style);
+    if (s !== st.style || st.override?.s !== undefined) o.s = s;
+  } else if (st.override?.s !== undefined) {
+    o.s = st.override.s;
+  }
+  return o;
+}
+
+function cellsOpOf(e: Edit): Extract<PackageOp, { kind: 'cells' }> {
+  const op = e.after.ops[e.after.ops.length - 1];
+  if (!op || op.kind !== 'cells') throw new Error('applyEdit: the edit has no cell operation');
+  return op;
+}
+
+function changeOf(m: WorkbookModel, e: Edit): RowsChange {
+  const meta = e.sheetId ? m.updateExtent(e.sheetId) : false;
+  m.dropListCaches();
+  return { sheetId: e.sheetId, rows: e.range ? [e.range.r0, e.range.r1 + 1] : undefined, structural: false, meta };
+}
+
+/**
+ * Applies an edit to the display model (the first time and for redo). Everything is validated before the first change:
+ * a throw leaves the model as it was. The first run records the overlay entries it replaced in `e.before`.
+ */
+export function applyEdit(m: WorkbookModel, e: Edit): RowsChange {
+  if (e.kind !== 'setCells' && e.kind !== 'clear') throw new Error(`applyEdit: unsupported edit kind '${e.kind}'`);
+  const view = e.sheetId ? m.viewOf(e.sheetId) : undefined;
+  if (!e.sheetId || !view) throw new Error('applyEdit: unknown sheet');
+  const op = cellsOpOf(e);
+  const writes: [rowId: number, colId: number, o: CellOverride][] = [];
+  for (const [r, c, patch] of op.cells) {
+    const st = m.cellState(e.sheetId, r, c);
+    if (!st) throw new Error('applyEdit: unknown cell');
+    writes.push([st.rowId, st.colId, overrideOfPatch(m, st, patch)]);
+  }
+  const record = e.before === undefined;
+  const before: [number, CellOverride | undefined][] = [];
+  for (const [rowId, colId, o] of writes) {
+    if (record) before.push([cellKey(rowId, colId), view.over.get(cellKey(rowId, colId))]);
+    setOverride(view, rowId, colId, o);
+  }
+  if (record) e.before = { cells: before };
+  return changeOf(m, e);
+}
+
+/** Takes an applied edit back: the overlay entries it replaced come back exactly (e.before). */
+export function invertEdit(m: WorkbookModel, e: Edit): RowsChange {
+  const view = e.sheetId ? m.viewOf(e.sheetId) : undefined;
+  if (!e.sheetId || !view) throw new Error('invertEdit: unknown sheet');
+  const cells = e.before?.cells;
+  if (!cells) throw new Error('invertEdit: the edit was never applied');
+  for (let k = cells.length - 1; k >= 0; k--) {
+    const [key, prev] = cells[k];
+    const rowId = Math.floor(key / CELL_KEY_COLS);
+    setOverride(view, rowId, key - rowId * CELL_KEY_COLS, prev);
+  }
+  return changeOf(m, e);
 }
 
 // ===== SELECTION STATS =====
@@ -5981,6 +7492,28 @@ export function xlsxTooLargeReason(meta: WorkbookMeta, bytes: number): string | 
   for (const sheet of meta.sheets) cells += sheet.rowCount * sheet.colCount;
   if (cells <= XLSX_EDIT_LIMITS.cells && bytes <= XLSX_EDIT_LIMITS.bytes) return undefined;
   return XLSX_TOO_LARGE_TEXT;
+}
+
+export const XLSX_EDIT_GROWS_TOO_LARGE_TEXT =
+  'This change would make the workbook too large to edit safely in this version (more than 100,000 cells in use). It was not applied.';
+
+/**
+ * The size rule of xlsxTooLargeReason, checked for a planned edit: undefined when the workbook stays within
+ * XLSX_EDIT_LIMITS.cells after the edit (or the edit does not grow the used range), else the reason to refuse it.
+ * Without it one paste could grow a small workbook past the limit (slow saves, a file that reopens read-only).
+ */
+export function editGrowsTooLarge(m: WorkbookModel, plan: Edit): string | undefined {
+  const sheet = plan.sheetId === null ? undefined : m.sheetMeta(plan.sheetId);
+  if (!sheet || !plan.range || plan.kind === 'clear') return undefined;
+  const rows = Math.max(sheet.rowCount, plan.range.r1 + 1);
+  const cols = Math.max(sheet.colCount, plan.range.c1 + 1);
+  if (rows === sheet.rowCount && cols === sheet.colCount) return undefined;
+  let cells = rows * cols;
+  for (let i = 0, id = m.sheetIdAt(0); id !== undefined; id = m.sheetIdAt(++i)) {
+    const other = id === plan.sheetId ? undefined : m.sheetMeta(id);
+    if (other) cells += other.rowCount * other.colCount;
+  }
+  return cells > XLSX_EDIT_LIMITS.cells ? XLSX_EDIT_GROWS_TOO_LARGE_TEXT : undefined;
 }
 
 /** Text for a workbook the save path cannot patch (`reason` from checkPatchable); there is no "Edit anyway". */
@@ -7737,8 +9270,8 @@ export class SaveVerifyError extends Error {
   }
 }
 
-/** Rewritten parts up to this size are parsed whole in V2; bigger cell-patched sheet parts are checked row by row. */
-const VERIFY_FULL_PARSE_BYTES = 32 << 20;
+/** Rewritten parts up to this size are parsed whole in V2; bigger cell-patched sheet parts are checked row by row. (An object so tests can lower it.) */
+export const verifyTuning = { fullParseBytes: 32 << 20 };
 /** V4 (reload with the loader) runs for files up to this size unless the caller says otherwise (D-008). */
 export const VERIFY_DEEP_MAX_BYTES = 10 << 20;
 /** V4 also needs a modest sharedStrings part: text-heavy workbooks compress 25:1, a 3.7 MB file can hold 95 MB of strings. */
@@ -8062,6 +9595,7 @@ async function verifySheetRows(baseBuf: Buffer, newBuf: Buffer, patchedRows: Rea
   let baseRows: RowSpan[];
   let newRows: RowSpan[];
   let LB: SheetXmlLayout;
+  let LN: SheetXmlLayout;
   try {
     LB = await sheetLayout(baseBuf, where, onYield);
     if (LB.sdSelfClosing) {
@@ -8069,10 +9603,29 @@ async function verifySheetRows(baseBuf: Buffer, newBuf: Buffer, patchedRows: Rea
       return;
     }
     baseRows = await sheetRowSpans(baseBuf, LB, onYield);
-    newRows = await sheetRowSpans(newBuf, await sheetLayout(newBuf, where, onYield), onYield);
+    LN = await sheetLayout(newBuf, where, onYield);
+    newRows = await sheetRowSpans(newBuf, LN, onYield);
   } catch (err) {
     if (err instanceof PatchError) throw new SaveVerifyError('V2', saveErrorText(err));
     throw err;
+  }
+  // The <dimension ref> in the head may be widened by the patch (widenDimension): only its ref may differ, and the new
+  // ref must be a plain range. Everything else of the head is compared byte by byte below.
+  const dimOf = (buf: Buffer, L: SheetXmlLayout): { start: number; end: number; tag: string } | undefined => {
+    const head = buf.toString('latin1', 0, L.sdOpen);
+    const m = new RegExp(`<${regexEscape(L.P)}dimension\\b[^>]*>`).exec(head);
+    return m ? { start: m.index, end: m.index + m[0].length, tag: m[0] } : undefined;
+  };
+  const dimB = dimOf(baseBuf, LB);
+  const dimN = dimOf(newBuf, LN);
+  let dimSkip = false;
+  if (dimB && dimN && dimB.tag !== dimN.tag) {
+    const withoutRef = (tag: string): string => tag.replace(/(\sref\s*=\s*)("[^"]*"|'[^']*')/, '$1""');
+    const ref = /\sref\s*=\s*"([^"]*)"/.exec(dimN.tag)?.[1] ?? '';
+    if (withoutRef(dimB.tag) !== withoutRef(dimN.tag) || !/^[A-Z]{1,3}\d{1,7}(?::[A-Z]{1,3}\d{1,7})?$/.test(ref)) {
+      throw new SaveVerifyError('V2', `${where} changed outside the edited rows`);
+    }
+    dimSkip = true;
   }
   let prevR = -1;
   for (const row of newRows) {
@@ -8081,9 +9634,13 @@ async function verifySheetRows(baseBuf: Buffer, newBuf: Buffer, patchedRows: Rea
     if (patchedRows.has(row.r)) await verifyXmlWellFormed(newBuf.subarray(row.start, row.end), `${where} row ${row.r + 1}`, onYield);
   }
   /** The part as a list of [start, end) spans without the patched rows. */
-  const kept = (rows: readonly RowSpan[], size: number): [number, number][] => {
+  const kept = (rows: readonly RowSpan[], size: number, dim: { start: number; end: number } | undefined): [number, number][] => {
     const out: [number, number][] = [];
     let from = 0;
+    if (dimSkip && dim) {
+      out.push([0, dim.start]);
+      from = dim.end;
+    }
     for (const row of rows) {
       if (!patchedRows.has(row.r)) continue;
       out.push([from, row.start]);
@@ -8092,8 +9649,8 @@ async function verifySheetRows(baseBuf: Buffer, newBuf: Buffer, patchedRows: Rea
     out.push([from, size]);
     return out;
   };
-  const a = kept(baseRows, baseBuf.length);
-  const b = kept(newRows, newBuf.length);
+  const a = kept(baseRows, baseBuf.length, dimB);
+  const b = kept(newRows, newBuf.length, dimN);
   // Compare the two span lists as one byte stream each.
   let ia = 0;
   let ib = 0;
@@ -8442,7 +9999,7 @@ export async function verifyXlsx(
   for (const [name, data] of rewritten) {
     if (!/\.(xml|rels)$/i.test(name)) continue;
     const rows = patchedRows.get(name.toLowerCase());
-    if (data.length > VERIFY_FULL_PARSE_BYTES && rows) {
+    if (data.length > verifyTuning.fullParseBytes && rows) {
       const baseEntry = baseZip.get(name);
       if (!baseEntry) throw new SaveVerifyError('V2', `${name} has no original`);
       await verifySheetRows(await readEntry(baseZip, baseEntry, onYield), data, rows, name, onYield);

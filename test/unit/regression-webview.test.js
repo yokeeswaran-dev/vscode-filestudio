@@ -47,7 +47,9 @@ function copy(spec) {
   const { view, rowOf } = sheetView(spec);
   const plan = V.planCopy(view);
   assert.equal(typeof plan, 'object', `copy refused: ${plan}`);
-  return { mode: plan.mode, ...V.buildCopyPayload(plan.view, plan.ranges, plan.mode, rowOf) };
+  // `values` (what a paste inside FileStudio uses) is checked in sheet-edit-fix1.test.js.
+  const { values: _values, ...payload } = V.buildCopyPayload(plan.view, plan.ranges, plan.mode, rowOf) ?? {};
+  return { mode: plan.mode, ...payload };
 }
 
 const range = (r0, c0, r1 = r0, c1 = c0) => ({ r0, c0, r1, c1 });

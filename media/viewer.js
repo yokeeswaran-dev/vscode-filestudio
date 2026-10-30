@@ -156,12 +156,15 @@ function dispatch(msg) {
     // ----- (v0.2.0) editing messages: declared by track F; the owning phase adds its call in its case -----
     case 'editResult':
       mdwOnEditResult(msg); // P6 (ignored unless the view is Markdown)
-      /* P2 grid, P3 csv */ break;
+      if (currentKind() !== 'markdown' && acceptsViewMessage(msg.type, ['sheet', 'csv'])) onEditResult(msg);
+      break;
     case 'patch':
-      /* P2 */ break;
+      if (acceptsViewMessage(msg.type, ['sheet', 'csv'])) onPatch(msg);
+      break;
     case 'editState':
       mdOnEditState(msg); // P6 (ignored unless the view is Markdown)
-      /* P2 grid */ break;
+      if (currentKind() !== 'markdown' && acceptsViewMessage(msg.type, ['sheet', 'csv'])) onEditState(msg);
+      break;
     case 'recalcState':
       /* P5 */ break;
     case 'findResult':
@@ -696,6 +699,7 @@ const NO_CELLS = [];
  * @property {HTMLElement} ariaDesc   description of the active cell (note, link target)
  * @property {HTMLElement | null} menu
  * @property {HTMLElement | null} banner
+ * @property {HTMLElement} [statusMode]
  * @property {HTMLElement} formulaBar
  * @property {HTMLElement} tabBar
  * @property {HTMLElement} statusBar
@@ -736,6 +740,12 @@ const NO_CELLS = [];
  * @property {CellBox | null} cellBox   read-only cell text box opened by a double-click (CELL TEXT BOX)
  * @property {HTMLElement | null} lostFocus  the grid or the cell text box whose focus went to <body> (see wireGridEvents)
  * @property {string | undefined} bannerText  lossy-content banner the host sent last (init / invalidate), even if dismissed
+ * @property {boolean} [bannerAction]   the banner carries an "Edit anyway" button
+ * @property {EditState} editState      what the host says about editing (init / invalidate / editState)
+ * @property {number} version           the host's document version this grid has seen (contract §2.7)
+ * @property {Map<number, Map<number, Map<number, string>>>} overlay  pending cell texts by sheet, row and column (EDITING)
+ * @property {EditMessage | null} inFlightEdit  the one edit asked of the host and not answered yet
+ * @property {(EditMessage | CommandMessage)[]} sendQueue  edits and commands waiting for it, in order
  */
 
 /** @type {GridState | null} */
@@ -784,12 +794,19 @@ function showGrid(msg) {
     cellBox: null,
     lostFocus: null,
     bannerText: msg.banner,
+    bannerAction: !!msg.editState?.canEditAnyway,
+    version: msg.version ?? 0,
+    // A host that sends no editState (0.1.2, test hosts) says it by `readOnly`.
+    editState: msg.editState || (msg.readOnly !== false ? { editable: false } : { editable: true, kinds: ['setCells', 'clear'] }),
+    overlay: new Map(),
+    inFlightEdit: null,
+    sendQueue: [],
   };
   resetRowCache();
   rowCache.metaFloor = rowCache.reqSeq;
   lastRegion = { sheet: -1, version: -1 };
   onDispose(() => {
-    closeCellBox(false);
+    closeCellBox('close', false);
     hideTooltip();
     closeMenu();
     saveGridState.flush();
@@ -807,25 +824,26 @@ function showGrid(msg) {
 
   mountGrid(msg.banner);
 
+  const g = /** @type {GridState} */ (G);
   // Hidden sheets this panel had revealed for viewing stay revealed (the active one may be among them).
-  if (G.saved && Array.isArray(G.saved.revealed)) {
-    for (const name of G.saved.revealed) {
-      const index = meta.sheets.findIndex((s) => s.name === name);
-      if (index >= 0 && meta.sheets[index].state !== 'visible') G.revealed.add(index);
+  if (g.saved && Array.isArray(g.saved.revealed)) {
+    for (const name of g.saved.revealed) {
+      const index = meta.sheets.findIndex((s) => sheetKey(s) === name || s.name === name);
+      if (index >= 0 && meta.sheets[index].state !== 'visible') g.revealed.add(index);
     }
   }
   // Initial sheet: the one persisted for this panel, else the workbook's active sheet. A hidden active sheet is shown
   // revealed (Excel opens the file on it, unhiding it); any other hidden one gives way to the first visible sheet.
   let first = -1;
-  if (G.saved && typeof G.saved.activeSheet === 'string') first = meta.sheets.findIndex((s) => s.name === G?.saved.activeSheet);
+  if (g.saved && typeof g.saved.activeSheet === 'string') first = meta.sheets.findIndex((s) => sheetKey(s) === g.saved.activeSheet || s.name === g.saved.activeSheet);
   if (first < 0) {
     first = clamp(meta.activeSheet | 0, 0, meta.sheets.length - 1);
-    if (meta.sheets[first].state === 'hidden') G.revealed.add(first);
+    if (meta.sheets[first].state === 'hidden') g.revealed.add(first);
   }
-  if (meta.sheets[first].state !== 'visible' && !G.revealed.has(first)) {
+  if (meta.sheets[first].state !== 'visible' && !g.revealed.has(first)) {
     const visible = meta.sheets.findIndex((s) => s.state === 'visible');
     if (visible >= 0) first = visible;
-    else G.revealed.add(first);
+    else g.revealed.add(first);
   }
   activateSheet(first, true);
   dom.scroller.focus({ preventScroll: true });
@@ -852,7 +870,7 @@ function showNoSheets(banner) {
 function mountGrid(banner) {
   const g = /** @type {GridState} */ (G);
   root.className = 'fv-grid-app';
-  root.replaceChildren(...buildGridApp({ banner }, g.dom));
+  root.replaceChildren(...buildGridApp({ banner, editState: g.editState }, g.dom));
   g.viewW = g.dom.scroller.clientWidth;
   g.viewH = g.dom.scroller.clientHeight;
   if (!g.wired) {
@@ -917,6 +935,7 @@ function buildGridDom(msg) {
     statusMsg: status.msg,
     statusStats: status.stats,
     statusInfo: status.info,
+    statusMode: status.mode,
     zoomLabel: status.zoomLabel,
     tooltip: h('div', { class: 'fv-tooltip', role: 'tooltip', hidden: true }),
     ariaRow,
@@ -932,13 +951,13 @@ function buildGridDom(msg) {
 
 /**
  * Top-level children of #app for the grid view.
- * @param {{ banner?: string }} msg  lossy-content banner text (GridInitMessage.banner)
+ * @param {{ banner?: string, editState?: EditState }} msg  lossy-content banner text (GridInitMessage.banner)
  * @param {GridDom} dom
  */
 function buildGridApp(msg, dom) {
   /** @type {HTMLElement[]} */
   const parts = [];
-  if (msg.banner) parts.push(buildGridBanner(msg.banner, dom));
+  if (msg.banner) parts.push(buildGridBanner(msg.banner, dom, msg.editState?.canEditAnyway ? { label: 'Edit anyway', onClick: () => post({ type: 'editAnyway' }) } : null));
   parts.push(dom.formulaBar, h('div', { class: 'fv-grid-host' }, dom.scroller), dom.tabBar, dom.statusBar, dom.tooltip, dom.ariaDesc);
   return parts;
 }
@@ -946,13 +965,14 @@ function buildGridApp(msg, dom) {
 /**
  * The grid's lossy-content banner (kept in dom.banner).
  * @param {string} text @param {GridDom} dom
+ * @param {{ label: string, onClick: () => void } | null} [action]
  */
-function buildGridBanner(text, dom) {
+function buildGridBanner(text, dom, action = null) {
   dom.banner = buildBanner(text, () => {
     dom.banner = null;
     // The Dismiss button had focus: give it back to the grid instead of losing it to <body>.
     G?.dom.scroller.focus({ preventScroll: true });
-  });
+  }, action);
   return dom.banner;
 }
 
@@ -961,43 +981,54 @@ function buildGridBanner(text, dom) {
  * "no worksheets" page, so it says what the reloaded file holds (a chart added or removed on disk). A banner the user
  * dismissed stays dismissed while the host sends the same text.
  * @param {string | undefined} text
+ * @param {boolean | object} [canEditAnyway]
  */
-function updateBanner(text) {
+function updateBanner(text, canEditAnyway) {
   const g = G;
-  if (!g || text === g.bannerText) return;
+  if (!g) return;
+  const canEdit = canEditAnyway !== undefined ? !!canEditAnyway : !!g.editState?.canEditAnyway;
+  if (text === g.bannerText && canEdit === g.bannerAction) return;
   g.bannerText = text;
+  g.bannerAction = canEdit;
   const focused = document.activeElement;
   root.querySelector(':scope > .fv-banner')?.remove();
   g.dom.banner = null;
-  if (text) root.prepend(g.dom.scroller.isConnected ? buildGridBanner(text, g.dom) : buildBanner(text, null));
+  const action = canEdit ? { label: 'Edit anyway', onClick: () => post({ type: 'editAnyway' }) } : null;
+  if (text) root.prepend(g.dom.scroller.isConnected ? buildGridBanner(text, g.dom, action) : buildBanner(text, null, action));
   // Removing a banner whose Dismiss button had the focus would drop it to <body>.
   if (focused instanceof HTMLElement && !focused.isConnected && g.dom.scroller.isConnected) g.dom.scroller.focus({ preventScroll: true });
 }
 
 /**
- * Lossy-content banner with a Dismiss button.
+ * Lossy-content banner with a Dismiss button and optional action button.
  * @param {string} text @param {(() => void) | null} onDismiss called after the banner is removed
+ * @param {{ label: string, onClick: () => void } | null} [action]
  */
-function buildBanner(text, onDismiss) {
+function buildBanner(text, onDismiss, action = null) {
+  // A banner with an action ("Edit anyway") cannot be dismissed: dismissing it would take away the only way to edit.
+  const actionBtn = action ? h('button', { class: 'fv-btn fv-banner-action', type: 'button', onclick: () => action.onClick() }, action.label) : null;
   const banner = h(
     'div',
     { class: 'fv-banner', role: 'status' },
     icon(ICONS.info),
     h('span', { class: 'fv-banner-text', title: text }, text),
-    h(
-      'button',
-      {
-        class: 'fv-icon-btn fv-banner-close',
-        type: 'button',
-        title: 'Dismiss',
-        'aria-label': 'Dismiss',
-        onclick: () => {
-          banner.remove();
-          onDismiss?.();
-        },
-      },
-      icon(ICONS.close),
-    ),
+    actionBtn,
+    actionBtn
+      ? null
+      : h(
+          'button',
+          {
+            class: 'fv-icon-btn fv-banner-close',
+            type: 'button',
+            title: 'Dismiss',
+            'aria-label': 'Dismiss',
+            onclick: () => {
+              banner.remove();
+              onDismiss?.();
+            },
+          },
+          icon(ICONS.close),
+        ),
   );
   return banner;
 }
@@ -1012,6 +1043,7 @@ function wireGridEvents() {
   listen(sc, 'keydown', onGridKeyDown);
   listen(sc, 'wheel', onGridWheel, { passive: false });
   listen(sc, 'dblclick', onGridDblClick);
+  listen(sc, 'paste', onGridPaste);
   listen(window, 'mousemove', onWindowMouseMove);
   listen(window, 'mouseup', onWindowMouseUp);
   listen(window, 'keydown', (e) => trackModifier(e, true));
@@ -1023,6 +1055,10 @@ function wireGridEvents() {
   // The webview document going away (reload, editor moved to another window) keeps the last change: the state save
   // is debounced and would otherwise be dropped.
   listen(window, 'pagehide', () => saveGridState.flush());
+  // A hidden panel keeps what the user typed: an open editor commits (as when it loses the focus).
+  listen(document, 'visibilitychange', () => {
+    if (document.visibilityState === 'hidden') closeCellBox('hidden', false);
+  });
   listen(document, 'copy', onCopyEvent);
   // VS Code's context menu (also a click in the workbench) takes the focus out of the webview's frame, which drops it
   // to <body>: the grid / cell text box that had it is remembered, so that the menu's Copy copies from it and the
@@ -1037,8 +1073,9 @@ function wireGridEvents() {
   listen(document, 'keydown', onLostFocusKeyDown);
   listen(document, 'mousedown', (e) => {
     // A click anywhere but the cell text box closes it (the focus goes back to the grid unless the click focuses
-    // something else, such as the name box).
-    if (G?.cellBox && !G.cellBox.el.contains(/** @type {Node} */ (e.target))) closeCellBox();
+    // something else, such as the name box). An editor commits ('blur'); the formula bar is part of the same edit.
+    const box = G?.cellBox;
+    if (G && box && !box.el.contains(/** @type {Node} */ (e.target)) && !(box.mode !== 'view' && G.dom.formula.contains(/** @type {Node} */ (e.target)))) closeCellBox(box.mode === 'view' ? 'close' : 'blur');
     const menu = G?.dom.menu;
     if (menu && !menu.contains(/** @type {Node} */ (e.target)) && e.target !== G?.dom.hiddenBtn && !G?.dom.hiddenBtn.contains(/** @type {Node} */ (e.target))) closeMenu();
   });
@@ -1061,7 +1098,7 @@ function wireGridEvents() {
   const ro = new ResizeObserver(() => {
     if (!G) return;
     // The cell text box is placed for the old size.
-    if (G.cellBox && (sc.clientWidth !== G.viewW || sc.clientHeight !== G.viewH)) closeCellBox();
+    if (G.cellBox && (sc.clientWidth !== G.viewW || sc.clientHeight !== G.viewH)) closeCellBox('resize');
     G.viewW = sc.clientWidth;
     G.viewH = sc.clientHeight;
     scheduleRender();
@@ -1089,7 +1126,7 @@ function wireGridEvents() {
     const key = gridThemeKey();
     if (key === themeKey) return;
     themeKey = key;
-    closeCellBox(); // its colours come from the old theme
+    closeCellBox('theme'); // its colours come from the old theme
     G.dark = isDarkTheme();
     darkColorCache.clear();
     darkBgLuminance = -1;
@@ -1122,7 +1159,7 @@ function activateSheet(index, force = false) {
   if (!G) return;
   if (index < 0 || index >= G.meta.sheets.length) return;
   if (index === G.sheet && !force) return;
-  closeCellBox();
+  closeCellBox('sheetSwitch');
   hideTooltip();
   closeMenu();
   if (G.meta.sheets[index].state !== 'visible') G.revealed.add(index);
@@ -1154,7 +1191,7 @@ function getView(index) {
   const existing = g.views.get(index);
   if (existing) return existing;
   const sm = g.meta.sheets[index];
-  const saved = g.saved?.sheets?.[sm.name];
+  const saved = g.saved?.sheets?.[sheetKey(sm)] ?? g.saved?.sheets?.[sm.name];
   /** @type {SheetView} */
   const view = {
     index,
@@ -1203,6 +1240,17 @@ const rowCache = {
   /** Replies to requests up to this id predate the current WorkbookMeta (style indexes may differ). */
   metaFloor: 0,
 };
+
+/**
+ * The `sheetId` field of a request about a sheet: the host resolves the sheet by id when it is given (the position stays
+ * for 0.1.2). Nothing for a host that sends no ids.
+ * @param {number} sheet
+ * @returns {{ sheetId?: SheetId }}
+ */
+function idField(sheet) {
+  const id = G?.meta.sheets[sheet]?.id;
+  return id === undefined ? {} : { sheetId: id };
+}
 
 /**
  * @param {number} sheet
@@ -1267,7 +1315,7 @@ function pumpRequests() {
     if (start >= end) continue;
     const reqId = ++rowCache.reqSeq;
     rowCache.inflight.set(key, { reqId, sent: now });
-    post({ type: 'getRows', reqId, sheet, start, end });
+    post({ type: 'getRows', reqId, sheet, ...idField(sheet), start, end });
   }
 }
 
@@ -1314,6 +1362,12 @@ function mergeStyles(entries) {
 /** @param {RowsMessage} msg */
 function onRows(msg) {
   if (!G) return;
+  // Rows of an older document version, or of another sheet than the one asked for (the tab at that position changed),
+  // are dropped (contract §2.7); the block is asked for again.
+  if ((msg.version !== undefined && msg.version < G.version) || (msg.sheetId !== undefined && G.meta.sheets[msg.sheet]?.id !== undefined && msg.sheetId !== G.meta.sheets[msg.sheet].id)) {
+    dropStaleRows(msg);
+    return;
+  }
   // Style entries are valid for the current meta even when the rows themselves arrive too late.
   if (msg.reqId > rowCache.metaFloor) mergeStyles(msg.styles);
   const direct = rowCache.direct.get(msg.reqId);
@@ -1346,9 +1400,41 @@ function onRows(msg) {
     }
     // A cell text box opened before its row was loaded gets its text now.
     const box = G.cellBox;
-    if (box && !box.loaded && box.sheet === msg.sheet && box.r >= msg.start && box.r < msg.end) openCellBox(activeView(), box.r, box.c);
+    if (box && !box.loaded && box.sheet === msg.sheet && box.r >= msg.start && box.r < msg.end) fillCellBox(box);
   }
   pumpRequests();
+}
+
+/** A rows reply that is not used: its request is forgotten, so the block is asked for again. @param {RowsMessage} msg */
+function dropStaleRows(msg) {
+  const key = blockKey(msg.sheet, Math.floor(msg.start / BLOCK_ROWS));
+  if (rowCache.inflight.get(key)?.reqId === msg.reqId) rowCache.inflight.delete(key);
+  const direct = rowCache.direct.get(msg.reqId);
+  if (direct) {
+    rowCache.direct.delete(msg.reqId);
+    direct.reject(new Error('The data changed while it was being read.'));
+  }
+  scheduleRender();
+  pumpRequests();
+}
+
+/**
+ * A box opened before its row was loaded gets the cell's text now. The read-only box opens again (0.1.2); an editor only
+ * takes the text while nothing was typed, and compares with the loaded text from now on.
+ * @param {CellBox} box
+ */
+function fillCellBox(box) {
+  const view = activeView();
+  if (box.mode === 'view') {
+    openCellBox(view, box.r, box.c);
+    return;
+  }
+  const text = editStartText(view, box.r, box.c, cellAt(view, box.r, box.c));
+  box.loaded = true;
+  if (box.el.value === box.initialValue) box.el.value = text;
+  box.initialValue = text;
+  syncFormulaFromBox();
+  relayoutCellBox();
 }
 
 /**
@@ -1392,7 +1478,7 @@ async function fetchRows(sheet, r0, r1, cols) {
     /** @type {RowsMessage} */
     const reply = await new Promise((resolve, reject) => {
       rowCache.direct.set(reqId, { resolve, reject });
-      post(cols ? { type: 'getRows', reqId, sheet, start, end: end + 1, c0: cols.c0, c1: cols.c1 } : { type: 'getRows', reqId, sheet, start, end: end + 1 });
+      post(cols ? { type: 'getRows', reqId, sheet, ...idField(sheet), start, end: end + 1, c0: cols.c0, c1: cols.c1 } : { type: 'getRows', reqId, sheet, ...idField(sheet), start, end: end + 1 });
     });
     for (const row of reply.rows) if (row.r >= r0 && row.r <= r1) rows.set(row.r, row);
   }
@@ -1410,16 +1496,20 @@ function countCells(sheet, ranges) {
   const reqId = ++g.statsSeq;
   return new Promise((resolve, reject) => {
     rowCache.probes.set(reqId, { resolve, reject });
-    post({ type: 'getStats', reqId, sheet, ranges });
+    post({ type: 'getStats', reqId, sheet, ...idField(sheet), ranges });
   });
 }
 
 /** @param {InvalidateMessage} msg */
 function onInvalidate(msg) {
   if (!G) return;
-  closeCellBox(); // its text may have changed
+  closeCellBox('invalidate');
   resetRowCache();
   hideTooltip();
+  if (msg.version !== undefined) G.version = Math.max(G.version, msg.version);
+  dropQueuedEdits();
+  G.overlay.clear();
+  if (msg.editState) onEditState({ type: 'editState', state: msg.editState });
   if (msg.banner !== undefined) updateBanner(msg.banner ?? undefined);
   if (msg.meta) {
     rowCache.metaFloor = rowCache.reqSeq;
@@ -1433,7 +1523,7 @@ function onInvalidate(msg) {
     G.views = new Map();
     G.revealed = new Set();
     msg.meta.sheets.forEach((s, i) => {
-      if (revealedNames.has(s.name)) G?.revealed.add(i);
+      if (revealedNames.has(sheetKey(s)) || revealedNames.has(s.name)) G?.revealed.add(i);
     });
     if (!msg.meta.sheets.length) {
       // No active sheet until worksheets come back: queued renders, stats and announcements stop.
@@ -1449,7 +1539,7 @@ function onInvalidate(msg) {
       mountGrid(root.querySelector('.fv-banner-text')?.textContent ?? undefined);
       if (document.activeElement === document.body) G.dom.scroller.focus({ preventScroll: true });
     }
-    let index = msg.meta.sheets.findIndex((s) => s.name === activeName);
+    let index = msg.meta.sheets.findIndex((s) => sheetKey(s) === activeName || s.name === activeName);
     if (index < 0) {
       // The active sheet is gone: same position, else the workbook's active sheet (revealed when it is hidden, as on
       // first display); another hidden one only if revealed.
@@ -1963,7 +2053,7 @@ function onGridScroll() {
   if (!G) return;
   // Scrolling closes the cell text box (not the scroll event of the position it opened at).
   const box = G.cellBox;
-  if (box && (Math.abs(G.dom.scroller.scrollTop - box.st) >= 1 || Math.abs(G.dom.scroller.scrollLeft - box.sl) >= 1)) closeCellBox();
+  if (box && (Math.abs(G.dom.scroller.scrollTop - box.st) >= 1 || Math.abs(G.dom.scroller.scrollLeft - box.sl) >= 1)) closeCellBox('scroll');
   scheduleRender();
   hoverReset();
   saveGridState();
@@ -2106,7 +2196,8 @@ function renderPaneCells(p, view, L, ra, rb, ca, cb) {
       if (rowHeight(L, r) === 0) continue;
       const row = getRow(view.index, r);
       if (row === undefined) continue; // placeholder drawn by renderPaneGrid
-      const cells = row ? row.cells : NO_CELLS;
+      const pending = getRowOverlay(view.index, r);
+      const cells = pending ? withOverlayCells(row ? row.cells : NO_CELLS, pending) : row ? row.cells : NO_CELLS;
       const rowS = rowStyleIndex(sm, r);
       let i = lowerBound(cells, ca);
       // Text overflowing into the window from the left (a formula returning "" blocks overflow, see overflowTarget).
@@ -2215,15 +2306,16 @@ function paintCell(p, view, L, key, m, r, c, cell, s, rowCells) {
 
   // Text. Numbers, dates, booleans and errors are values: never wrapped and never cut — they lose decimals
   // (General) or show ### like Excel.
-  const value = !!cell && (cell.t === 'n' || cell.t === 'd' || cell.t === 'b' || cell.t === 'e');
+  const over = getCellOverlay(view.index, r, c);
+  const raw = over !== undefined ? over : (cell ? displayText(cell) : '');
+  const value = over !== undefined ? false : !!cell && (cell.t === 'n' || cell.t === 'd' || cell.t === 'b' || cell.t === 'e');
   const wrap = S.wrap && !value;
-  const raw = cell ? displayText(cell) : '';
   let text = !wrap && raw.includes('\n') ? oneLine(raw) : raw;
   /** @type {RichRun[] | null} */
-  let rich = cell && cell.rt && cell.rt.length ? cell.rt : null;
+  let rich = over === undefined && cell && cell.rt && cell.rt.length ? cell.rt : null;
   // Fitted values always fit their cell (no clipping check needed below).
   const fitted = !!text && value && !S.rot && !S.shrink && !rich;
-  if (fitted) text = fitNumber(cell, text, S, w);
+  if (fitted && cell) text = fitNumber(cell, text, S, w);
   // Repeat-to-fill formats (accounting `_("$"* #,##0.00_)`, `@*-`) span the whole cell whatever its alignment (fillHtml);
   // a value that did not fit (### / rounded) is shown as such. Not with wrapping, rotation, shrinking or rich text.
   const fillFmt = cell && cell.fill && text === raw && !wrap && !S.rot && !S.shrink && !rich && S.h !== 'fill' ? cell.fill : null;
@@ -3746,6 +3838,27 @@ function serialToDateString(serial) {
   return hasTime ? `${date.toLocaleDateString(undefined, opts)} ${date.toLocaleTimeString(undefined, opts)}` : date.toLocaleDateString(undefined, opts);
 }
 
+/**
+ * Excel serial → editable date/time text that the host reads back the same in every locale (parseCellInput knows ISO
+ * and m/d/yyyy only): `yyyy-mm-dd`, `yyyy-mm-dd hh:mm:ss`, or `hh:mm:ss` for a time alone (+ `.mmm` when there are
+ * milliseconds). A locale text such as 05/01/2024 (en-GB) would be read back as May 1.
+ * @param {number} serial
+ */
+function serialToEditText(serial) {
+  const g = /** @type {GridState} */ (G);
+  let days = serial + (g.meta.date1904 ? 1462 : 0);
+  if (!g.meta.date1904 && days < 61) days += 1; // Excel's fictitious 1900-02-29
+  const date = new Date(Math.round((days - 25569) * 86400000));
+  if (Number.isNaN(date.getTime())) return String(serial);
+  const two = (/** @type {number} */ n) => String(n).padStart(2, '0');
+  const ms = date.getUTCMilliseconds();
+  const time = `${two(date.getUTCHours())}:${two(date.getUTCMinutes())}:${two(date.getUTCSeconds())}${ms ? '.' + String(ms).padStart(3, '0') : ''}`;
+  if (serial < 1 && serial >= 0) return time;
+  const day = `${String(date.getUTCFullYear()).padStart(4, '0')}-${two(date.getUTCMonth() + 1)}-${two(date.getUTCDate())}`;
+  const hasTime = date.getUTCHours() || date.getUTCMinutes() || date.getUTCSeconds() || ms;
+  return hasTime ? `${day} ${time}` : day;
+}
+
 /** Value shown in the formula bar: `=formula` (`{=formula}`), or the raw value. @param {CellData | null | undefined} cell */
 function rawValue(cell) {
   if (!cell || cell.t === 'z') return '';
@@ -3759,7 +3872,7 @@ function rawValue(cell) {
     case 'n':
       return typeof v === 'number' ? formulaBarNumber(v) : String(v);
     case 'd':
-      return typeof v === 'number' ? serialToDateString(v) : String(v);
+      return typeof v === 'number' ? serialToEditText(v) : String(v);
     case 'b':
       return v ? 'TRUE' : 'FALSE';
     default:
@@ -4467,7 +4580,7 @@ function setZoom(zoom) {
   const view = activeView();
   zoom = clamp(Math.round(zoom), MIN_ZOOM, MAX_ZOOM);
   if (zoom === view.zoom || !view.L) return;
-  closeCellBox();
+  closeCellBox('zoom');
   const L = view.L;
   const vy = virtualScrollTop();
   const sl = G.dom.scroller.scrollLeft;
@@ -4524,6 +4637,30 @@ function onGridKeyDown(e) {
   if (!L) return;
   const ctrl = e.ctrlKey || e.metaKey;
   const shift = e.shiftKey;
+  // An edit of this panel is in flight (or queued): VS Code's undo would hit the edit BEFORE it, so Ctrl+Z / Ctrl+Y are
+  // held back and sent as a command behind the edits (D-067). Ctrl+S is held back the same way, so the file has every edit.
+  if (G.inFlightEdit && ctrl && !e.altKey) {
+    const k = e.key.toLowerCase();
+    if (k === 'z' || k === 'y' || (k === 's' && !shift)) {
+      e.preventDefault();
+      e.stopPropagation();
+      sendCommand(k === 's' ? 'save' : k === 'y' || shift ? 'redo' : 'undo');
+      return;
+    }
+  }
+  // Typing starts an edit with the typed character. An IME or dead key opens the box empty and the browser types into it.
+  if (isCellEditable()) {
+    const typed = editStartKey(e);
+    if (typed !== null) {
+      const m = masterOf(view, view.sel.active.r, view.sel.active.c);
+      if (typed !== '') e.preventDefault();
+      e.stopPropagation();
+      openCellBox(view, m.r, m.c, { mode: 'replace', text: typed });
+      return;
+    }
+  } else if (editStartKey(e)) {
+    sayReadOnly();
+  }
   switch (e.key) {
     case 'ArrowUp':
       moveSelection(view, -1, 0, shift, ctrl);
@@ -4583,14 +4720,25 @@ function onGridKeyDown(e) {
       closeMenu();
       return;
     case 'F2': {
-      // Excel's F2 edits the active cell in place: here the read-only cell text box, caret at the end of the text.
+      // Excel's F2 edits the active cell in place, caret at the end of the text (a read-only grid: the read-only box).
       if (ctrl || shift || e.altKey) return;
       const m = masterOf(view, view.sel.active.r, view.sel.active.c);
-      openCellBox(view, m.r, m.c, true);
+      openCellBox(view, m.r, m.c, { mode: 'edit', caretAtEnd: true });
       break;
     }
+    case 'Delete':
+      if (!ctrl && !e.altKey && !canClear()) sayReadOnly();
+      if (ctrl || e.altKey || !canClear()) return;
+      clearSelectionContents(view);
+      break;
     case 'Backspace':
-      // Ctrl+Backspace scrolls the active cell into view; Shift+Backspace keeps only the active cell selected (Excel).
+      // An editable grid: Backspace clears like Delete. Ctrl+Backspace scrolls the active cell into view; Shift+Backspace
+      // keeps only the active cell selected (Excel).
+      if (!ctrl && !shift && !e.altKey && canClear()) {
+        clearSelectionContents(view);
+        break;
+      }
+      if (!ctrl && !shift && !e.altKey) sayReadOnly();
       if (e.altKey || ctrl === shift) return;
       if (ctrl) scrollCellIntoView(view, view.sel.active.r, view.sel.active.c);
       else selectCell(view, view.sel.active.r, view.sel.active.c);
@@ -4599,7 +4747,13 @@ function onGridKeyDown(e) {
       const k = e.key.toLowerCase();
       if (ctrl && !e.altKey && k === 'a') selectRegionOrAll(view);
       else if (ctrl && !e.altKey && !shift && k === 'c') copySelectionFromKeyboard();
-      else if (ctrl && !e.altKey && !shift && e.key === '.') nextCorner(view);
+      else if (ctrl && !e.altKey && !shift && k === 'x' && isCellEditable()) {
+        // Cut is not in 0.2.0 (D-044): nothing is removed, and the key does not reach VS Code's own cut.
+        setStatusMessage('Cut is not available yet; use Copy and Delete.', 'info');
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      } else if (ctrl && !e.altKey && !shift && e.key === '.') nextCorner(view);
       else return;
     }
   }
@@ -5309,8 +5463,21 @@ async function currentRegion(view, alive) {
  * @typedef {'cell' | 'single' | 'rows' | 'cols'} CopyMode
  */
 
-/** Text prepared for the next `copy` event (set by the keyboard handler); html '' = plain text only. @type {{ text: string, html: string, cells: number } | null} */
+/** Text prepared for the next `copy` event (set by the keyboard handler); html '' = plain text only. @type {{ text: string, html: string, cells: number, values?: string[][] } | null} */
 let pendingCopy = null;
+
+/** The last copy from this grid: a paste whose plain text is still `text` pastes `values` (exact numbers, text stays text). @type {{ text: string, values: string[][] } | null} */
+let lastCopy = null;
+
+/** Remembers what was put on the clipboard. @param {{ text: string, values?: string[][] }} payload */
+function rememberCopy(payload) {
+  lastCopy = payload.values ? { text: payload.text, values: payload.values } : null;
+}
+
+/** Line endings and one final line break do not matter when the clipboard text is compared. @param {string} text */
+function clipboardKey(text) {
+  return text.replace(/\r\n?/g, '\n').replace(/\n$/, '');
+}
 
 function copySelectionFromKeyboard() {
   if (!G) return;
@@ -5330,9 +5497,10 @@ function copySelectionFromKeyboard() {
 /**
  * Puts a payload on the clipboard through a copy event (text + HTML), else (execCommand refused, or no copy event
  * reached onCopyEvent) as plain text with the async clipboard API.
- * @param {{ text: string, html: string, cells: number }} payload
+ * @param {{ text: string, html: string, cells: number, values?: string[][] }} payload
  */
 function copyPayload(payload) {
+  rememberCopy(payload);
   pendingCopy = payload;
   let ok = false;
   try {
@@ -5383,6 +5551,7 @@ function onCopyEvent(e) {
     }
   }
   e.preventDefault();
+  rememberCopy(payload);
   e.clipboardData.setData('text/plain', payload.text);
   if (payload.html) e.clipboardData.setData('text/html', payload.html);
   setStatusMessage(payload.cells ? `Copied ${formatCount(payload.cells)} cell${payload.cells === 1 ? '' : 's'}` : 'Copied', 'info');
@@ -5428,14 +5597,20 @@ function planCopy(view) {
  * available.
  * @param {SheetView} view @param {Range[]} ranges @param {CopyMode} mode
  * @param {(r: number) => RowData | null | undefined} rowOf
- * @returns {{ text: string, html: string, cells: number } | null}
+ * `values`: per copied cell, the text that pastes the same value back inside FileStudio (exact number, apostrophe for
+ * text that would read as a value); used on paste while the clipboard still holds `text`.
+ * @returns {{ text: string, html: string, cells: number, values: string[][] } | null}
  */
 function buildCopyPayload(view, ranges, mode, rowOf) {
   if (mode === 'cell') {
     const { r0, c0 } = ranges[0];
+    const over = getCellOverlay(view.index, r0, c0);
+    if (over !== undefined) return { text: over, html: '', cells: 1, values: [[over]] };
     const row = rowOf(r0);
     if (row === undefined) return null;
-    return { text: displayText(row ? findCell(row.cells, c0) : null), html: '', cells: 1 };
+    const cell = row ? findCell(row.cells, c0) : null;
+    const text = displayText(cell);
+    return { text, html: '', cells: 1, values: [[pasteTextOf(cell, text)]] };
   }
   const sm = view.meta;
   /** Rows (columns) of [a, b] that are not hidden; all of them when every one is hidden. */
@@ -5451,9 +5626,11 @@ function buildCopyPayload(view, ranges, mode, rowOf) {
   const table = [];
   /** Per table cell: a text cell (marked as text in the HTML). @type {boolean[][]} */
   const isText = [];
+  /** @type {string[][]} */
+  const values = [];
   const markText = G?.kind === 'sheet';
-  /** @param {number} r @param {number[]} cols ascending @param {string[]} out @param {boolean[]} outText */
-  const appendRow = (r, cols, out, outText) => {
+  /** @param {number} r @param {number[]} cols ascending @param {string[]} out @param {boolean[]} outText @param {string[]} outVal */
+  const appendRow = (r, cols, out, outText, outVal) => {
     const row = rowOf(r);
     if (row === undefined) return false;
     const cells = row ? row.cells : NO_CELLS;
@@ -5462,16 +5639,22 @@ function buildCopyPayload(view, ranges, mode, rowOf) {
       while (i < cells.length && cells[i].c < c) i++;
       let text = '';
       let str = false;
-      if (i < cells.length && cells[i].c === c) {
+      let val = '';
+      const over = getCellOverlay(view.index, r, c);
+      if (over !== undefined) {
+        text = val = over; // what the grid shows; whether it is text is known when the host's rows arrive
+      } else if (i < cells.length && cells[i].c === c) {
         const cell = cells[i++];
         const covered = view.mergeIndex.size && mergeAt(view, r, c) >= 0 && !(masterOf(view, r, c).r === r && masterOf(view, r, c).c === c);
         if (!covered) {
           text = displayText(cell);
           str = markText && cell.t === 's' && text !== '';
+          val = pasteTextOf(cell, text);
         }
       }
       out.push(text);
       outText.push(str);
+      outVal.push(val);
     }
     return true;
   };
@@ -5483,9 +5666,12 @@ function buildCopyPayload(view, ranges, mode, rowOf) {
       const out = [];
       /** @type {boolean[]} */
       const outText = [];
-      for (const cols of colsOf) if (!appendRow(r, cols, out, outText)) return null;
+      /** @type {string[]} */
+      const outVal = [];
+      for (const cols of colsOf) if (!appendRow(r, cols, out, outText, outVal)) return null;
       table.push(out);
       isText.push(outText);
+      values.push(outVal);
     }
   } else {
     for (const rg of ranges) {
@@ -5495,9 +5681,12 @@ function buildCopyPayload(view, ranges, mode, rowOf) {
         const out = [];
         /** @type {boolean[]} */
         const outText = [];
-        if (!appendRow(r, cols, out, outText)) return null;
+        /** @type {string[]} */
+        const outVal = [];
+        if (!appendRow(r, cols, out, outText, outVal)) return null;
         table.push(out);
         isText.push(outText);
+        values.push(outVal);
       }
     }
   }
@@ -5505,7 +5694,58 @@ function buildCopyPayload(view, ranges, mode, rowOf) {
   const text = table.map((row) => row.map(quote).join('\t')).join('\r\n');
   const td = (/** @type {string} */ s, /** @type {boolean} */ str) => `<td${str ? ` style="mso-number-format:'\\@'"` : ''}>${escapeHtml(s).replace(/\r?\n/g, '<br>')}</td>`;
   const html = '<meta charset="utf-8"><table>' + table.map((row, i) => '<tr>' + row.map((s, j) => td(s, isText[i][j])).join('') + '</tr>').join('') + '</table>';
-  return { text, html, cells: table.length * (table[0]?.length ?? 0) };
+  return { text, html, cells: table.length * (table[0]?.length ?? 0), values };
+}
+
+/**
+ * xlsx: the text that pastes this cell's value back exactly (Excel keeps the value on a copy inside the app): the full
+ * number when the display text rounds it (1234.5678 shown as $1,234.57, 5 shown as "5.00 kg"), an apostrophe on text that
+ * would read as a value ('007, '=1+1, 'true). Formulas and everything else: the display text.
+ * @param {CellData | null | undefined} cell @param {string} text the display text
+ */
+function pasteTextOf(cell, text) {
+  if (!cell || cell.f || G?.kind !== 'sheet') return text;
+  if (cell.t === 's') return textReadsAsValue(text) ? `'${text}` : text;
+  if (cell.t === 'n' && typeof cell.v === 'number' && Number.isFinite(cell.v)) return exactNumberText(text, cell.v, true) ?? text;
+  return text;
+}
+
+/**
+ * The text to paste for number v shown as `text`, or null when the text already reads back as v. A plain number shape
+ * keeps its % or $ (so a General target still gets that format); any other display text ("5.00 kg", " 1/2") gives the
+ * bare number when `anyShape`, else null.
+ * @param {string} text @param {number} v @param {boolean} anyShape
+ * @returns {string | null}
+ */
+function exactNumberText(text, v, anyShape) {
+  const shape = numberShape(text);
+  if (!shape) return anyShape ? formulaBarNumber(v) : null;
+  if (shape.n === v || Math.abs(shape.n - v) <= Math.abs(v) * 1e-15) return null;
+  if (shape.percent) return `${formulaBarNumber(v * 100)}%`;
+  return (shape.currency ? '$' : '') + formulaBarNumber(v);
+}
+
+/**
+ * A display text in a plain number shape ($, thousands separators, spaces, a trailing %, negative parentheses) and the
+ * number it reads as; null for anything else (dates, units, fractions).
+ * @param {string} text
+ * @returns {{ n: number, percent: boolean, currency: boolean } | null}
+ */
+function numberShape(text) {
+  let t = text.trim();
+  const percent = t.endsWith('%');
+  if (percent) t = t.slice(0, -1);
+  let neg = false;
+  if (/^\(.*\)$/.test(t)) {
+    neg = true;
+    t = t.slice(1, -1);
+  }
+  const currency = t.includes('$');
+  t = t.replace(/[$,\s]/g, '');
+  if (!/^[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/.test(t)) return null;
+  let n = Number(t) / (percent ? 100 : 1);
+  if (neg) n = -n;
+  return { n, percent, currency };
 }
 
 /**
@@ -5549,6 +5789,10 @@ async function writeClipboard(text, cells) {
 }
 
 // ----- CELL TEXT BOX -----
+// (v0.2.0) The box is also the cell EDITOR while the host allows editing (editState.editable and the kind setCells): F2,
+// a double-click or typing open it, Enter / Tab / Shift+ commit and move, Esc cancels, Alt+Enter is a line break. Every way
+// it can close is one call of closeCellBox(reason) with a fixed rule per reason (CELLBOX_RULES). The rest of this comment
+// describes the read-only box of 0.1.2, which is what the box is while the grid is read-only.
 // Double-clicking a cell opens Excel's in-cell edit box, read-only: a textarea that refuses every edit, over the cell
 // (or merged area), with the cell's display text, all of it selected. Part of it can be selected with the mouse or keyboard and
 // copied: the textarea's own copy (plain text); the grid's copy handler only acts while the grid has the focus.
@@ -5569,6 +5813,9 @@ async function writeClipboard(text, cells) {
  * @property {boolean} loaded    the cell's row was loaded (else onRows fills the text in when it arrives)
  * @property {boolean} menu      a context menu was opened on it and the focus has not come back since: VS Code's menu
  *   takes the focus away (to <body>), which must not close the box (its Copy copies the box's selected text)
+ * @property {'view' | 'edit' | 'replace'} mode  view = the read-only box of 0.1.2; edit = F2 / double-click / formula bar; replace = typing
+ * @property {string} initialValue  an editor: the text the edit started from (what "unchanged" means)
+ * @property {boolean} composing    an IME composition is running (it never commits)
  */
 
 /** @param {MouseEvent} e */
@@ -5584,28 +5831,64 @@ function onGridDblClick(e) {
   if (hit.area !== 'cell') return;
   const view = activeView();
   const m = masterOf(view, hit.r, hit.c);
-  openCellBox(view, m.r, m.c);
+  openCellBox(view, m.r, m.c, { mode: 'edit', caretAtEnd: isCellEditable() });
 }
 
 /**
- * Opens (or re-opens) the read-only text box of a cell: all of its text selected (double-click), or the caret at the
- * end of the text (F2, as Excel's in-cell edit puts it).
- * @param {SheetView} view @param {number} r @param {number} c  top-left cell of the cell / merged area
- * @param {boolean} [caretAtEnd]
+ * What opens the in-cell box and how.
+ * @typedef {object} CellBoxOpen
+ * @property {'view' | 'edit' | 'replace'} [mode]  'edit' (F2, double-click, formula bar) and 'replace' (typing) only while the
+ *   grid is editable; otherwise, and by default, the read-only box of 0.1.2
+ * @property {boolean} [caretAtEnd]  caret at the end of the text; else all of it selected
+ * @property {string} [text]         'replace': what the user typed to start the edit
+ * @property {boolean} [focus]       false: the formula bar keeps the focus (it is the second editor of the same cell)
  */
-function openCellBox(view, r, c, caretAtEnd = false) {
+
+/**
+ * Opens (or re-opens) the in-cell box of a cell. Read-only mode: all of the display text selected (double-click) or the
+ * caret at its end (F2), nothing can be changed. Edit modes (grid editable): the text starts as the cell's edit text
+ * (editStartText); 'replace' starts with what the user typed. Opening a box first ends an editor that is still open
+ * (commit, like clicking elsewhere).
+ * @param {SheetView} view @param {number} r @param {number} c  top-left cell of the cell / merged area
+ * @param {CellBoxOpen} [opts]
+ */
+function openCellBox(view, r, c, opts = {}) {
   const g = /** @type {GridState} */ (G);
-  closeCellBox(false);
+  closeCellBox('blur', false);
   const host = g.dom.scroller.parentElement;
   if (!view.L || !host) return;
   hoverReset();
   closeMenu();
   scrollCellIntoView(view, r, c);
   const cell = cellAt(view, r, c);
-  const text = cell ? displayText(cell) : '';
-  // Not the readonly attribute: Chrome then ignores the keys that move the caret (Shift+Arrow, Home, End), so the
-  // text could not be selected from the keyboard. Every edit is cancelled instead (beforeinput, paste, cut, drop); an
-  // IME composition, which cannot be cancelled, is undone by the input handler.
+  /** @type {'view' | 'edit' | 'replace'} */
+  const mode = isCellEditable() ? opts.mode || 'view' : 'view';
+  const original = mode === 'view' ? '' : editStartText(view, r, c, cell);
+  const text = mode === 'view' ? (cell ? displayText(cell) : '') : mode === 'replace' ? opts.text || '' : original;
+  const caretAtEnd = opts.caretAtEnd === true || mode === 'replace';
+  const el = mode === 'view' ? buildViewCellBox(r, c, text) : buildEditCellBox(r, c);
+  el.value = text;
+  const sc = g.dom.scroller;
+  g.cellBox = { el, sheet: view.index, r, c, st: sc.scrollTop, sl: sc.scrollLeft, loaded: cell !== undefined, menu: false, mode, initialValue: original, composing: false };
+  host.appendChild(el);
+  layoutCellBox(view, el, r, c, cell);
+  if (opts.focus !== false) {
+    el.focus({ preventScroll: true });
+    el.setSelectionRange(caretAtEnd ? el.value.length : 0, el.value.length);
+    el.scrollTop = caretAtEnd ? el.scrollHeight : 0;
+  }
+  if (mode !== 'view') syncFormulaFromBox();
+}
+
+/**
+ * The read-only box (0.1.2). Not the readonly attribute: Chrome then ignores the keys that move the caret (Shift+Arrow,
+ * Home, End), so the text could not be selected from the keyboard. Every edit is cancelled instead (beforeinput, paste,
+ * cut, drop); an IME composition, which cannot be cancelled, is undone by the input handler.
+ * @param {number} r @param {number} c @param {string} text
+ * @returns {HTMLTextAreaElement}
+ */
+function buildViewCellBox(r, c, text) {
+  /** @type {HTMLTextAreaElement} */
   const el = /** @type {HTMLTextAreaElement} */ (
     h('textarea', {
       class: 'fv-cellbox',
@@ -5618,12 +5901,12 @@ function openCellBox(view, r, c, caretAtEnd = false) {
         if (e.isComposing || (e.key !== 'Escape' && e.key !== 'Enter' && e.key !== 'Tab')) return;
         e.preventDefault();
         e.stopPropagation();
-        closeCellBox();
+        closeCellBox('escape');
       },
       // Focus moving elsewhere in the view (F6, Ctrl+G, a click on the name box) closes it; switching to another
       // window keeps it, and the browser gives it the focus back. So does VS Code's context menu on it.
       onblur: () => {
-        if (G?.cellBox?.el === el && document.hasFocus() && !G.cellBox.menu) closeCellBox(false);
+        if (G?.cellBox?.el === el && document.hasFocus() && !G.cellBox.menu) closeCellBox('blur', false);
       },
       oncontextmenu: () => {
         if (G?.cellBox?.el === el) G.cellBox.menu = true;
@@ -5642,28 +5925,204 @@ function openCellBox(view, r, c, caretAtEnd = false) {
       ondragstart: (/** @type {Event} */ e) => e.preventDefault(),
     })
   );
-  el.value = text;
-  const sc = g.dom.scroller;
-  g.cellBox = { el, sheet: view.index, r, c, st: sc.scrollTop, sl: sc.scrollLeft, loaded: cell !== undefined, menu: false };
-  host.appendChild(el);
-  layoutCellBox(view, el, r, c, cell);
-  el.focus({ preventScroll: true });
-  el.setSelectionRange(caretAtEnd ? el.value.length : 0, el.value.length);
-  el.scrollTop = caretAtEnd ? el.scrollHeight : 0;
+  return el;
 }
 
 /**
- * Closes the cell text box. With `focusGrid` the grid takes the focus back when the box had it (or the focus was lost).
- * @param {boolean} [focusGrid]
+ * The editor box. Its text is the one source of truth of an edit: the formula bar mirrors it (and the other way round).
+ * @param {number} r @param {number} c
+ * @returns {HTMLTextAreaElement}
  */
-function closeCellBox(focusGrid = true) {
+function buildEditCellBox(r, c) {
+  /** @type {HTMLTextAreaElement} */
+  const el = /** @type {HTMLTextAreaElement} */ (
+    h('textarea', {
+      class: 'fv-cellbox',
+      'aria-readonly': 'false',
+      spellcheck: 'false',
+      autocomplete: 'off',
+      'aria-label': `${colName(c)}${r + 1} cell text`,
+      onkeydown: (/** @type {KeyboardEvent} */ e) => onCellBoxKeyDown(e, el),
+      onblur: (/** @type {FocusEvent} */ e) => onCellBoxBlur(e, el),
+      oncontextmenu: () => {
+        if (G?.cellBox?.el === el) G.cellBox.menu = true;
+      },
+      onwheel: (/** @type {WheelEvent} */ e) => onCellBoxWheel(e, el),
+      oninput: () => onCellBoxInput(el),
+      // An IME composition never commits: its Enter / Tab belong to the IME, and only compositionend ends it.
+      oncompositionstart: () => {
+        if (G?.cellBox?.el === el) G.cellBox.composing = true;
+      },
+      oncompositionend: () => {
+        if (G?.cellBox?.el === el) G.cellBox.composing = false;
+        onCellBoxInput(el);
+      },
+    })
+  );
+  return el;
+}
+
+/**
+ * Keys of the editor box (contract §10, D-026). Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z: the browser undoes the typing (no
+ * preventDefault) and the key must not reach VS Code, which would undo the document. Ctrl+S commits and saves.
+ * @param {KeyboardEvent} e @param {HTMLTextAreaElement} el
+ */
+function onCellBoxKeyDown(e, el) {
+  const box = G?.cellBox;
+  if (!G || !box || box.el !== el) return;
+  box.menu = false;
+  if (e.isComposing || box.composing || e.keyCode === 229) return;
+  const ctrl = e.ctrlKey || e.metaKey;
+  const key = e.key.toLowerCase();
+  if (ctrl && !e.altKey && (key === 'z' || key === 'y')) {
+    e.stopPropagation();
+    return;
+  }
+  if (ctrl && !e.altKey && !e.shiftKey && key === 's') {
+    e.preventDefault();
+    e.stopPropagation();
+    endCellEdit('save', 0, 'save');
+    return;
+  }
+  if (e.altKey && !ctrl && e.key === 'Enter') {
+    e.preventDefault();
+    e.stopPropagation();
+    insertLineBreak(el);
+    return;
+  }
+  if (ctrl && !e.altKey && !e.shiftKey && e.key === 'Enter') {
+    // Excel: Ctrl+Enter commits and stays in the cell.
+    e.preventDefault();
+    e.stopPropagation();
+    endCellEdit('enter', 0);
+    return;
+  }
+  if (ctrl || e.altKey) return;
+  if (e.key === 'Enter' || e.key === 'Tab') {
+    e.preventDefault();
+    e.stopPropagation();
+    endCellEdit(e.key === 'Enter' ? 'enter' : 'tab', e.shiftKey ? -1 : 1);
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    e.stopPropagation();
+    cancelCellEdit();
+  }
+}
+
+/**
+ * The editor lost the focus: that commits, unless the window itself lost it (VS Code's menus, another window: the
+ * browser gives it back), a context menu is open on it, or the focus went to the formula bar (the same edit).
+ * @param {FocusEvent} e @param {HTMLTextAreaElement} el
+ */
+function onCellBoxBlur(e, el) {
+  const box = G?.cellBox;
+  if (!G || !box || box.el !== el || !document.hasFocus() || box.menu) return;
+  if (e.relatedTarget === G.dom.formula) return;
+  closeCellBox('blur', false);
+}
+
+/** @param {HTMLTextAreaElement} el */
+function onCellBoxInput(el) {
+  if (G?.cellBox?.el !== el) return;
+  syncFormulaFromBox();
+  relayoutCellBox();
+}
+
+/** Alt+Enter: a line break at the caret (Excel). @param {HTMLTextAreaElement} el */
+function insertLineBreak(el) {
+  const start = el.selectionStart;
+  el.setRangeText('\n', start, el.selectionEnd, 'end');
+  onCellBoxInput(el);
+}
+
+/**
+ * What closeCellBox does with an open EDITOR for each reason (contract §10): commit = send the text, cancel = drop it,
+ * keep = leave it open (it is only moved). The read-only box of 0.1.2 closes for every reason.
+ * @type {Record<string, 'commit' | 'cancel' | 'keep'>}
+ */
+const CELLBOX_RULES = {
+  blur: 'commit',
+  enter: 'commit',
+  tab: 'commit',
+  save: 'commit',
+  sheetSwitch: 'commit',
+  hidden: 'commit',
+  escape: 'cancel',
+  invalidate: 'cancel',
+  notEditable: 'cancel',
+  close: 'cancel',
+  scroll: 'keep',
+  zoom: 'keep',
+  theme: 'keep',
+  resize: 'keep',
+};
+
+/**
+ * Closes the cell box, or ends the cell editor, by one fixed rule per reason (CELLBOX_RULES). With `focusGrid` the grid
+ * takes the focus back when the box had it (or the focus was lost). `then: 'save'` asks the host to save after the edit.
+ * @param {string} [reason] @param {boolean} [focusGrid] @param {'save'} [then]
+ */
+function closeCellBox(reason = 'close', focusGrid = true, then) {
   const box = G?.cellBox;
   if (!G || !box) return;
+  const rule = box.mode === 'view' ? 'cancel' : CELLBOX_RULES[reason] || 'cancel';
+  if (rule === 'keep') {
+    relayoutSoon(); // moved in the next frame (a zoom or theme change is applied right after this call)
+    return;
+  }
+  const text = box.el.value;
   // Cleared first: removing the focused box fires its blur handler, which must find it closed.
   G.cellBox = null;
   const hadFocus = document.activeElement === box.el;
   box.el.remove();
   if (focusGrid && (hadFocus || document.activeElement === document.body) && G.dom.scroller.isConnected) G.dom.scroller.focus({ preventScroll: true });
+  if (box.mode === 'view') return;
+  if (rule === 'commit') submitCellText(box.sheet, box.r, box.c, text, box.initialValue ?? '', then);
+  updateFormulaBar();
+}
+
+/**
+ * Enter / Tab / Ctrl+S in an editor: commit, give the grid the focus and move on (Enter down, Tab right, Shift back;
+ * inside a selection of several cells the active cell walks through it, like in the grid).
+ * @param {'enter' | 'tab' | 'save'} reason @param {number} delta @param {'save'} [then]
+ */
+function endCellEdit(reason, delta, then) {
+  const box = G?.cellBox;
+  if (!G || !box) return;
+  const sheet = box.sheet;
+  closeCellBox(reason, false, then);
+  G.dom.scroller.focus({ preventScroll: true });
+  const view = G.views.get(sheet);
+  if (view && delta && sheet === G.sheet) cycleInSelection(view, reason === 'enter' ? 'col' : 'row', delta);
+}
+
+/** Esc in an editor (cell or formula bar): the edit is dropped, the grid has the focus. */
+function cancelCellEdit() {
+  if (!G) return;
+  closeCellBox('escape', false);
+  G.dom.scroller.focus({ preventScroll: true });
+  updateFormulaBar();
+}
+
+let relayoutQueued = false;
+
+/** relayoutCellBox in the next animation frame, once for any number of requests (a scroll fires many events). */
+function relayoutSoon() {
+  if (relayoutQueued) return;
+  relayoutQueued = true;
+  requestAnimationFrame(() => {
+    relayoutQueued = false;
+    relayoutCellBox();
+  });
+}
+
+/** Moves the open box to its cell again (scroll, zoom, theme, resize, typing, patches). */
+function relayoutCellBox() {
+  const box = G?.cellBox;
+  if (!G || !box) return;
+  const view = G.views.get(box.sheet);
+  if (!view || !view.L || G.sheet !== box.sheet) return;
+  layoutCellBox(view, box.el, box.r, box.c, cellAt(view, box.r, box.c));
 }
 
 /**
@@ -5763,9 +6222,806 @@ function onCellBoxWheel(e, el) {
   e.preventDefault();
   const sc = G.dom.scroller;
   const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? G.viewH : 1;
-  closeCellBox();
+  closeCellBox('scroll');
   sc.scrollTop += e.deltaY * unit;
   sc.scrollLeft += (isRtl() ? -1 : 1) * e.deltaX * unit;
+}
+
+// ----- EDITING -----
+// Cell editing in the webview (contract §10, D-024..D-026, D-067). The host is the authority: the grid only shows a typed
+// value at once (the OVERLAY: cell text by position, drawn over the cached rows, never written into them) and asks.
+// - One `edit` message per user action; one in flight per panel. Later edits (and Ctrl+Z / Ctrl+Y / Ctrl+S commands) wait
+//   in G.sendQueue in the order they were made and are sent after the editResult, re-based on its version.
+// - editResult accepted: the host's rows (`patches`) replace the overlay. Rejected: the overlay entries of that edit go and
+//   the reason is shown in the status line (never the error page). A `patch` / `invalidate` from another source drops
+//   the queued edits ("The file changed; your last change was not applied.") and the overlay.
+// - The cell editor box (CELL TEXT BOX) and the formula bar are two views of ONE edit: the box's text is the truth.
+// - The webview keeps no undo history: Ctrl+Z / Ctrl+Y on the grid go to VS Code (document undo).
+
+/** Most cells an optimistic overlay is kept for (a bigger paste / clear waits for the host's rows). */
+const OVERLAY_MAX_CELLS = 20000;
+/** Most cells of one setCells (the host's limit, parseWebviewMessage). */
+const EDIT_MAX_CELLS = 1000000;
+
+/** @typedef {Extract<WebviewMessage, { type: 'command' }>} CommandMessage */
+
+// ----- EDITING: overlay -----
+
+/**
+ * The pending texts of one row of a sheet (column -> text), or undefined.
+ * @param {number} sheet @param {number} r
+ * @returns {Map<number, string> | undefined}
+ */
+function getRowOverlay(sheet, r) {
+  const g = G;
+  if (!g || !g.overlay || g.overlay.size === 0) return undefined; // (the unit tests stub a grid without an overlay)
+  return g.overlay.get(sheet)?.get(r);
+}
+
+/**
+ * The text a pending edit put in a cell (what the grid shows until the host's rows arrive), or undefined.
+ * @param {number} sheet @param {number} r @param {number} c
+ * @returns {string | undefined}
+ */
+function getCellOverlay(sheet, r, c) {
+  return getRowOverlay(sheet, r)?.get(c);
+}
+
+/** @param {number} sheet @param {number} r @param {number} c @param {string} text */
+function setCellOverlay(sheet, r, c, text) {
+  const g = G;
+  if (!g) return;
+  let rows = g.overlay.get(sheet);
+  if (!rows) g.overlay.set(sheet, (rows = new Map()));
+  let cols = rows.get(r);
+  if (!cols) rows.set(r, (cols = new Map()));
+  cols.set(c, text);
+  g.dataVersion++; // the cell painter repaints only when the data version changed
+}
+
+/**
+ * Removes an overlay entry, but only while it still holds `text` (a newer pending text of the same cell stays).
+ * @param {number} sheet @param {number} r @param {number} c @param {string} text
+ */
+function dropCellOverlay(sheet, r, c, text) {
+  const rows = G?.overlay.get(sheet);
+  const cols = rows?.get(r);
+  if (!G || !rows || !cols || cols.get(c) !== text) return;
+  cols.delete(c);
+  if (cols.size === 0) rows.delete(r);
+  if (rows.size === 0) G.overlay.delete(sheet);
+  G.dataVersion++;
+}
+
+/**
+ * A row's cells plus a text cell for every pending overlay text that has no cell yet (the cached row is never changed).
+ * @param {CellData[]} cells sorted by column @param {Map<number, string>} pending
+ * @returns {CellData[]}
+ */
+function withOverlayCells(cells, pending) {
+  const extra = [];
+  for (const [c, text] of pending) if (!findCell(cells, c)) extra.push(/** @type {CellData} */ ({ c, t: 's', v: text, w: text }));
+  if (extra.length === 0) return cells;
+  return [...cells, ...extra].sort((a, b) => a.c - b.c);
+}
+
+/** @param {SheetId | undefined} id @returns {number} the tab position of a sheet, -1 when it is not there */
+function sheetIndexById(id) {
+  return G && id !== undefined ? G.meta.sheets.findIndex((s) => s.id === id) : -1;
+}
+
+/** @param {Range[]} ranges @returns {number} the cells of the ranges (counted twice where they overlap) */
+function rangesCellCount(ranges) {
+  let n = 0;
+  for (const rg of ranges) n += (rg.r1 - rg.r0 + 1) * (rg.c1 - rg.c0 + 1);
+  return n;
+}
+
+/**
+ * Drops the overlay entries a (finished or dropped) intent made.
+ * @param {EditIntent} intent
+ */
+function dropIntentOverlay(intent) {
+  if (!G || G.overlay.size === 0) return;
+  if (intent.kind === 'setCells') {
+    const sheet = sheetIndexById(intent.sheetId);
+    if (sheet >= 0) for (const [r, c, text] of intent.cells) dropCellOverlay(sheet, r, c, text);
+  } else if (intent.kind === 'clear') {
+    const sheet = sheetIndexById(intent.sheetId);
+    if (sheet < 0 || rangesCellCount(intent.ranges) > OVERLAY_MAX_CELLS) return;
+    for (const rg of intent.ranges) for (let r = rg.r0; r <= rg.r1; r++) for (let c = rg.c0; c <= rg.c1; c++) dropCellOverlay(sheet, r, c, '');
+  }
+}
+
+// ----- EDITING: state -----
+
+/** Can the user change cells now? The host decides (editState); the webview only follows it. */
+function isCellEditable() {
+  const g = G;
+  if (!g || g.sheet < 0 || !g.editState || !g.editState.editable) return false;
+  if (g.editState.kinds && !g.editState.kinds.includes('setCells')) return false;
+  return g.meta.sheets[g.sheet]?.id !== undefined;
+}
+
+let readOnlySaidAt = 0;
+
+/** A key that would change a cell in a read-only grid: say why nothing happens (at most every 5 s; the status is a live region). */
+function sayReadOnly() {
+  const now = Date.now();
+  if (!G || now - readOnlySaidAt < 5000) return;
+  readOnlySaidAt = now;
+  const reason = G.editState?.reason;
+  setStatusMessage(reason ? `This view is read-only: ${reason}` : 'This view is read-only.', 'info');
+}
+
+/** Delete / Backspace need the `clear` intent. */
+function canClear() {
+  return isCellEditable() && (!G?.editState?.kinds || G.editState.kinds.includes('clear'));
+}
+
+/** The error literals, numbers, dates, times and booleans Excel reads from typed text (parseCellInput in sheet.ts; wider is harmless). */
+const TYPED_VALUE_RE = /^\s*(?:true|false|#(?:NULL!|DIV\/0!|VALUE!|REF!|NAME\?|NUM!|N\/A)|\(?[+-]?\$?[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?%?\)?|\d{4}-\d{1,2}-\d{1,2}(?:[ T]\d{1,2}:\d{2}.*)?|\d{1,2}\/\d{1,2}\/\d{2,4}(?: \d{1,2}:\d{2}.*)?|\d{1,2}:\d{2}(?::\d{2})?(?:\s?[AaPp][Mm])?)\s*$/i;
+
+/**
+ * xlsx: would this stored TEXT turn into something else when it is typed back in (a formula, a number, a date, TRUE,
+ * an error, or an apostrophe that Excel eats)? Then the editor shows it with a leading apostrophe, Excel's text mark.
+ * @param {string} text
+ */
+function textReadsAsValue(text) {
+  if (text === '') return false;
+  if (text.startsWith('=') || text.startsWith("'")) return true;
+  return /\d|true|false|#/i.test(text) && TYPED_VALUE_RE.test(text);
+}
+
+/**
+ * The text an edit of the cell starts with: a pending overlay text, else the cell's raw value or =formula (never the
+ * display text). xlsx text that would read as something else gets the apostrophe (`'007`, `'=A1`).
+ * @param {SheetView} view @param {number} r @param {number} c @param {CellData | null | undefined} cell
+ */
+function editStartText(view, r, c, cell) {
+  const over = getCellOverlay(view.index, r, c);
+  if (over !== undefined) return over;
+  const text = cell ? rawValue(cell) : '';
+  return G?.kind === 'sheet' && cell && cell.t === 's' && !cell.f && textReadsAsValue(text) ? `'${text}` : text;
+}
+
+/** Applies a new edit state: formula bar, status bar, banner button; an open editor goes when editing is off. @param {EditStateMessage} msg */
+function onEditState(msg) {
+  const g = G;
+  if (!g) return;
+  const could = isCellEditable();
+  const had = !!g.editState;
+  g.editState = msg.state;
+  g.readOnly = !msg.state.editable;
+  if (!isCellEditable()) {
+    closeCellBox('notEditable');
+    // Said once, when editing stops while the view is open (the reason is also the status bar's tooltip).
+    if (could && msg.state.reason) setStatusMessage(msg.state.reason, 'warn');
+  } else if (had && !could) {
+    // Said once when editing starts in an open view ("Edit anyway", the setting turned on): the live status tells screen readers.
+    setStatusMessage('Editing is on.', 'info');
+  }
+  updateEditUi();
+}
+
+/** Read-only / Ready in the status bar, the formula bar's editability and the banner's "Edit anyway" button. */
+function updateEditUi() {
+  const g = G;
+  if (!g) return;
+  const state = g.editState;
+  const editable = isCellEditable();
+  const mode = g.dom.statusMode;
+  if (mode) {
+    mode.textContent = editable ? 'Ready' : 'Read-only';
+    mode.title = editable ? '' : state?.reason ? `This view is read-only: ${state.reason}` : 'This view is read-only';
+  }
+  const fx = g.dom.formulaBar.querySelector('.fv-fx');
+  if (fx) fx.setAttribute('title', editable ? 'Cell value or formula' : 'Cell value or formula (read-only)');
+  updateBanner(g.bannerText, state?.canEditAnyway);
+  updateFormulaBar();
+}
+
+// ----- EDITING: sending -----
+
+let nextEditId = 1;
+
+/**
+ * Asks the host for one edit (one user action). Sent at once, or after the edit in flight.
+ * @param {EditIntent} intent @param {'save'} [then]
+ */
+function sendEdit(intent, then) {
+  const g = G;
+  if (!g) return;
+  enqueueSend({ type: 'edit', editId: nextEditId++, baseVersion: g.version, intent, ...(then ? { then } : {}) });
+}
+
+/** A document command, in order with the edits (D-067: a Ctrl+Z pressed while an edit is in flight undoes THAT edit). @param {'undo' | 'redo' | 'save'} id */
+function sendCommand(id) {
+  enqueueSend({ type: 'command', id });
+}
+
+/** @param {EditMessage | CommandMessage} msg */
+function enqueueSend(msg) {
+  if (!G) return;
+  G.sendQueue.push(msg);
+  pumpSendQueue();
+}
+
+/** Sends queued messages until an edit is in flight (re-based on the latest version). */
+function pumpSendQueue() {
+  const g = G;
+  while (g && !g.inFlightEdit && g.sendQueue.length > 0) {
+    const msg = g.sendQueue.shift();
+    if (!msg) break;
+    if (msg.type === 'edit') {
+      msg.baseVersion = g.version;
+      g.inFlightEdit = msg;
+    }
+    post(msg);
+  }
+}
+
+/** Drops the queued edits (and their overlay) because the file changed under them; a command that waited goes too. */
+function dropQueuedEdits() {
+  const g = G;
+  if (!g || g.sendQueue.length === 0) return;
+  let edits = 0;
+  for (const msg of g.sendQueue) {
+    if (msg.type !== 'edit') continue;
+    edits++;
+    dropIntentOverlay(msg.intent);
+  }
+  g.sendQueue = [];
+  if (edits > 0) setStatusMessage('The file changed; your last change was not applied.', 'warn');
+  scheduleRender();
+}
+
+/** @param {EditResultMessage} msg */
+function onEditResult(msg) {
+  const g = G;
+  if (!g) return;
+  const sent = g.inFlightEdit;
+  if (!sent || sent.editId !== msg.editId) return;
+  g.inFlightEdit = null;
+  g.version = Math.max(g.version, msg.version);
+  if (msg.accepted) {
+    if (msg.sheets) for (const sm of msg.sheets) applySheetMeta(sm);
+    if (msg.patches) applyPatches(msg.patches);
+    dropIntentOverlay(sent.intent);
+    if (msg.select) selectResult(msg.select);
+    // Delete and paste change cells the user may not see: the live status says it was done (typing says nothing).
+    const it = sent.intent;
+    if (it.kind === 'clear') setStatusMessage('Cleared.', 'info');
+    else if (it.kind === 'setCells' && it.cells.length > 1) setStatusMessage(`Changed ${formatCount(it.cells.length)} cells.`, 'info');
+  } else {
+    dropIntentOverlay(sent.intent);
+    setStatusMessage(msg.reason || 'The change was not applied.', 'warn');
+    reopenRejectedDraft(msg.editId);
+  }
+  scheduleRender();
+  updateFormulaBar();
+  scheduleStats();
+  pumpSendQueue();
+}
+
+/** A patch from another source (another panel, undo / redo, recalc). @param {PatchMessage} msg */
+function onPatch(msg) {
+  const g = G;
+  if (!g || msg.version < g.version) return;
+  g.version = msg.version;
+  dropQueuedEdits();
+  if (msg.styles) mergeStyles(msg.styles);
+  if (msg.sheets) for (const sm of msg.sheets) applySheetMeta(sm);
+  if (msg.patches) applyPatches(msg.patches);
+  scheduleRender();
+  updateFormulaBar();
+  scheduleStats();
+}
+
+/**
+ * Puts the host's rows into the row cache: rows [start, end) of a patch are replaced (a row that is not in `rows` is now
+ * empty). Blocks that are not loaded stay so (they are fetched later, with the new data).
+ * @param {RowsPatch[]} patches
+ */
+function applyPatches(patches) {
+  const g = G;
+  if (!g) return;
+  for (const patch of patches) {
+    const sheet = sheetIndexById(patch.sheetId);
+    if (sheet < 0) continue;
+    mergeStyles(patch.styles);
+    /** @type {Map<number, RowData>} */
+    const byRow = new Map();
+    for (const row of patch.rows) byRow.set(row.r, row);
+    const first = Math.floor(patch.start / BLOCK_ROWS);
+    const last = Math.floor((patch.end - 1) / BLOCK_ROWS);
+    for (let b = first; b <= last; b++) {
+      const block = rowCache.blocks.get(blockKey(sheet, b));
+      if (!block) continue;
+      for (let i = 0; i < BLOCK_ROWS; i++) {
+        const r = b * BLOCK_ROWS + i;
+        if (r >= patch.start && r < patch.end) block[i] = byRow.get(r);
+      }
+    }
+  }
+  g.dataVersion++;
+}
+
+/**
+ * A sheet's new meta from a `patch` (used range grown by an edit, merges, size): replaces it by id; the row cache stays.
+ * @param {SheetMeta} sm
+ */
+function applySheetMeta(sm) {
+  const g = G;
+  const index = sheetIndexById(sm.id);
+  if (!g || index < 0) return;
+  g.meta.sheets[index] = sm;
+  const view = g.views.get(index);
+  if (view) {
+    view.meta = sm;
+    view.mergeIndex = buildMergeIndex(sm.merges);
+    view.maxR = Math.max(MAX_ROWS, sm.rowCount);
+    view.maxC = Math.max(MAX_COLS, sm.colCount);
+    const top = index === g.sheet && view.L ? virtualScrollTop() : view.scrollTop;
+    const left = index === g.sheet ? g.dom.scroller.scrollLeft : view.scrollLeft;
+    view.L = null;
+    if (index === g.sheet) {
+      applyLayout(view);
+      setVirtualScroll(view, top, left);
+      g.dom.scroller.setAttribute('aria-rowcount', String(view.maxR));
+      g.dom.scroller.setAttribute('aria-colcount', String(view.maxC));
+      g.selVersion++;
+    }
+  }
+  renderTabs();
+}
+
+/** The host's choice of selection after an edit (a paste over merged cells). @param {{ sheetId: SheetId, range: Range }} sel */
+function selectResult(sel) {
+  const g = G;
+  if (!g || sheetIndexById(sel.sheetId) !== g.sheet) return;
+  selectRange(activeView(), sel.range);
+}
+
+/** Selects one range, the active cell at its top-left corner. @param {SheetView} view @param {Range} rg */
+function selectRange(view, rg) {
+  const from = { r: rg.r0, c: rg.c0 };
+  setSelection(view, [{ r0: rg.r0, c0: rg.c0, r1: rg.r1, c1: rg.c1 }], from, { anchor: from, cursor: { r: rg.r1, c: rg.c1 }, reveal: null });
+}
+
+// ----- EDITING: cells -----
+
+/**
+ * A committed cell text: shown at once, sent to the host. The same text as the cell had sends nothing (Enter without a
+ * change); Ctrl+S (`then: 'save'`) then only saves.
+ * @param {number} sheet @param {number} r @param {number} c @param {string} text @param {string} original @param {'save'} [then]
+ */
+function submitCellText(sheet, r, c, text, original, then) {
+  const g = G;
+  if (!g) return;
+  const sheetId = g.meta.sheets[sheet]?.id;
+  if (text === original || sheetId === undefined) {
+    if (then === 'save') sendCommand('save');
+    return;
+  }
+  setCellOverlay(sheet, r, c, text);
+  scheduleRender();
+  sendEdit({ kind: 'setCells', sheetId, cells: [[r, c, text]] }, then);
+  editorDraft = { editId: nextEditId - 1, sheet, r, c, text };
+}
+
+/** The last text committed from the editor: a rejected edit opens the editor again with it (Excel keeps the editor open). @type {{ editId: number, sheet: number, r: number, c: number, text: string } | null} */
+let editorDraft = null;
+
+/** The host refused the editor's text: open the editor on that cell again with the text, unless the user moved on. @param {number} editId */
+function reopenRejectedDraft(editId) {
+  const g = G;
+  const d = editorDraft;
+  if (!g || !d || d.editId !== editId) return;
+  editorDraft = null;
+  if (g.cellBox || g.sheet !== d.sheet || !isCellEditable()) return;
+  const view = activeView();
+  selectRange(view, { r0: d.r, c0: d.c, r1: d.r, c1: d.c });
+  openCellBox(view, d.r, d.c, { mode: 'replace', text: d.text });
+}
+
+/** Delete / Backspace: clear the contents of the selection, one edit for all of its ranges. @param {SheetView} view */
+function clearSelectionContents(view) {
+  const sheetId = view.meta.id;
+  if (sheetId === undefined || !canClear()) return;
+  const ranges = view.sel.ranges.map((rg) => ({ r0: rg.r0, c0: rg.c0, r1: rg.r1, c1: rg.c1 }));
+  if (ranges.length > 1000) {
+    setStatusMessage('This change is too large (max 1,000 ranges).', 'warn');
+    return;
+  }
+  if (rangesCellCount(ranges) <= OVERLAY_MAX_CELLS) {
+    for (const rg of ranges) for (let r = rg.r0; r <= rg.r1; r++) for (let c = rg.c0; c <= rg.c1; c++) setCellOverlay(view.index, r, c, '');
+  }
+  scheduleRender();
+  updateFormulaBar();
+  sendEdit({ kind: 'clear', sheetId, ranges, what: 'contents' });
+}
+
+/**
+ * The text a key press starts an edit with ('' = an IME or dead key: the browser types it into the box that now has
+ * the focus), or null when the key is not for typing. AltGr characters (Ctrl+Alt on Windows) count as typing.
+ * @param {KeyboardEvent} e
+ * @returns {string | null}
+ */
+function editStartKey(e) {
+  if (e.key === 'Process' || e.key === 'Dead' || e.keyCode === 229) return '';
+  const altGr = e.getModifierState('AltGraph');
+  if (e.metaKey || ((e.ctrlKey || e.altKey) && !altGr)) return null;
+  if ([...e.key].length !== 1) return null;
+  if (e.key === ' ' && e.shiftKey) return null; // Shift+Space selects the row
+  return e.key;
+}
+
+// ----- EDITING: formula bar -----
+// The formula bar is the second editor of the same cell: focusing it opens the editor box over the cell (without taking
+// the focus); typing in either one changes both. Enter, Tab, Esc, Ctrl+S and blur work as in the box.
+
+/** @param {boolean} editable */
+function setFormulaEditable(editable) {
+  const f = G?.dom.formula;
+  if (!f) return;
+  const want = editable ? 'plaintext-only' : null;
+  if (f.getAttribute('contenteditable') !== want) {
+    if (want) f.setAttribute('contenteditable', want);
+    else f.removeAttribute('contenteditable');
+  }
+  f.setAttribute('aria-readonly', editable ? 'false' : 'true');
+  if (editable) f.setAttribute('aria-multiline', 'true'); // Alt+Enter adds line breaks
+  else f.removeAttribute('aria-multiline');
+}
+
+/** The text and look of the formula bar. @param {string} text @param {boolean} isFormula */
+function setFormulaText(text, isFormula) {
+  const f = G?.dom.formula;
+  if (!f) return;
+  if (f.textContent !== text) {
+    f.textContent = text;
+    f.title = text.length > 60 || text.includes('\n') ? text : '';
+  }
+  f.classList.toggle('fv-formula-f', isFormula);
+}
+
+/** The box's text goes to the formula bar (unless the user is typing there). */
+function syncFormulaFromBox() {
+  const g = G;
+  const box = g?.cellBox;
+  if (!g || !box || box.mode === 'view' || document.activeElement === g.dom.formula) return;
+  setFormulaText(box.el.value, g.kind === 'sheet' && box.el.value.startsWith('='));
+}
+
+/** The formula bar's text goes to the open box. */
+function onFormulaInput() {
+  const g = G;
+  const box = g?.cellBox;
+  if (!g || !box || box.mode === 'view') return;
+  box.el.value = g.dom.formula.textContent || '';
+  relayoutCellBox();
+  g.dom.formula.classList.toggle('fv-formula-f', g.kind === 'sheet' && box.el.value.startsWith('='));
+}
+
+/**
+ * Alt+Enter in the formula bar: a line break at the caret. insertLineBreak puts a real newline into a plaintext-only
+ * contenteditable and keeps the caret after it (insertText does nothing for a newline there; a hand-made text node
+ * leaves the caret before a trailing newline). It fires `input`, which copies the text to the editor box.
+ */
+function insertFormulaLineBreak() {
+  document.execCommand('insertLineBreak');
+}
+
+/** Focus in the formula bar starts an edit of the active cell (Excel). */
+function onFormulaFocus() {
+  const g = G;
+  if (!g || g.cellBox || !isCellEditable()) return;
+  const view = activeView();
+  const m = masterOf(view, view.sel.active.r, view.sel.active.c);
+  openCellBox(view, m.r, m.c, { mode: 'edit', caretAtEnd: true, focus: false });
+}
+
+/** Focus left the formula bar: commit, unless the window lost it or it went to the editor box. @param {FocusEvent} e */
+function onFormulaBlur(e) {
+  const box = G?.cellBox;
+  if (!G || !box || box.mode === 'view' || !document.hasFocus() || e.relatedTarget === box.el) return;
+  closeCellBox('blur', false);
+}
+
+/** @param {KeyboardEvent} e */
+function onFormulaKeyDown(e) {
+  const g = G;
+  if (!g || e.isComposing || e.keyCode === 229) return;
+  const ctrl = e.ctrlKey || e.metaKey;
+  const key = e.key.toLowerCase();
+  const box = g.cellBox && g.cellBox.mode !== 'view' ? g.cellBox : null;
+  if (box) {
+    if (ctrl && !e.altKey && (key === 'z' || key === 'y')) {
+      e.stopPropagation(); // the browser undoes the typing here (D-026); VS Code must not undo the document
+      return;
+    }
+    if (ctrl && !e.altKey && !e.shiftKey && key === 's') {
+      e.preventDefault();
+      e.stopPropagation();
+      endCellEdit('save', 0, 'save');
+      return;
+    }
+    if (e.altKey && !ctrl && e.key === 'Enter') {
+      e.preventDefault();
+      e.stopPropagation();
+      insertFormulaLineBreak();
+      return;
+    }
+    if (!ctrl && !e.altKey && (e.key === 'Enter' || e.key === 'Tab')) {
+      e.preventDefault();
+      e.stopPropagation();
+      endCellEdit(e.key === 'Enter' ? 'enter' : 'tab', e.shiftKey ? -1 : 1);
+      return;
+    }
+    if (ctrl && !e.altKey && !e.shiftKey && e.key === 'Enter') {
+      e.preventDefault();
+      e.stopPropagation();
+      endCellEdit('enter', 0); // Ctrl+Enter: commit, stay in the cell
+      return;
+    }
+    if (e.key === 'Escape' && !ctrl && !e.altKey) {
+      e.preventDefault();
+      e.stopPropagation();
+      cancelCellEdit();
+      return;
+    }
+  } else if ((e.key === 'Escape' || e.key === 'Enter') && !ctrl && !e.altKey) {
+    e.preventDefault();
+    g.dom.scroller.focus({ preventScroll: true });
+    return;
+  }
+  if (ctrl && !e.altKey && !e.shiftKey && key === 'a') {
+    // Select all = the formula text, as in a text box (the page's select-all would take the whole view). Not passed on:
+    // VS Code would run its own select-all on the page.
+    e.preventDefault();
+    e.stopPropagation();
+    window.getSelection()?.selectAllChildren(g.dom.formula);
+  }
+}
+
+// ----- EDITING: paste -----
+
+/**
+ * Ctrl+V on the grid (the editor box and the formula bar paste text natively). `text/html` (from Excel) is parsed into an
+ * inert fragment that is never inserted (a table, cells as text), else `text/plain` is read as TSV. One setCells for
+ * the whole block; a single copied cell fills a selection of several cells (Excel). Formulas in pasted HTML are not taken.
+ * @param {ClipboardEvent} e
+ */
+function onGridPaste(e) {
+  const g = G;
+  const dt = e.clipboardData;
+  if (!g || !dt || g.cellBox || !isCellEditable()) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const table = clipboardTable(dt);
+  if (table === 'tooLarge') setStatusMessage(PASTE_TOO_LARGE, 'warn');
+  else if (table && table.length > 0) pasteTable(activeView(), table);
+}
+
+const PASTE_TOO_LARGE = 'This change is too large (max 1,000,000 cells).';
+
+/** @param {DataTransfer} dt @returns {string[][] | null | 'tooLarge'} */
+function clipboardTable(dt) {
+  const plain = dt.getData('text/plain');
+  if (lastCopy && plain && clipboardKey(plain) === clipboardKey(lastCopy.text)) return lastCopy.values;
+  const html = dt.getData('text/html');
+  if (html && html.length <= 32 * 1024 * 1024) {
+    try {
+      // Parsed in a <template>: its content belongs to an inert document (nothing runs). Handler attributes and images are
+      // cut from the markup first (inside tags only, text is untouched): even an inert parser reports them to the CSP.
+      const tpl = document.createElement('template');
+      tpl.innerHTML = html
+        .replace(/<img\b[^>]*>/gi, '')
+        .replace(/<[a-zA-Z][^>]*>/g, (tag) => tag.replace(/\s+on[a-zA-Z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/gi, ''));
+      const table = tpl.content.querySelector('table');
+      const grid = table ? htmlTableToGrid(table, textClasses(tpl.content)) : null;
+      if (grid && grid.length > 0) return grid;
+    } catch (err) {
+      if (err instanceof RangeError && err.message === PASTE_TOO_LARGE) return 'tooLarge';
+      // not parseable: the plain text below
+    }
+  }
+  const text = dt.getData('text/plain');
+  return text ? parseTsv(text) : null;
+}
+
+/**
+ * Class names that Excel's HTML (its <style> block) marks as Text format (mso-number-format:"\@").
+ * @param {ParentNode} root
+ * @returns {Set<string>}
+ */
+function textClasses(root) {
+  /** @type {Set<string>} */
+  const out = new Set();
+  for (const st of root.querySelectorAll('style')) {
+    for (const m of (st.textContent || '').matchAll(/\.([\w-]+)\s*\{[^}]*mso-number-format\s*:\s*["']?\\?@/gi)) out.add(m[1].toLowerCase());
+  }
+  return out;
+}
+
+/**
+ * The text to paste for one HTML table cell. A cell marked as text (x:str, or mso-number-format "\@" inline or by
+ * class: FileStudio's and Excel's copy) stays text: spaces kept, an apostrophe when it would read as a value. A number
+ * whose display text rounds it pastes its x:num value.
+ * @param {Element} td @param {Set<string>} [textCls]
+ */
+function htmlPasteText(td, textCls) {
+  const style = td.getAttribute('style') || '';
+  const asText = td.hasAttribute('x:str') || /mso-number-format\s*:\s*["']?\\?@/i.test(style) || [...td.classList].some((c) => !!textCls?.has(c.toLowerCase()));
+  const text = htmlCellText(td, asText);
+  if (asText) return textReadsAsValue(text) ? `'${text}` : text;
+  const num = td.getAttribute('x:num');
+  if (num) {
+    const v = Number(num);
+    if (Number.isFinite(v)) return exactNumberText(text, v, false) ?? text;
+  }
+  return text;
+}
+
+/**
+ * Cell texts of an HTML table, spans expanded (a merged cell's text in its top-left cell, '' after it).
+ * @param {HTMLTableElement} table @param {Set<string>} [textCls] classes marked as Text format
+ * @returns {string[][]}
+ */
+function htmlTableToGrid(table, textCls) {
+  /** @type {string[][]} */
+  const out = [];
+  const taken = new Set();
+  let r = 0;
+  let area = 0;
+  for (const tr of table.rows) {
+    let c = 0;
+    out[r] ||= [];
+    for (const td of tr.cells) {
+      while (taken.has(r * 65536 + c)) c++;
+      const rowSpan = clamp(td.rowSpan || 1, 1, 1000);
+      const colSpan = clamp(td.colSpan || 1, 1, 1000);
+      // Spans are counted before they are expanded: a crafted table must not freeze the view before the size check.
+      if ((area += rowSpan * colSpan) > EDIT_MAX_CELLS) throw new RangeError(PASTE_TOO_LARGE);
+      for (let i = 0; i < rowSpan; i++) {
+        out[r + i] ||= [];
+        for (let j = 0; j < colSpan; j++) {
+          out[r + i][c + j] = i === 0 && j === 0 ? htmlPasteText(td, textCls) : '';
+          if (i || j) taken.add((r + i) * 65536 + c + j);
+        }
+      }
+      c += colSpan;
+    }
+    r++;
+  }
+  const rows = out.length;
+  for (let i = 0; i < rows; i++) {
+    const row = out[i] || (out[i] = []);
+    for (let j = 0; j < row.length; j++) if (row[j] === undefined) row[j] = '';
+  }
+  return out;
+}
+
+/**
+ * The text of a table cell as the page would show it: runs of white space are one space, <br> and blocks are line breaks.
+ * `keepEnds`: a text cell keeps its leading and trailing spaces.
+ * @param {Element} td @param {boolean} [keepEnds]
+ */
+function htmlCellText(td, keepEnds = false) {
+  let out = '';
+  /** @param {Node} node */
+  const walk = (node) => {
+    for (const n of node.childNodes) {
+      if (n.nodeType === Node.TEXT_NODE) out += (n.textContent || '').replace(/[ \t\r\n\f ]+/g, ' ');
+      else if (n instanceof HTMLElement) {
+        if (n.tagName === 'SCRIPT' || n.tagName === 'STYLE') continue;
+        if (n.tagName === 'BR') out += '\n';
+        else {
+          if (/^(P|DIV|LI)$/.test(n.tagName) && out !== '' && !out.endsWith('\n')) out += '\n';
+          walk(n);
+        }
+      }
+    }
+  };
+  walk(td);
+  const lines = out.replace(/ *\n */g, '\n');
+  return keepEnds ? lines.replace(/^\n+|\n+$/g, '') : lines.trim();
+}
+
+/**
+ * Reads tab-separated text (Excel's text/plain): a field that starts with a quote runs to the closing quote ("" = a quote,
+ * line breaks stay inside); the final line break ends the last row.
+ * @param {string} text
+ * @returns {string[][]}
+ */
+function parseTsv(text) {
+  /** @type {string[][]} */
+  const rows = [];
+  let row = [];
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    let field = '';
+    if (text[i] === '"') {
+      i++;
+      for (;;) {
+        const q = text.indexOf('"', i);
+        if (q < 0) {
+          field += text.slice(i);
+          i = n;
+          break;
+        }
+        field += text.slice(i, q);
+        if (text[q + 1] === '"') {
+          field += '"';
+          i = q + 2;
+        } else {
+          i = q + 1;
+          break;
+        }
+      }
+      field = field.replace(/\r\n?/g, '\n');
+      // Anything between the closing quote and the next tab / line break is kept as it is.
+      while (i < n && text[i] !== '\t' && text[i] !== '\n' && text[i] !== '\r') field += text[i++];
+    } else {
+      let j = i;
+      while (j < n && text[j] !== '\t' && text[j] !== '\n' && text[j] !== '\r') j++;
+      field = text.slice(i, j);
+      i = j;
+    }
+    row.push(field);
+    if (i >= n) break;
+    if (text[i] === '\t') {
+      i++;
+      if (i >= n) row.push('');
+    } else {
+      if (text[i] === '\r' && text[i + 1] === '\n') i++;
+      i++;
+      rows.push(row);
+      row = [];
+    }
+  }
+  if (row.length > 0) rows.push(row);
+  return rows;
+}
+
+/**
+ * Sends a pasted block: at the top-left of the selection, or into every cell of the selection when one cell was copied.
+ * @param {SheetView} view @param {string[][]} table
+ */
+function pasteTable(view, table) {
+  const sheetId = view.meta.id;
+  const last = view.sel.ranges[view.sel.ranges.length - 1];
+  if (sheetId === undefined || !last) return;
+  const rows = table.length;
+  const cols = table.reduce((m, row) => Math.max(m, row.length), 0);
+  /** @type {[r: number, c: number, text: string][]} */
+  const cells = [];
+  /** @type {Range | null} */
+  let block = null;
+  if (rows === 1 && cols === 1 && rangesCellCount(view.sel.ranges) > 1) {
+    if (rangesCellCount(view.sel.ranges) > EDIT_MAX_CELLS) return tooLarge();
+    for (const rg of view.sel.ranges) for (let r = rg.r0; r <= rg.r1; r++) for (let c = rg.c0; c <= rg.c1; c++) cells.push([r, c, table[0][0]]);
+  } else {
+    if (rows * cols > EDIT_MAX_CELLS) return tooLarge();
+    if (last.r0 + rows > view.maxR || last.c0 + cols > view.maxC) {
+      setStatusMessage('This does not fit: it would go past the end of the sheet.', 'warn');
+      return;
+    }
+    for (let i = 0; i < rows; i++) for (let j = 0; j < table[i].length; j++) cells.push([last.r0 + i, last.c0 + j, table[i][j]]);
+    block = { r0: last.r0, c0: last.c0, r1: last.r0 + rows - 1, c1: last.c0 + cols - 1 };
+  }
+  if (cells.length === 0) return;
+  if (cells.length <= OVERLAY_MAX_CELLS) for (const [r, c, text] of cells) setCellOverlay(view.index, r, c, text);
+  scheduleRender();
+  updateFormulaBar();
+  sendEdit({ kind: 'setCells', sheetId, cells });
+  if (block && (rows > 1 || cols > 1)) selectRange(view, block);
+
+  function tooLarge() {
+    setStatusMessage('This change is too large (max 1,000,000 cells).', 'warn');
+  }
 }
 
 // ----- LINKS & NAVIGATION -----
@@ -5898,7 +7154,7 @@ function snapshotState() {
   /** @type {Record<string, any>} */
   const sheets = { ...(g.saved?.sheets || {}) };
   for (const v of g.views.values()) {
-    sheets[v.meta.name] = {
+    sheets[sheetKey(v.meta)] = {
       st: Math.round(v.scrollTop),
       sl: Math.round(v.scrollLeft),
       z: v.zoom,
@@ -5908,8 +7164,18 @@ function snapshotState() {
   // Hidden sheets revealed for viewing (one of them may be the active sheet). While the workbook has no worksheets
   // (sheet -1 after an invalidate), the last active / revealed sheets are kept for when worksheets come back.
   if (g.sheet < 0 && g.saved) return { file: g.fileName, activeSheet: g.saved.activeSheet, revealed: g.saved.revealed, sheets };
-  const revealed = [...g.revealed].map((i) => g.meta.sheets[i]?.name).filter((name) => name !== undefined);
-  return { file: g.fileName, activeSheet: g.meta.sheets[g.sheet]?.name, revealed, sheets };
+  const revealed = [...g.revealed].map((i) => g.meta.sheets[i]).filter((sm) => sm !== undefined).map(sheetKey);
+  const active = g.meta.sheets[g.sheet];
+  return { file: g.fileName, activeSheet: active ? sheetKey(active) : undefined, revealed, sheets };
+}
+
+/**
+ * The key of a sheet in the persisted view state: its stable id (survives a rename), else its name (0.1.2 states and
+ * files without ids). A state saved by name is still found.
+ * @param {SheetMeta} sm
+ */
+function sheetKey(sm) {
+  return sm.id !== undefined ? `id:${sm.id}` : sm.name;
 }
 
 const saveGridState = debounce(() => {
@@ -5996,7 +7262,7 @@ function renderTabs() {
         title: revealed ? `${sm.name} (${hiddenSheetLabel(sm)})` : sm.name,
         // Screen readers hear what the italic label and the dashed mark show.
         'aria-label': revealed ? `${sm.name}, ${hiddenSheetLabel(sm)}` : null,
-        dataset: { index: String(sm.index) },
+        dataset: { index: String(sm.index), ...(sm.id != null ? { id: String(sm.id) } : {}) },
         onclick: () => {
           activateSheet(sm.index);
           G?.dom.scroller.focus({ preventScroll: true });
@@ -6238,21 +7504,13 @@ function buildFormulaBar() {
   });
   nameBox.addEventListener('focus', () => nameBox.select());
   nameBox.addEventListener('blur', () => updateFormulaBar());
-  // Read-only text box: focusable so keyboard and screen-reader users can read (and select) the whole value;
-  // Escape / Enter go back to the grid like Excel.
+  // Formula text box: focusable so keyboard and screen-reader users can read (and select) the whole value;
+  // Escape / Enter go back to the grid like Excel; editable when cell is editable.
   const formula = h('div', { class: 'fv-formula', role: 'textbox', tabindex: '0', 'aria-readonly': 'true', 'aria-label': 'Formula Bar' });
-  formula.addEventListener('keydown', (e) => {
-    if ((e.key === 'Escape' || e.key === 'Enter') && !e.ctrlKey && !e.altKey && !e.metaKey) {
-      e.preventDefault();
-      G?.dom.scroller.focus({ preventScroll: true });
-    } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'a') {
-      // Select all = the formula text, as in a text box (the page's select-all would take the whole view). Not
-      // passed on: VS Code would run its own select-all on the page.
-      e.preventDefault();
-      e.stopPropagation();
-      window.getSelection()?.selectAllChildren(formula);
-    }
-  });
+  formula.addEventListener('keydown', onFormulaKeyDown);
+  formula.addEventListener('input', onFormulaInput);
+  formula.addEventListener('focus', onFormulaFocus);
+  formula.addEventListener('blur', onFormulaBlur);
   const bar = h(
     'div',
     { class: 'fv-formula-bar' },
@@ -6264,7 +7522,10 @@ function buildFormulaBar() {
   return { bar, nameBox, formula };
 }
 
-/** Name box = address of the selection, formula bar = raw value or =formula of the active cell. */
+/**
+ * Name box = address of the selection, formula bar = raw value or =formula of the active cell (editable grid: the text an
+ * edit starts with, so `'007` shows its apostrophe; while an edit is open: the edit's text).
+ */
 function updateFormulaBar() {
   if (!G || G.sheet < 0) return;
   const view = activeView();
@@ -6272,12 +7533,12 @@ function updateFormulaBar() {
   if (document.activeElement !== d.nameBox) d.nameBox.value = selectionLabel(view);
   const a = view.sel.active;
   const cell = cellAt(view, a.r, a.c);
-  const text = cell === undefined ? '' : rawValue(cell);
-  if (d.formula.textContent !== text) {
-    d.formula.textContent = text;
-    d.formula.title = text.length > 60 || text.includes('\n') ? text : '';
-  }
-  d.formula.classList.toggle('fv-formula-f', !!(cell && cell.f));
+  const editable = isCellEditable();
+  setFormulaEditable(editable);
+  const box = G.cellBox && G.cellBox.mode !== 'view' ? G.cellBox : null;
+  if (box && document.activeElement === d.formula) return; // the user is typing there
+  const text = box ? box.el.value : editable ? editStartText(view, a.r, a.c, cell) : cell === undefined ? '' : rawValue(cell);
+  setFormulaText(text, box || editable ? G.kind === 'sheet' && text.startsWith('=') : !!(cell && cell.f));
 }
 
 // ===== STATUS BAR =====
@@ -6285,7 +7546,10 @@ function updateFormulaBar() {
 /** @param {GridInitMessage} msg */
 function buildStatusBar(msg) {
   const info = h('span', { class: 'fv-status-item fv-status-dims' });
-  const mode = h('span', { class: 'fv-status-item fv-status-mode', title: msg.readOnly !== false ? 'This view is read-only' : '' }, msg.readOnly !== false ? 'Read-only' : 'Ready');
+  const isReadOnly = msg.editState ? !msg.editState.editable : msg.readOnly !== false;
+  const reason = msg.editState?.reason;
+  const modeTitle = isReadOnly ? (reason ? `This view is read-only: ${reason}` : 'This view is read-only') : '';
+  const mode = h('span', { class: 'fv-status-item fv-status-mode', title: modeTitle }, isReadOnly ? 'Read-only' : 'Ready');
   const msgEl = h('span', { class: 'fv-status-item fv-status-msg', role: 'status', 'aria-live': 'polite' });
   const stats = h('span', { class: 'fv-status-item fv-status-stats', 'aria-live': 'polite' });
   const zoomLabel = /** @type {HTMLButtonElement} */ (h('button', { class: 'fv-zoom-label', type: 'button', title: 'Reset zoom to the sheet setting', onclick: () => resetZoom() }, '100%'));
@@ -6298,7 +7562,7 @@ function buildStatusBar(msg) {
   );
   const delimiter = msg.kind === 'csv' && msg.delimited ? buildDelimiterStatus(msg.delimited) : null;
   const bar = h('div', { class: 'fv-statusbar' }, mode, info, ...(delimiter ? [delimiter] : []), msgEl, h('span', { class: 'fv-status-spacer' }), stats, zoom);
-  return { bar, msg: msgEl, stats, info, zoomLabel };
+  return { bar, mode, msg: msgEl, stats, info, zoomLabel };
 }
 
 /** Names of the delimiters parseDelimited uses (' ' = runs of spaces). */
@@ -6406,7 +7670,7 @@ const scheduleStats = debounce(() => {
     const reqId = ++G.statsSeq;
     req.ids.add(reqId);
     req.requests++;
-    post({ type: 'getStats', reqId, sheet: view.index, ranges: parts.slice(i, Math.min(sent, i + STATS_MAX_RANGES)) });
+    post({ type: 'getStats', reqId, sheet: view.index, ...idField(view.index), ranges: parts.slice(i, Math.min(sent, i + STATS_MAX_RANGES)) });
   }
 }, STATS_DEBOUNCE_MS);
 

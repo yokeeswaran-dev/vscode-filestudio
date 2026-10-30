@@ -893,6 +893,39 @@ body[data-kind='csv'] {
   outline-offset: 0;
 }
 
+/* ----- editing ----- */
+
+/* The editor box (the same textarea as the read-only box, aria-readonly="false"): the caret takes the cell's text colour. */
+.fv-cellbox[aria-readonly='false'] {
+  caret-color: var(--fv-cell-fg);
+}
+
+/* "Edit anyway" in the banner: a small button of the banner's height. */
+.fv-banner-action {
+  flex: none;
+  min-height: 20px;
+  height: 20px;
+  padding: 0 10px;
+  font-size: var(--fv-ui-size);
+}
+
+/* The formula bar is editable while the grid is (contenteditable="plaintext-only"); it already has its focus frame. */
+.fv-formula[contenteditable] {
+  cursor: text;
+}
+
+/* HIGH CONTRAST: the editor frame and the banner button are drawn with the contrast colours (not the theme's fills). */
+body.vscode-high-contrast .fv-cellbox[aria-readonly='false'],
+body.vscode-high-contrast-light .fv-cellbox[aria-readonly='false'] {
+  outline: 2px solid var(--vscode-contrastActiveBorder, var(--vscode-focusBorder));
+  box-shadow: none;
+}
+
+body.vscode-high-contrast .fv-banner-action,
+body.vscode-high-contrast-light .fv-banner-action {
+  border: 1px solid var(--vscode-contrastBorder, var(--vscode-button-border, currentColor));
+}
+
 /* ===== FORMULA BAR ===== */
 
 .fv-formula-bar {
@@ -3961,4 +3994,4 @@ body.vscode-high-contrast-light .pptx-thumb-current .pptx-thumb-pic {
 /* VS Code's "Reduce Motion" (workbench.reduceMotion: on) reaches the webview as a body class, not as the media query. */
 body.vscode-reduce-motion .pptx-slide.pptx-loading::after {
   animation: none;
-}
+}

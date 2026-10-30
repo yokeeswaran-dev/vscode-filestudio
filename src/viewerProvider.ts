@@ -11,7 +11,7 @@
 import type { CellExpectation, CellStyle, PackageOp, Range, RowData, SaveReport, SelectionStats, WorkbookMeta } from './renderers/sheet';
 import type { TaskMarker, TocEntry } from './renderers/markdown';
 import type { PptxDeckMeta, PptxSlide } from './renderers/pptx';
-import type { BorderSide, EditIntent, EditKind, FindQuery, SheetId, SheetMeta, StyleDelta } from './renderers/sheet';
+import type { BorderSide, Edit, EditIntent, EditKind, FindQuery, RowsChange, SheetId, SheetMeta, StyleDelta } from './renderers/sheet';
 import type { MdBlock, MdTextEdit } from './renderers/markdown';
 
 import { execFile } from 'child_process';
@@ -23,12 +23,16 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
+  applyEdit,
   buildXlsx,
   checkPatchable,
   CsvGridModel,
   detectLossyFeatures,
   hardReadOnlyText,
+  invertEdit,
+  planEdit,
   xlsxTooLargeReason,
+  editGrowsTooLarge,
   xlsxEditCostBytes,
   lossyEditAnyway,
   SaveVerifyError,
@@ -260,7 +264,16 @@ export type HostMessage =
     }
   // ---------- (v0.2.0) editing: declared by track F, handled by P1-P6 ----------
   /** Answer to one `edit` (exactly one per edit): applied, with the new version and the changed rows. */
-  | { type: 'editResult'; editId: number; accepted: true; version: number; patches?: RowsPatch[]; select?: { sheetId: SheetId; range: Range } }
+  | {
+      type: 'editResult';
+      editId: number;
+      accepted: true;
+      version: number;
+      patches?: RowsPatch[];
+      /** (P2, additive) Meta of the sheets whose used range changed (replaces them by id, like `patch.sheets`). */
+      sheets?: SheetMeta[];
+      select?: { sheetId: SheetId; range: Range };
+    }
   /** Answer to one `edit`: not applied; the webview rolls back its overlay and shows `reason` in the status line. */
   | { type: 'editResult'; editId: number; accepted: false; code: EditRejectCode; reason: string; version: number; where?: string[] }
   /**
@@ -2771,11 +2784,14 @@ export interface JournalEdit {
   /** Changes which cell a position means (structure, merge): raises `structureVersion` (contract §3.3). */
   structural?: boolean;
   after: { ops: PackageOp[]; expect: CellExpectation[] };
-  /** Redo on the display model; throws = poison (§3.5). */
-  apply?(): void | Promise<void>;
+  /** Redo on the display model; throws = poison (§3.5). Returns the rows it changed (the other panels get a `patch`). */
+  apply?(): RowsChange | void | Promise<RowsChange | void>;
   /** Undo on the display model; throws = poison. */
-  invert?(): void | Promise<void>;
+  invert?(): RowsChange | void | Promise<RowsChange | void>;
 }
+
+/** The intents the xlsx editor implements (P2: cells; P4 adds the rest). */
+const XLSX_EDIT_KINDS: readonly EditKind[] = ['setCells', 'clear'];
 
 /** The sidecar next to a hot-exit backup (contract §4.6). */
 interface BackupSidecar {
@@ -2858,6 +2874,8 @@ export class SheetDocument implements vscode.CustomDocument {
   readonly onDidChangeState = this._onDidChangeState.event;
   /** Set by the provider: every panel shows the reloaded workbook (after a revert chosen from the external-change warning). */
   onReloaded: (() => void) | undefined;
+  /** Set by the provider: an undo / redo changed these rows; every panel gets a `patch` (own edits are answered by the provider). */
+  onContentChange: ((change: RowsChange, version: number) => void) | undefined;
 
   readonly queue = new SerialQueue();
 
@@ -2979,15 +2997,24 @@ export class SheetDocument implements vscode.CustomDocument {
     };
   }
 
-  /** The edit state this document contributes now (xlsx stays not editable until P2 wires the edits). */
-  computeEditState(): EditState {
+  /**
+   * The edit state this document has now (contract §3.6): the kill switch and read-only checks (read again), then the
+   * document's own state. Editable xlsx documents offer the cell intents P2 implements.
+   */
+  async computeEditState(): Promise<EditState> {
+    await this._loading; // the state of a document that is still loading is not known yet
     if (this._loadError !== undefined || !this._model) return viewOnlyEditState();
-    const result = documentGate(this.gateState);
-    if (result.ok) return viewOnlyEditState();
+    const result = await checkEditable('xlsx', this.uri, this.gateState);
     return {
-      ...editStateOf(result, []),
-      ...(result.code === 'lossy' ? { canEditAnyway: lossyEditAnyway(this._lossyFeatures) } : {}),
+      ...editStateOf(result, [...XLSX_EDIT_KINDS]),
+      ...(!result.ok && result.code === 'lossy' ? { canEditAnyway: lossyEditAnyway(this._lossyFeatures) } : {}),
     };
+  }
+
+  /** "Edit anyway" can be offered now: lossy content that was not accepted yet, and nothing harder blocks the file. */
+  get canAcceptLossy(): boolean {
+    const gate = documentGate(this.gateState);
+    return !gate.ok && gate.code === 'lossy';
   }
 
   /** "Edit anyway" was accepted for this document (all panels). */
@@ -3064,9 +3091,9 @@ export class SheetDocument implements vscode.CustomDocument {
       this.stepRefused(EDIT_TEXT.poisoned);
       return;
     }
+    let change: RowsChange | void;
     try {
-      if (direction === 'undo') await edit.invert?.();
-      else await edit.apply?.();
+      change = direction === 'undo' ? await edit.invert?.() : await edit.apply?.();
     } catch (err) {
       this.poison(err);
       this.stepRefused(EDIT_TEXT.poisoned);
@@ -3076,6 +3103,7 @@ export class SheetDocument implements vscode.CustomDocument {
     this.stateId = this.pos > 0 ? this.journal[this.pos - 1].id : this.baseStateId;
     this.version++;
     if (edit.structural) this.structureVersion = this.version;
+    if (change) this.onContentChange?.(change, this.version);
     this.changed();
   }
 
@@ -3701,6 +3729,8 @@ function answerGetRows(
   source: GridSource | undefined,
   msg: MessageOf<'getRows'>,
   loadError?: unknown,
+  /** xlsx (v0.2.0): the position of the sheet asked for by id (-1 = no such sheet now) and the fields the answer carries. */
+  byId?: { index: number; version: number },
 ): void {
   if (!source) {
     session.postError(`"${session.fileName}" could not be displayed`, loadError, true);
@@ -3708,9 +3738,19 @@ function answerGetRows(
   }
   const columns = msg.c0 === undefined ? {} : { c0: msg.c0, c1: msg.c1 };
   const reply = (rows: RowData[], styles: [number, CellStyle][]): void =>
-    session.post({ type: 'rows', reqId: msg.reqId, sheet: msg.sheet, start: msg.start, end: msg.end, ...columns, rows, styles });
+    session.post({
+      type: 'rows',
+      reqId: msg.reqId,
+      sheet: msg.sheet,
+      start: msg.start,
+      end: msg.end,
+      ...columns,
+      rows,
+      styles,
+      ...(byId ? { version: byId.version, ...(msg.sheetId !== undefined ? { sheetId: msg.sheetId } : {}) } : {}),
+    });
   try {
-    const { rows, styles } = source.getRows(msg.sheet, msg.start, msg.end, msg.c0, msg.c1);
+    const { rows, styles } = source.getRows(byId ? byId.index : msg.sheet, msg.start, msg.end, msg.c0, msg.c1);
     reply(rows, styles);
   } catch (err) {
     if (isStaleSheetRequest(source, msg.sheet)) {
@@ -3733,16 +3773,56 @@ function isStaleSheetRequest(source: GridSource, sheet: number): boolean {
 }
 
 /** Status-bar aggregates. A failure only empties the status bar (logged), it does not replace the grid. */
-function answerGetStats(session: ViewerSession, source: GridSource | undefined, msg: MessageOf<'getStats'>): void {
+function answerGetStats(session: ViewerSession, source: GridSource | undefined, msg: MessageOf<'getStats'>, index?: number): void {
   let stats: SelectionStats = { ...EMPTY_STATS };
   if (source) {
     try {
-      stats = source.getStats(msg.sheet, msg.ranges);
+      stats = source.getStats(index ?? msg.sheet, msg.ranges);
     } catch (err) {
       logError(`[${session.kind}] Could not compute selection statistics for ${session.fileName}`, err);
     }
   }
   session.post({ type: 'stats', reqId: msg.reqId, stats });
+}
+
+// ----- edit answers (xlsx) -----
+
+/** Test hook: runs on the planned edit after its display change was applied and before it is journaled (host tests corrupt the ops to prove check V3). */
+export const sheetEditHooks: { afterApply?: (plan: Edit) => void } = {};
+
+/** The rows an edit changed, as `RowsPatch`es (plus the sheet meta when its used range changed). */
+function rowsPatchOf(model: WorkbookModel, change: RowsChange): { patches?: RowsPatch[]; sheets?: SheetMeta[] } {
+  const out: { patches?: RowsPatch[]; sheets?: SheetMeta[] } = {};
+  const id = change.sheetId;
+  if (id === null) return out;
+  const index = model.sheetIndexOf(id);
+  if (index < 0) return out;
+  if (change.rows && change.rows[1] > change.rows[0]) {
+    const { rows, styles } = model.getRows(index, change.rows[0], change.rows[1]);
+    out.patches = [{ sheetId: id, start: change.rows[0], end: change.rows[1], rows, styles }];
+  }
+  if (change.meta) {
+    const meta = model.refreshSheet(id);
+    if (meta) out.sheets = [meta];
+  }
+  return out;
+}
+
+/**
+ * What the file must hold after `plan` (check V3, contract §4.2), read from the DISPLAY model after the edit was applied:
+ * a cell the user changed has the value the grid shows, or the formula (its cached value is not checked until P5).
+ */
+function displayExpectations(model: WorkbookModel, plan: Edit): CellExpectation[] {
+  const op = plan.after.ops[plan.after.ops.length - 1];
+  const id = plan.sheetId;
+  if (!id || !op || op.kind !== 'cells') return [];
+  const out: CellExpectation[] = [];
+  for (const [r, c] of op.cells) {
+    const st = model.cellState(id, r, c);
+    if (!st) continue;
+    out.push(st.formula !== undefined ? { sheet: op.sheet, r, c, formula: st.formula } : { sheet: op.sheet, r, c, value: st.value ?? null });
+  }
+  return out;
 }
 
 export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDocument> {
@@ -3754,6 +3834,8 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
   readonly onDidChangeCustomDocument = this._onDidChangeCustomDocument.event;
 
   private readonly sessions = new Map<vscode.WebviewPanel, ViewerSession>();
+  /** The panel's attachment to the document's edit gate (its `doc.refresh()` gives the fresh edit state). */
+  private readonly gates = new Map<vscode.WebviewPanel, EditGateHandle>();
 
   /** `storageUri`: the extension's global storage (pre-images of in-place saves, failed hot-exit backups). */
   constructor(
@@ -3768,6 +3850,7 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
   ): SheetDocument {
     const document = SheetDocument.open(uri, openContext, this.storageUri?.fsPath);
     document.onReloaded = () => this.refreshPanels(document);
+    document.onContentChange = (change, version) => this.broadcastChange(document, change, version, undefined);
     const forward = document.onDidChange((e) => this._onDidChangeCustomDocument.fire(e));
     const watcher = watchForDiskChanges(uri, async () => {
       if (await document.reloadIfChangedOnDisk()) this.refreshPanels(document);
@@ -3788,7 +3871,7 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
     );
     document.panels.add(panel);
     this.sessions.set(panel, session);
-    // (v0.2.0) Edit gate registry: the document computes its state (poisoned, lossy, hard read-only); P2 turns xlsx editing on.
+    // (v0.2.0) Edit gate registry: the document computes its state (kill switch, read-only, poisoned, lossy, hard read-only).
     const gate = {
       format: 'xlsx',
       uri: document.uri,
@@ -3797,12 +3880,20 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
       dirty: () => document.hasUnsavedChanges,
     } as const;
     const handle = attachEditGateDoc(gate, (state) => session.post({ type: 'editState', state }));
+    this.gates.set(panel, handle);
+    session.editHandlers = {
+      version: () => document.versions.version,
+      onEdit: (msg) => this.onEdit(document, session, msg),
+      onEditAnyway: () => this.onEditAnyway(document),
+      onCommand: (msg) => this.onCommand(document, msg),
+    };
     session.onDispose(handle);
     session.onDispose(document.onDidChangeState(() => void handle.doc.refresh()));
     session.onDispose({
       dispose: () => {
         document.panels.delete(panel);
         this.sessions.delete(panel);
+        this.gates.delete(panel);
       },
     });
   }
@@ -3845,22 +3936,218 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
       case 'ready':
         // 'ready' may arrive before or after the load finishes: waiting on the load promise covers both orders.
         await document.loading;
-        this.sendInit(document, session);
+        await this.sendInit(document, session);
         return;
-      case 'getRows':
+      case 'getRows': {
         await document.loading;
-        answerGetRows(session, document.model, msg, document.loadError);
+        // (v0.2.0) A request with a `sheetId` is resolved by id (the tab may have moved); the position stays for 0.1.2.
+        const model = document.model;
+        const index = msg.sheetId !== undefined && model ? model.sheetIndexOf(msg.sheetId) : msg.sheet;
+        answerGetRows(session, model, msg, document.loadError, { index, version: document.versions.version });
         return;
-      case 'getStats':
+      }
+      case 'getStats': {
         await document.loading;
-        answerGetStats(session, document.model, msg);
+        const model = document.model;
+        answerGetStats(session, model, msg, msg.sheetId !== undefined && model ? model.sheetIndexOf(msg.sheetId) : undefined);
         return;
+      }
       default:
         await handleCommonMessage(session, msg, { allowLocal: true });
     }
   }
 
-  private sendInit(document: SheetDocument, session: ViewerSession): void {
+  /** The edit state for `init` / `invalidate`: fresh (settings and read-only state are read now). */
+  private async editStateFor(document: SheetDocument, panel: vscode.WebviewPanel): Promise<EditState> {
+    const handle = this.gates.get(panel);
+    try {
+      return handle ? await handle.doc.refresh() : await document.computeEditState();
+    } catch (err) {
+      logError(`[sheet] Could not compute the edit state of ${document.fileName}`, err);
+      return viewOnlyEditState();
+    }
+  }
+
+  // ----- edits (contract §3.2, §3.3) -----
+
+  /**
+   * One `edit` from a panel: in the document's queue, gate -> version rule -> plan -> apply -> journal -> answer. Exactly
+   * one `editResult` for the sender (also on every failure path), then a `patch` to every other panel. `then: 'save'`
+   * saves after the edit, outside the queue (the save is a queue job itself).
+   */
+  private async onEdit(document: SheetDocument, session: ViewerSession, msg: MessageOf<'edit'>): Promise<void> {
+    await document.loading; // outside the queue: a queued reload is behind this edit, not in front of it
+    const accepted = await document.queue.run(() => this.applySheetEdit(document, session, msg));
+    if (accepted && msg.then === 'save') await this.runVsCodeCommand(document, 'save');
+  }
+
+  private rejectSheetEdit(
+    document: SheetDocument,
+    session: ViewerSession,
+    msg: MessageOf<'edit'>,
+    code: EditRejectCode,
+    reason: string,
+    where?: string[],
+    refresh = false,
+  ): false {
+    getLog().info(`[sheet] Edit ${msg.editId} of ${document.fileName} refused (${code}): ${reason}`);
+    session.rejectEdit(msg.editId, code, reason, where);
+    if (refresh) void this.refreshAfterReload(document, session);
+    return false;
+  }
+
+  /** Returns true when the edit was applied (or changed nothing). */
+  private async applySheetEdit(document: SheetDocument, session: ViewerSession, msg: MessageOf<'edit'>): Promise<boolean> {
+    const reject = (code: EditRejectCode, reason: string, where?: string[], refresh = false): false =>
+      this.rejectSheetEdit(document, session, msg, code, reason, where, refresh);
+    try {
+      const model = document.model;
+      if (!model) return reject('internal', EDIT_TEXT.internal);
+      // The check of every worksheet part (§4.7) is finished before the edit is judged.
+      await document.lazyScan();
+      const gate = await checkEditable('xlsx', document.uri, document.gateState);
+      if (!gate.ok) {
+        for (const panel of document.panels) void this.gates.get(panel)?.doc.refresh(); // the panels learn why
+        return reject(gate.code, gate.reason);
+      }
+      // No await from here to the end of the commit (contract §3.2 step 4): the checks hold when the edit is made.
+      if (msg.baseVersion < document.versions.structureVersion) return reject('stale', EDIT_TEXT.stale, undefined, true);
+      const plan = planEdit(model, msg.intent);
+      if ('noop' in plan) {
+        session.post({ type: 'editResult', editId: msg.editId, accepted: true, version: document.versions.version });
+        return true;
+      }
+      if ('invalid' in plan) return reject('invalid', plan.invalid);
+      if ('blocked' in plan) {
+        return reject('blocked', plan.blocked.map((b) => b.message).join(' '), plan.blocked.flatMap((b) => b.where));
+      }
+      const tooLarge = editGrowsTooLarge(model, plan); // the open-time size rule, kept for edits that grow the sheet
+      if (tooLarge) return reject('blocked', tooLarge);
+      return this.commitSheetEdit(document, session, msg, model, plan, reject);
+    } catch (err) {
+      logError(`[sheet] Edit ${msg.editId} of ${document.fileName} failed`, err);
+      return reject('internal', EDIT_TEXT.internal);
+    }
+  }
+
+  private commitSheetEdit(
+    document: SheetDocument,
+    session: ViewerSession,
+    msg: MessageOf<'edit'>,
+    model: WorkbookModel,
+    plan: Edit,
+    reject: (code: EditRejectCode, reason: string, where?: string[], refresh?: boolean) => false,
+  ): boolean {
+    let change: RowsChange;
+    try {
+      change = applyEdit(model, plan); // validates before its first change: a throw leaves the display as it was
+    } catch (err) {
+      logError(`[sheet] The display could not apply edit ${msg.editId} of ${document.fileName}`, err);
+      return reject('internal', EDIT_TEXT.internal);
+    }
+    const expect = displayExpectations(model, plan);
+    sheetEditHooks.afterApply?.(plan);
+    try {
+      document.commit({
+        label: plan.label,
+        structural: plan.structural,
+        after: { ops: plan.after.ops, expect },
+        apply: () => applyEdit(model, plan),
+        invert: () => invertEdit(model, plan),
+      });
+    } catch (err) {
+      // Not journaled (poisoned, or the file cannot be edited safely): take the display change back.
+      try {
+        invertEdit(model, plan);
+      } catch (rollback) {
+        document.poison(rollback);
+      }
+      logError(`[sheet] Edit ${msg.editId} of ${document.fileName} was not recorded`, err);
+      return reject('blocked', errorMessageOf(err));
+    }
+    const { version } = document.versions;
+    session.post({ type: 'editResult', editId: msg.editId, accepted: true, version, ...rowsPatchOf(model, change) });
+    this.broadcastChange(document, change, version, session);
+    return true;
+  }
+
+  /** A `patch` to every panel of the document except `except` (the sender, who got an editResult). */
+  private broadcastChange(document: SheetDocument, change: RowsChange, version: number, except: ViewerSession | undefined): void {
+    const model = document.model;
+    if (!model) return;
+    let rows: ReturnType<typeof rowsPatchOf>;
+    try {
+      rows = rowsPatchOf(model, change);
+    } catch (err) {
+      logError(`[sheet] Could not read the changed rows of ${document.fileName}`, err);
+      rows = {};
+    }
+    for (const panel of document.panels) {
+      const other = this.sessions.get(panel);
+      if (!other || other === except || !other.isReady || other.shown !== 'content') continue;
+      other.post({ type: 'patch', version, patches: rows.patches ?? [], ...(rows.sheets ? { sheets: rows.sheets } : {}) });
+    }
+  }
+
+  /** Documents whose "Edit anyway" question is open now. */
+  private readonly askingEditAnyway = new WeakSet<SheetDocument>();
+
+  /** "Edit anyway" (lossy workbook): the host asks itself; the message is never consent (contract §4.7). */
+  private async onEditAnyway(document: SheetDocument): Promise<void> {
+    await document.loading;
+    if (!document.canAcceptLossy) {
+      getLog().info(`[sheet] "Edit anyway" for ${document.fileName} ignored: nothing to accept`);
+      for (const panel of document.panels) void this.gates.get(panel)?.doc.refresh();
+      return;
+    }
+    // One question at a time per document: a repeated message while it is open is ignored.
+    if (this.askingEditAnyway.has(document)) return;
+    const features = [...document.lossyFeatures];
+    const info = lossyEditAnyway(features);
+    this.askingEditAnyway.add(document);
+    let answer: string | undefined;
+    try {
+      answer = await ask(
+        'editAnyway',
+        info.title,
+        { modal: true, detail: `${info.details.join('\n')}\n\nDo you want to edit this file anyway?` },
+        'Edit anyway',
+      );
+    } finally {
+      this.askingEditAnyway.delete(document);
+    }
+    if (answer !== 'Edit anyway') return;
+    await document.queue.run(() => {
+      // The file may have been reloaded meanwhile: accept only what was asked about.
+      if (!document.canAcceptLossy || !sameList(features, document.lossyFeatures)) return;
+      getLog().info(`[sheet] "Edit anyway" accepted for ${document.fileName} (this session)`);
+      document.acceptLossy();
+    });
+  }
+
+  /** `command` (Ctrl+Z / Ctrl+Y / Ctrl+S held back while an edit was in flight, D-067): runs behind the queued edits. */
+  private async onCommand(document: SheetDocument, msg: MessageOf<'command'>): Promise<void> {
+    await document.queue.run(() => undefined); // every edit queued before the command is done
+    await this.runVsCodeCommand(document, msg.id);
+  }
+
+  /** VS Code's own undo / redo / save of the active editor (the closures run in the queue themselves: never call this inside it). */
+  private async runVsCodeCommand(document: SheetDocument, id: 'undo' | 'redo' | 'save'): Promise<void> {
+    const input = vscode.window.tabGroups.activeTabGroup.activeTab?.input;
+    const active = input instanceof vscode.TabInputCustom && isSameFile(input.uri, document.uri) && input.viewType === VIEW_TYPES.sheet;
+    if (!active) {
+      getLog().info(`[sheet] '${id}' for ${document.fileName} not run: this editor is not the active tab`);
+      vscode.window.setStatusBarMessage(`FileStudio: ${id} was not run because this editor is not the active tab.`, 5000);
+      return;
+    }
+    try {
+      await vscode.commands.executeCommand(id === 'save' ? 'workbench.action.files.save' : id);
+    } catch (err) {
+      logError(`[sheet] '${id}' failed for ${document.fileName}`, err);
+    }
+  }
+
+  private async sendInit(document: SheetDocument, session: ViewerSession): Promise<void> {
     const model = document.model;
     if (!model) {
       // SheetDocument.load logged the failure once; every panel and every 'ready' only shows it.
@@ -3868,14 +4155,17 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
       return;
     }
     try {
+      const panel = [...document.panels].find((p) => this.sessions.get(p) === session);
+      const editState = panel ? await this.editStateFor(document, panel) : viewOnlyEditState();
       session.post({
         type: 'init',
         kind: 'sheet',
         fileName: document.fileName,
         meta: model.getMeta(),
-        readOnly: true,
+        readOnly: !editState.editable,
         banner: document.tooLargeBanner ?? lossyBanner(document.lossyFeatures),
-        editState: viewOnlyEditState(),
+        version: document.versions.version,
+        editState,
       });
     } catch (err) {
       session.postError(`Could not open "${document.fileName}"`, err);
@@ -3886,7 +4176,7 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
   private refreshPanels(document: SheetDocument): void {
     for (const panel of document.panels) {
       const session = this.sessions.get(panel);
-      if (session) this.refreshAfterReload(document, session);
+      if (session) void this.refreshAfterReload(document, session);
     }
   }
 
@@ -3894,19 +4184,22 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
    * Grids get 'invalidate' with the new meta (sheet, selection and scroll are kept) and the reloaded file's banner;
    * error views get a fresh init.
    */
-  private refreshAfterReload(document: SheetDocument, session: ViewerSession): void {
+  private async refreshAfterReload(document: SheetDocument, session: ViewerSession): Promise<void> {
     if (!session.isReady) return; // the pending 'ready' will send init from the reloaded workbook
     const model = document.model;
     if (!model || session.shown !== 'content') {
-      this.sendInit(document, session);
+      await this.sendInit(document, session);
       return;
     }
     try {
+      const panel = [...document.panels].find((p) => this.sessions.get(p) === session);
+      const editState = panel ? await this.editStateFor(document, panel) : viewOnlyEditState();
       session.post({
         type: 'invalidate',
         meta: model.getMeta(),
         banner: document.tooLargeBanner ?? lossyBanner(document.lossyFeatures) ?? null,
-        editState: viewOnlyEditState(),
+        version: document.versions.version,
+        editState,
       });
     } catch (err) {
       session.postError(`Could not reload "${document.fileName}"`, err);

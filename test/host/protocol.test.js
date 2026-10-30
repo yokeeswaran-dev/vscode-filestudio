@@ -257,14 +257,15 @@ function openText(name, text, kind) {
   return { uri, document, panel };
 }
 
-test('xlsx and CSV stay view-only as in 0.1.2: init says so; an edit is answered blocked, a malformed one invalid', async () => {
+test('xlsx cell editing is on (P2); an intent that is not implemented yet is answered blocked, a malformed one invalid; CSV stays view-only', async () => {
   const sheet = await openSheet('view-only.xlsx');
-  assert.equal(sheet.init.readOnly, true);
-  assert.deepEqual(sheet.init.editState, { editable: false, kinds: [] });
+  assert.equal(sheet.init.readOnly, false);
+  assert.deepEqual(sheet.init.editState, { editable: true, kinds: ['setCells', 'clear'] });
+  assert.equal(sheet.init.version, 0);
   sheet.panel.posted.length = 0;
-  sheet.panel.send(edit({ kind: 'setCells', sheetId: 's1', cells: [[0, 0, 'b']] }));
+  sheet.panel.send(edit({ kind: 'clear', sheetId: 's1', ranges: [{ r0: 0, c0: 0, r1: 0, c1: 0 }], what: 'formats' }));
   const blocked = await waitFor(() => lastOf(sheet.panel, 'editResult'), 3000, 'editResult');
-  assert.deepEqual(blocked, { type: 'editResult', editId: 7, accepted: false, code: 'blocked', reason: EDIT_TEXT.notAvailable, version: 0 });
+  assert.deepEqual(blocked, { type: 'editResult', editId: 7, accepted: false, code: 'blocked', reason: EDIT_TEXT.notAvailable, version: 0, where: [] });
   sheet.panel.posted.length = 0;
   sheet.panel.send({ type: 'edit', editId: 8, baseVersion: 0, intent: { kind: 'setCells', sheetId: 's1', cells: [[-1, 0, 'b']] } });
   const bad = await waitFor(() => lastOf(sheet.panel, 'editResult'), 3000, 'editResult');
