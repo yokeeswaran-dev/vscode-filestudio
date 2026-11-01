@@ -10,20 +10,23 @@ import {
   TextViewerProvider,
   VIEW_TYPES,
   changeDelimiter,
+  createTestApi,
   disposeLog,
   fileNameOf,
   getLog,
   reopenAsText,
   viewTypeForUri,
   watchUnreadableTextTabs,
+  type FileStudioTestApi,
 } from './viewerProvider';
 
 // ===== ACTIVATION =====
 
-export function activate(context: vscode.ExtensionContext): void {
+/** Returns the test API (contract §13.3) only when VS Code runs the extension's tests (ExtensionMode.Test). */
+export function activate(context: vscode.ExtensionContext): FileStudioTestApi | undefined {
   const webviewOptions = { retainContextWhenHidden: true };
   context.subscriptions.push(
-    vscode.window.registerCustomEditorProvider(VIEW_TYPES.sheet, new SheetEditorProvider(context.extensionUri), {
+    vscode.window.registerCustomEditorProvider(VIEW_TYPES.sheet, new SheetEditorProvider(context.extensionUri, context.globalStorageUri), {
       webviewOptions,
       supportsMultipleEditorsPerDocument: true,
     }),
@@ -57,6 +60,9 @@ export function activate(context: vscode.ExtensionContext): void {
     // Last, so anything logged while the registrations above are disposed still has a channel.
     { dispose: disposeLog },
   );
+  // `vscode.ExtensionMode?.`: a fake `vscode` without the enum (older tests) means normal use, not a crash.
+  const modes = vscode.ExtensionMode as typeof vscode.ExtensionMode | undefined;
+  return modes && context.extensionMode === modes.Test ? createTestApi() : undefined;
 }
 
 export function deactivate(): void {

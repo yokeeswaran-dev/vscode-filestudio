@@ -1427,6 +1427,780 @@ async function writeLargeXlsx(temp, rows, cols, onProgress) {
   await wb.commit();
 }
 
+// ----- xlsx save fixtures -----
+// Workbooks for the surgical xlsx save (test/unit/sheet-save.test.js; contract §14 P1 WP7). They are written part by
+// part as raw XML, laid out the way Excel writes it (namespaces, mc:Ignorable, row spans, x14ac:dyDescent, part
+// order, docProps), so the save is tested on files like the ones users have and not on ExcelJS output. Each workbook
+// holds objects the save must keep byte for byte. Output: test/samples/xlsx-save/*.xlsx (deterministic: FIXED_DATE).
+
+const XS_MAIN = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+const XS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+const XS_MC = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
+const XS_X14AC = 'http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac';
+const XS_XR = 'http://schemas.microsoft.com/office/spreadsheetml/2014/revision';
+const XS_XDR = 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing';
+const XS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+const XS_CHART = 'http://schemas.openxmlformats.org/drawingml/2006/chart';
+const XS_TC = 'http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments';
+const XS_MS_REL = 'http://schemas.microsoft.com/office/2017/10/relationships';
+const XS_CT = 'application/vnd.openxmlformats-officedocument.';
+const XS_SML = `${XS_CT}spreadsheetml.`;
+const XS_DECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n';
+const XS_TIME = FIXED_DATE.toISOString().replace(/\.\d{3}Z$/, 'Z');
+const XS_MARGINS = '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>';
+
+/** A stable GUID for a name (Excel writes xr:uid / person / comment ids as GUIDs). */
+function xsGuid(seed) {
+  const h = crypto.createHash('sha1').update(`filestudio:${seed}`).digest('hex').toUpperCase();
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
+}
+
+/** 'AB' -> 28. */
+function xsColIndex(letters) {
+  let n = 0;
+  for (const ch of letters) n = n * 26 + ch.charCodeAt(0) - 64;
+  return n;
+}
+
+/** A .rels part; rels = [{ id, type ('worksheet' or a full URL), target, external }]. */
+function xsRels(rels) {
+  return XS_DECL + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+    rels.map(rel => `<Relationship Id="${rel.id}" Type="${rel.type.startsWith('http') ? rel.type : `${XS_R}/${rel.type}`}" ` +
+      `Target="${xmlEscape(rel.target)}"${rel.external ? ' TargetMode="External"' : ''}/>`).join('') +
+    '</Relationships>';
+}
+
+/** Shared strings in order of first use (count = every use, like Excel). `rich` adds a raw <si> body. */
+class XsStrings {
+  constructor() {
+    this.items = [];
+    this.index = new Map();
+    this.count = 0;
+  }
+  id(text) {
+    this.count++;
+    let i = this.index.get(text);
+    if (i === undefined) {
+      i = this.items.length;
+      this.items.push(`<t${/^\s|\s$|\n/.test(text) ? ' xml:space="preserve"' : ''}>${xmlEscape(text)}</t>`);
+      this.index.set(text, i);
+    }
+    return i;
+  }
+  rich(body) {
+    this.count++;
+    this.items.push(body);
+    return this.items.length - 1;
+  }
+  xml() {
+    return XS_DECL + `<sst xmlns="${XS_MAIN}" count="${this.count}" uniqueCount="${this.items.length}">` +
+      this.items.map(item => `<si>${item}</si>`).join('') + '</sst>';
+  }
+}
+
+/**
+ * One <c>. spec: number, string (shared string) or { s, t, v, f, fa (raw <f> attributes), cm, text, rich }.
+ * f === '' writes <f .../> (a shared-formula clone).
+ */
+function xsCell(sst, ref, spec) {
+  if (typeof spec === 'number') spec = { v: spec };
+  else if (typeof spec === 'string') spec = { text: spec };
+  let t = spec.t;
+  let v = spec.v;
+  if (spec.text !== undefined) {
+    t = 's';
+    v = sst.id(spec.text);
+  } else if (spec.rich !== undefined) {
+    t = 's';
+    v = sst.rich(spec.rich);
+  }
+  const attrs = `${spec.s ? ` s="${spec.s}"` : ''}${t ? ` t="${t}"` : ''}${spec.cm ? ` cm="${spec.cm}"` : ''}`;
+  const f = spec.f === undefined ? '' : spec.f === '' ? `<f${spec.fa || ''}/>` : `<f${spec.fa || ''}>${xmlEscape(spec.f)}</f>`;
+  const value = v === undefined ? '' : `<v>${typeof v === 'string' ? xmlEscape(v) : v}</v>`;
+  return f || value ? `<c r="${ref}"${attrs}>${f}${value}</c>` : `<c r="${ref}"${attrs}/>`;
+}
+
+/** <sheetData> from [{ r, cells: { A: spec, ... }, attrs }] (attrs = raw row attributes after spans). */
+function xsSheetData(sst, rows) {
+  return '<sheetData>' + rows.map(row => {
+    const cols = Object.keys(row.cells || {}).sort((a, b) => xsColIndex(a) - xsColIndex(b));
+    const spans = cols.length ? ` spans="${xsColIndex(cols[0])}:${xsColIndex(cols[cols.length - 1])}"` : '';
+    const inner = cols.map(col => xsCell(sst, `${col}${row.r}`, row.cells[col])).join('');
+    const head = `<row r="${row.r}"${spans}${row.attrs || ''} x14ac:dyDescent="0.25"`;
+    return inner ? `${head}>${inner}</row>` : `${head}/>`;
+  }).join('') + '</sheetData>';
+}
+
+/** A worksheet part. `after` = everything after <sheetData>, already in schema order. */
+function xsWorksheet(o) {
+  return XS_DECL +
+    `<worksheet xmlns="${XS_MAIN}" xmlns:r="${XS_R}" xmlns:mc="${XS_MC}" mc:Ignorable="x14ac xr xr2 xr3" ` +
+    `xmlns:x14ac="${XS_X14AC}" xmlns:xr="${XS_XR}" xmlns:xr2="http://schemas.microsoft.com/office/spreadsheetml/2015/revision2" ` +
+    `xmlns:xr3="http://schemas.microsoft.com/office/spreadsheetml/2016/revision3" xr:uid="{${xsGuid(o.uid)}}">` +
+    (o.sheetPr || '') +
+    `<dimension ref="${o.dimension}"/>` +
+    `<sheetViews>${o.view || `<sheetView${o.selected ? ' tabSelected="1"' : ''} workbookViewId="0"/>`}</sheetViews>` +
+    '<sheetFormatPr defaultRowHeight="15" x14ac:dyDescent="0.25"/>' +
+    (o.cols ? `<cols>${o.cols}</cols>` : '') +
+    xsSheetData(o.sst, o.rows) +
+    (o.after || XS_MARGINS) +
+    '</worksheet>';
+}
+
+/** workbook.xml. sheets = [{ name, id, rid, state }]; names = raw <definedName> list; extra = after calcPr. */
+function xsWorkbook(o) {
+  return XS_DECL +
+    `<workbook xmlns="${XS_MAIN}" xmlns:r="${XS_R}" xmlns:mc="${XS_MC}" mc:Ignorable="x15 xr xr6 xr10 xr2" ` +
+    'xmlns:x15="http://schemas.microsoft.com/office/spreadsheetml/2010/11/main" ' +
+    `xmlns:xr="${XS_XR}" xmlns:xr6="http://schemas.microsoft.com/office/spreadsheetml/2016/revision6" ` +
+    'xmlns:xr10="http://schemas.microsoft.com/office/spreadsheetml/2016/revision10" ' +
+    'xmlns:xr2="http://schemas.microsoft.com/office/spreadsheetml/2015/revision2">' +
+    '<fileVersion appName="xl" lastEdited="7" lowestEdited="7" rupBuild="27328"/>' +
+    `<workbookPr${o.date1904 ? ' date1904="1"' : ''} defaultThemeVersion="166925"/>` +
+    `<mc:AlternateContent xmlns:mc="${XS_MC}"><mc:Choice Requires="x15">` +
+    '<x15ac:absPath url="C:\\Users\\sample\\Documents\\" xmlns:x15ac="http://schemas.microsoft.com/office/spreadsheetml/2010/11/ac"/>' +
+    '</mc:Choice></mc:AlternateContent>' +
+    `<xr:revisionPtr revIDLastSave="0" documentId="8_{${xsGuid(`${o.uid}:doc`)}}" xr6:coauthVersionLast="47" ` +
+    'xr6:coauthVersionMax="47" xr10:uidLastSave="{00000000-0000-0000-0000-000000000000}"/>' +
+    '<bookViews><workbookView xWindow="-120" yWindow="-120" windowWidth="29040" windowHeight="15720" ' +
+    `xr2:uid="{${xsGuid(`${o.uid}:view`)}}"/></bookViews>` +
+    '<sheets>' + o.sheets.map(s => `<sheet name="${xmlEscape(s.name)}" sheetId="${s.id}"${s.state ? ` state="${s.state}"` : ''} r:id="${s.rid}"/>`).join('') + '</sheets>' +
+    (o.externalRefs ? `<externalReferences>${o.externalRefs.map(rid => `<externalReference r:id="${rid}"/>`).join('')}</externalReferences>` : '') +
+    (o.names && o.names.length ? `<definedNames>${o.names.join('')}</definedNames>` : '') +
+    '<calcPr calcId="191029"/>' +
+    (o.extra || '') +
+    '</workbook>';
+}
+
+/** styles.xml with Excel's layout. numFmts = [[id, code]]; fonts/fills/borders/xfs/dxfs = raw elements. */
+function xsStyles(o) {
+  const list = (tag, items, attrs = '') => `<${tag} count="${items.length}"${attrs}>${items.join('')}</${tag}>`;
+  return XS_DECL +
+    `<styleSheet xmlns="${XS_MAIN}" xmlns:mc="${XS_MC}" mc:Ignorable="x14ac x16r2 xr" xmlns:x14ac="${XS_X14AC}" ` +
+    `xmlns:x16r2="http://schemas.microsoft.com/office/spreadsheetml/2015/02/main" xmlns:xr="${XS_XR}">` +
+    (o.numFmts && o.numFmts.length ? list('numFmts', o.numFmts.map(([id, code]) => `<numFmt numFmtId="${id}" formatCode="${xmlEscape(code)}"/>`)) : '') +
+    list('fonts', o.fonts, ' x14ac:knownFonts="1"') +
+    list('fills', ['<fill><patternFill patternType="none"/></fill>', '<fill><patternFill patternType="gray125"/></fill>', ...(o.fills || [])]) +
+    list('borders', ['<border><left/><right/><top/><bottom/><diagonal/></border>', ...(o.borders || [])]) +
+    '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+    list('cellXfs', ['<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>', ...o.xfs]) +
+    '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>' +
+    list('dxfs', o.dxfs || []) +
+    '<tableStyles count="0" defaultTableStyle="TableStyleMedium2" defaultPivotStyle="PivotStyleLight16"/>' +
+    (o.colors || '') +
+    '</styleSheet>';
+}
+
+/** A Calibri 11 font; `before` = flags written before <sz> (<b/>, <b val="0"/>, ...), `color` = raw <color>. */
+const xsFont = (before = '', color = '<color theme="1"/>', size = 11) =>
+  `<font>${before}<sz val="${size}"/>${color}<name val="Calibri"/><family val="2"/><scheme val="minor"/></font>`;
+const XS_THIN = '<border><left style="thin"><color indexed="64"/></left><right style="thin"><color indexed="64"/></right>' +
+  '<top style="thin"><color indexed="64"/></top><bottom style="thin"><color indexed="64"/></bottom><diagonal/></border>';
+/** One cellXfs <xf>; o = { numFmt, font, fill, border, align (raw <alignment>) }. */
+function xsXf(o) {
+  const apply = `${o.numFmt ? ' applyNumberFormat="1"' : ''}${o.font ? ' applyFont="1"' : ''}${o.fill ? ' applyFill="1"' : ''}` +
+    `${o.border ? ' applyBorder="1"' : ''}${o.align ? ' applyAlignment="1"' : ''}`;
+  const head = `<xf numFmtId="${o.numFmt || 0}" fontId="${o.font || 0}" fillId="${o.fill || 0}" borderId="${o.border || 0}" xfId="0"${apply}`;
+  return o.align ? `${head}>${o.align}</xf>` : `${head}/>`;
+}
+
+/** Zips the parts in the given order after a [Content_Types].xml built from each part's `ct`. */
+async function xsPackage(parts) {
+  const defaults = [
+    ['png', 'image/png'],
+    ['rels', 'application/vnd.openxmlformats-package.relationships+xml'],
+    ['vml', `${XS_CT}vmlDrawing`],
+    ['xml', 'application/xml'],
+  ].filter(([ext]) => ext === 'rels' || ext === 'xml' || parts.some(p => p.name.endsWith(`.${ext}`)));
+  const types = XS_DECL + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+    defaults.map(([ext, type]) => `<Default Extension="${ext}" ContentType="${type}"/>`).join('') +
+    parts.filter(p => p.ct).map(p => `<Override PartName="/${p.name}" ContentType="${p.ct}"/>`).join('') +
+    '</Types>';
+  const zip = new JSZip();
+  zip.file('[Content_Types].xml', types, { date: FIXED_DATE, createFolders: false });
+  for (const p of parts) zip.file(p.name, p.data, { date: FIXED_DATE, createFolders: false });
+  return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 }, platform: 'DOS' });
+}
+
+/** _rels/.rels, docProps/core.xml and docProps/app.xml parts (the docProps go last, as Excel writes them). */
+function xsCommonParts(sheetNames) {
+  const rels = {
+    name: '_rels/.rels',
+    data: xsRels([
+      { id: 'rId3', type: 'extended-properties', target: 'docProps/app.xml' },
+      { id: 'rId2', type: 'http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties', target: 'docProps/core.xml' },
+      { id: 'rId1', type: 'officeDocument', target: 'xl/workbook.xml' },
+    ]),
+  };
+  const core = {
+    name: 'docProps/core.xml',
+    ct: 'application/vnd.openxmlformats-package.core-properties+xml',
+    data: XS_DECL + '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" ' +
+      'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" ' +
+      'xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">' +
+      `<dc:creator>${GENERATOR_NAME}</dc:creator><cp:lastModifiedBy>${GENERATOR_NAME}</cp:lastModifiedBy>` +
+      `<dcterms:created xsi:type="dcterms:W3CDTF">${XS_TIME}</dcterms:created>` +
+      `<dcterms:modified xsi:type="dcterms:W3CDTF">${XS_TIME}</dcterms:modified></cp:coreProperties>`,
+  };
+  const app = {
+    name: 'docProps/app.xml',
+    ct: `${XS_CT}extended-properties+xml`,
+    data: XS_DECL + '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" ' +
+      'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes"><Application>Microsoft Excel</Application>' +
+      '<DocSecurity>0</DocSecurity><ScaleCrop>false</ScaleCrop><HeadingPairs><vt:vector size="2" baseType="variant">' +
+      `<vt:variant><vt:lpstr>Worksheets</vt:lpstr></vt:variant><vt:variant><vt:i4>${sheetNames.length}</vt:i4></vt:variant>` +
+      `</vt:vector></HeadingPairs><TitlesOfParts><vt:vector size="${sheetNames.length}" baseType="lpstr">` +
+      sheetNames.map(name => `<vt:lpstr>${xmlEscape(name)}</vt:lpstr>`).join('') +
+      '</vt:vector></TitlesOfParts><LinksUpToDate>false</LinksUpToDate><SharedDoc>false</SharedDoc>' +
+      '<HyperlinksChanged>false</HyperlinksChanged><AppVersion>16.0300</AppVersion></Properties>',
+  };
+  return { rels, core, app };
+}
+
+/** A clustered column chart part (cached categories and values, like Excel writes them). */
+function xsColumnChart(o) {
+  const strCache = items => `<c:strCache><c:ptCount val="${items.length}"/>` +
+    items.map((text, i) => `<c:pt idx="${i}"><c:v>${xmlEscape(text)}</c:v></c:pt>`).join('') + '</c:strCache>';
+  const numCache = items => `<c:numCache><c:formatCode>General</c:formatCode><c:ptCount val="${items.length}"/>` +
+    items.map((value, i) => `<c:pt idx="${i}"><c:v>${value}</c:v></c:pt>`).join('') + '</c:numCache>';
+  const axis = '<c:scaling><c:orientation val="minMax"/></c:scaling><c:delete val="0"/>';
+  return XS_DECL + `<c:chartSpace xmlns:c="${XS_CHART}" xmlns:a="${XS_A}" xmlns:r="${XS_R}">` +
+    '<c:date1904 val="0"/><c:lang val="en-US"/><c:roundedCorners val="0"/><c:chart><c:autoTitleDeleted val="0"/>' +
+    '<c:plotArea><c:layout/><c:barChart><c:barDir val="col"/><c:grouping val="clustered"/><c:varyColors val="0"/>' +
+    `<c:ser><c:idx val="0"/><c:order val="0"/><c:tx><c:strRef><c:f>${o.nameRef}</c:f>${strCache([o.name])}</c:strRef></c:tx>` +
+    `<c:invertIfNegative val="0"/><c:cat><c:strRef><c:f>${o.catRef}</c:f>${strCache(o.cats)}</c:strRef></c:cat>` +
+    `<c:val><c:numRef><c:f>${o.valRef}</c:f>${numCache(o.vals)}</c:numRef></c:val></c:ser>` +
+    '<c:gapWidth val="219"/><c:overlap val="-27"/><c:axId val="511200001"/><c:axId val="511200002"/></c:barChart>' +
+    `<c:catAx><c:axId val="511200001"/>${axis}<c:axPos val="b"/><c:numFmt formatCode="General" sourceLinked="1"/>` +
+    '<c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/><c:crossAx val="511200002"/>' +
+    '<c:crosses val="autoZero"/><c:auto val="1"/><c:lblAlgn val="ctr"/><c:lblOffset val="100"/><c:noMultiLvlLbl val="0"/></c:catAx>' +
+    `<c:valAx><c:axId val="511200002"/>${axis}<c:axPos val="l"/><c:majorGridlines/><c:numFmt formatCode="General" sourceLinked="1"/>` +
+    '<c:majorTickMark val="none"/><c:minorTickMark val="none"/><c:tickLblPos val="nextTo"/><c:crossAx val="511200001"/>' +
+    '<c:crosses val="autoZero"/><c:crossBetween val="between"/></c:valAx></c:plotArea>' +
+    '<c:legend><c:legendPos val="b"/><c:overlay val="0"/></c:legend><c:plotVisOnly val="1"/><c:dispBlanksAs val="gap"/></c:chart>' +
+    '</c:chartSpace>';
+}
+
+/** A drawing anchor position (0-based column / row). */
+const xsAnchorAt = (tag, col, row) =>
+  `<xdr:${tag}><xdr:col>${col}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${row}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:${tag}>`;
+
+/** The legacy VML shapes of notes; notes = [{ row, col }] (0-based). */
+function xsNotesVml(notes, idmap) {
+  const shapes = notes.map((note, i) =>
+    `<v:shape id="_x0000_s${idmap * 1024 + 1 + i}" type="#_x0000_t202" style="position:absolute;margin-left:107.25pt;` +
+    `margin-top:1.5pt;width:108pt;height:59.25pt;z-index:${i + 1};visibility:hidden" fillcolor="#ffffe1" o:insetmode="auto">\r\n` +
+    '  <v:fill color2="#ffffe1"/>\r\n  <v:shadow on="t" color="black" obscured="t"/>\r\n  <v:path o:connecttype="none"/>\r\n' +
+    '  <v:textbox style="mso-direction-alt:auto">\r\n   <div style="text-align:left"></div>\r\n  </v:textbox>\r\n' +
+    '  <x:ClientData ObjectType="Note">\r\n   <x:MoveWithCells/>\r\n   <x:SizeWithCells/>\r\n' +
+    `   <x:Anchor>\r\n    ${note.col + 1}, 15, ${note.row}, 2, ${note.col + 3}, 15, ${note.row + 4}, 4</x:Anchor>\r\n` +
+    `   <x:AutoFill>False</x:AutoFill>\r\n   <x:Row>${note.row}</x:Row>\r\n   <x:Column>${note.col}</x:Column>\r\n` +
+    '  </x:ClientData>\r\n </v:shape>').join('');
+  return '<xml xmlns:v="urn:schemas-microsoft-com:vml"\r\n xmlns:o="urn:schemas-microsoft-com:office:office"\r\n' +
+    ' xmlns:x="urn:schemas-microsoft-com:office:excel">\r\n' +
+    ` <o:shapelayout v:ext="edit">\r\n  <o:idmap v:ext="edit" data="${idmap}"/>\r\n </o:shapelayout>` +
+    '<v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202"\r\n  path="m,l,21600r21600,l21600,xe">\r\n' +
+    '  <v:stroke joinstyle="miter"/>\r\n  <v:path gradientshapeok="t" o:connecttype="rect"/>\r\n </v:shapetype>' +
+    shapes + '</xml>';
+}
+
+/** comments part; comments = [{ ref, author (index), runs (raw <text> body), uid }]. */
+function xsComments(authors, comments) {
+  return XS_DECL + `<comments xmlns="${XS_MAIN}" xmlns:mc="${XS_MC}" mc:Ignorable="xr" xmlns:xr="${XS_XR}">` +
+    `<authors>${authors.map(a => `<author>${xmlEscape(a)}</author>`).join('')}</authors><commentList>` +
+    comments.map(c => `<comment ref="${c.ref}" authorId="${c.author}" shapeId="0" xr:uid="{${xsGuid(c.uid)}}"><text>${c.runs}</text></comment>`).join('') +
+    '</commentList></comments>';
+}
+
+/** Excel's legacy text of a threaded comment (what older Excel versions show). */
+const xsThreadedLegacy = text => '<t xml:space="preserve">[Threaded comment]\n\nYour version of Excel allows you to read this ' +
+  'threaded comment; however, any edits to it will get removed if the file is opened in a newer version of Excel. ' +
+  `Learn more: https://go.microsoft.com/fwlink/?linkid=870924\n\nComment:\n    ${xmlEscape(text)}</t>`;
+
+// --- objects.xlsx: table, chart, picture, pivot table + cache, external link; sheetIds 1, 3, 2 (not in tab order) ---
+async function buildXlsxSaveObjects() {
+  const sst = new XsStrings();
+  const regions = ['North', 'South', 'East', 'West'];
+  const units = [120, 95, 143, 88, 131, 102, 150, 97];
+  const data = units.map((u, i) => ({ region: regions[i % 4], month: i < 4 ? 'Jan' : 'Feb', units: u, revenue: excelRound(u * 12.5) }));
+  const totalUnits = units.reduce((a, b) => a + b, 0);
+  const totalRevenue = excelRound(data.reduce((a, d) => a + d.revenue, 0));
+
+  const salesRows = [{ r: 1, cells: { A: { text: 'Region', s: 1 }, B: { text: 'Month', s: 1 }, C: { text: 'Units', s: 1 }, D: { text: 'Revenue', s: 1 } } }];
+  data.forEach((d, i) => {
+    const r = i + 2;
+    const revenue = i === 0 ? { f: 'C2*12.5', fa: ' t="shared" ref="D2:D9" si="0"', v: d.revenue, s: 2 } : { f: '', fa: ' t="shared" si="0"', v: d.revenue, s: 2 };
+    salesRows.push({ r, cells: { A: d.region, B: d.month, C: d.units, D: revenue } });
+  });
+  const sales = xsWorksheet({
+    sst, uid: 'objects:sales', dimension: 'A1:D9', selected: true, rows: salesRows,
+    cols: '<col min="1" max="2" width="11.7109375" customWidth="1"/><col min="4" max="4" width="12.7109375" customWidth="1"/>',
+    after: `${XS_MARGINS}<drawing r:id="rId1"/><tableParts count="1"><tablePart r:id="rId2"/></tableParts>`,
+  });
+  const summary = xsWorksheet({
+    sst, uid: 'objects:summary', dimension: 'A1:B6',
+    rows: [
+      { r: 1, cells: { A: { text: 'Summary', s: 3 } }, attrs: ' ht="18.75" customHeight="1"' },
+      { r: 3, cells: { A: 'Total units', B: { f: 'SUM(Sales!C2:C9)', v: totalUnits } } },
+      { r: 4, cells: { A: 'Total revenue', B: { f: 'SUM(SalesTable[Revenue])', v: totalRevenue, s: 2 } } },
+      { r: 5, cells: { A: 'List price', B: { f: '[1]Prices!$B$2', v: 12.5, s: 2 } } },
+      { r: 6, cells: { A: 'Units x list price', B: { f: 'B3*[1]Prices!$B$2', v: excelRound(totalUnits * 12.5), s: 2 } } },
+    ],
+    cols: '<col min="1" max="1" width="18.7109375" customWidth="1"/>',
+  });
+  // pivot: units per region (row items sorted by name)
+  const byRegion = regions.map(name => ({ name, x: regions.indexOf(name), sum: data.filter(d => d.region === name).reduce((a, d) => a + d.units, 0) }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const pivotRows = [{ r: 3, cells: { A: { text: 'Row Labels', s: 1 }, B: { text: 'Sum of Units', s: 1 } } }];
+  byRegion.forEach((g, i) => pivotRows.push({ r: 4 + i, cells: { A: g.name, B: g.sum } }));
+  pivotRows.push({ r: 8, cells: { A: { text: 'Grand Total', s: 1 }, B: { v: totalUnits, s: 1 } } });
+  const pivotSheet = xsWorksheet({ sst, uid: 'objects:pivot', dimension: 'A3:B8', rows: pivotRows });
+
+  const table = XS_DECL + `<table xmlns="${XS_MAIN}" xmlns:mc="${XS_MC}" mc:Ignorable="xr xr3" xmlns:xr="${XS_XR}" ` +
+    `xmlns:xr3="http://schemas.microsoft.com/office/spreadsheetml/2016/revision3" id="1" xr:uid="{${xsGuid('objects:table')}}" ` +
+    'name="SalesTable" displayName="SalesTable" ref="A1:D9" totalsRowShown="0">' +
+    `<autoFilter ref="A1:D9" xr:uid="{${xsGuid('objects:table:filter')}}"/><tableColumns count="4">` +
+    ['Region', 'Month', 'Units', 'Revenue'].map((name, i) => `<tableColumn id="${i + 1}" xr3:uid="{${xsGuid(`objects:table:${name}`)}}" name="${name}"/>`).join('') +
+    '</tableColumns><tableStyleInfo name="TableStyleMedium2" showFirstColumn="0" showLastColumn="0" showRowStripes="1" showColumnStripes="0"/></table>';
+  const drawing = XS_DECL + `<xdr:wsDr xmlns:xdr="${XS_XDR}" xmlns:a="${XS_A}">` +
+    `<xdr:twoCellAnchor editAs="oneCell">${xsAnchorAt('from', 5, 1)}${xsAnchorAt('to', 6, 5)}<xdr:pic><xdr:nvPicPr>` +
+    '<xdr:cNvPr id="2" name="Picture 1" descr="Badge"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>' +
+    `<xdr:blipFill><a:blip xmlns:r="${XS_R}" r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>` +
+    '<xdr:spPr><a:xfrm><a:off x="3048000" y="190500"/><a:ext cx="609600" cy="609600"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>' +
+    '</xdr:pic><xdr:clientData/></xdr:twoCellAnchor>' +
+    `<xdr:twoCellAnchor>${xsAnchorAt('from', 5, 10)}${xsAnchorAt('to', 12, 26)}<xdr:graphicFrame macro=""><xdr:nvGraphicFramePr>` +
+    '<xdr:cNvPr id="3" name="Chart 2"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm>' +
+    `<a:graphic><a:graphicData uri="${XS_CHART}"><c:chart xmlns:c="${XS_CHART}" xmlns:r="${XS_R}" r:id="rId2"/></a:graphicData></a:graphic>` +
+    '</xdr:graphicFrame><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>';
+  const chart = xsColumnChart({
+    name: 'Units', nameRef: 'Sales!$C$1', catRef: 'Sales!$A$2:$A$9', valRef: 'Sales!$C$2:$C$9',
+    cats: data.map(d => `${d.region} ${d.month}`), vals: units,
+  });
+  const pivotTable = XS_DECL + `<pivotTableDefinition xmlns="${XS_MAIN}" xmlns:mc="${XS_MC}" mc:Ignorable="xr" xmlns:xr="${XS_XR}" ` +
+    `name="PivotTable1" cacheId="5" applyNumberFormats="0" applyBorderFormats="0" applyFontFormats="0" applyPatternFormats="0" ` +
+    'applyAlignmentFormats="0" applyWidthHeightFormats="1" dataCaption="Values" updatedVersion="8" minRefreshableVersion="3" ' +
+    `useAutoFormatting="1" itemPrintTitles="1" createdVersion="8" indent="0" outline="1" outlineData="1" multipleFieldFilters="0" xr:uid="{${xsGuid('objects:pivot:def')}}">` +
+    '<location ref="A3:B8" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/><pivotFields count="4">' +
+    `<pivotField axis="axisRow" showAll="0"><items count="5">${byRegion.map(g => `<item x="${g.x}"/>`).join('')}<item t="default"/></items></pivotField>` +
+    '<pivotField showAll="0"/><pivotField dataField="1" showAll="0"/><pivotField showAll="0"/></pivotFields>' +
+    '<rowFields count="1"><field x="0"/></rowFields><rowItems count="5"><i><x/></i><i><x v="1"/></i><i><x v="2"/></i><i><x v="3"/></i>' +
+    '<i t="grand"><x/></i></rowItems><colItems count="1"><i/></colItems>' +
+    '<dataFields count="1"><dataField name="Sum of Units" fld="2" baseField="0" baseItem="0"/></dataFields>' +
+    '<pivotTableStyleInfo name="PivotStyleLight16" showRowHeaders="1" showColHeaders="1" showRowStripes="0" showColStripes="0" showLastColumn="1"/>' +
+    '</pivotTableDefinition>';
+  const minMax = (values, integer) => `containsSemiMixedTypes="0" containsString="0" containsNumber="1"${integer ? ' containsInteger="1"' : ''} ` +
+    `minValue="${Math.min(...values)}" maxValue="${Math.max(...values)}"`;
+  const cacheDef = XS_DECL + `<pivotCacheDefinition xmlns="${XS_MAIN}" xmlns:r="${XS_R}" xmlns:mc="${XS_MC}" mc:Ignorable="xr" ` +
+    `xmlns:xr="${XS_XR}" r:id="rId1" refreshedBy="${GENERATOR_NAME}" refreshedDate="45306.395833333336" createdVersion="8" ` +
+    `refreshedVersion="8" minRefreshableVersion="3" recordCount="${data.length}" xr:uid="{${xsGuid('objects:pivot:cache')}}">` +
+    '<cacheSource type="worksheet"><worksheetSource ref="A1:D9" sheet="Sales"/></cacheSource><cacheFields count="4">' +
+    `<cacheField name="Region" numFmtId="0"><sharedItems count="4">${regions.map(r => `<s v="${r}"/>`).join('')}</sharedItems></cacheField>` +
+    '<cacheField name="Month" numFmtId="0"><sharedItems count="2"><s v="Jan"/><s v="Feb"/></sharedItems></cacheField>' +
+    `<cacheField name="Units" numFmtId="0"><sharedItems ${minMax(units, true)}/></cacheField>` +
+    `<cacheField name="Revenue" numFmtId="164"><sharedItems ${minMax(data.map(d => d.revenue), false)}/></cacheField>` +
+    '</cacheFields><extLst><ext uri="{725AE2AE-9491-48be-B2B4-4EB974FC3084}" xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main">' +
+    '<x14:pivotCacheDefinition/></ext></extLst></pivotCacheDefinition>';
+  const cacheRecords = XS_DECL + `<pivotCacheRecords xmlns="${XS_MAIN}" xmlns:r="${XS_R}" xmlns:mc="${XS_MC}" mc:Ignorable="xr" ` +
+    `xmlns:xr="${XS_XR}" count="${data.length}">` +
+    data.map(d => `<r><x v="${regions.indexOf(d.region)}"/><x v="${d.month === 'Jan' ? 0 : 1}"/><n v="${d.units}"/><n v="${d.revenue}"/></r>`).join('') +
+    '</pivotCacheRecords>';
+  const externalLink = XS_DECL + `<externalLink xmlns="${XS_MAIN}" xmlns:r="${XS_R}" xmlns:mc="${XS_MC}" mc:Ignorable="x14" ` +
+    'xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"><externalBook r:id="rId1">' +
+    '<sheetNames><sheetName val="Prices"/></sheetNames><sheetDataSet><sheetData sheetId="0">' +
+    '<row r="2"><cell r="B2"><v>12.5</v></cell></row></sheetData></sheetDataSet></externalBook></externalLink>';
+  const styles = xsStyles({
+    numFmts: [[164, '"$"#,##0.00']],
+    fonts: [xsFont(), xsFont('<b/>', '<color theme="0"/>'), xsFont('<b/>', '<color rgb="FF1F3864"/>', 14)],
+    fills: ['<fill><patternFill patternType="solid"><fgColor rgb="FF4472C4"/><bgColor indexed="64"/></patternFill></fill>'],
+    xfs: [xsXf({ font: 1, fill: 2 }), xsXf({ numFmt: 164 }), xsXf({ font: 2 })],
+  });
+  const sheetNames = ['Sales', 'Summary', 'Pivot'];
+  const common = xsCommonParts(sheetNames);
+  const workbook = xsWorkbook({
+    uid: 'objects',
+    sheets: [{ name: 'Sales', id: 1, rid: 'rId1' }, { name: 'Summary', id: 3, rid: 'rId2' }, { name: 'Pivot', id: 2, rid: 'rId3' }],
+    externalRefs: ['rId4'],
+    names: [],
+    extra: '<pivotCaches><pivotCache cacheId="5" r:id="rId5"/></pivotCaches>',
+  });
+  return xsPackage([
+    common.rels,
+    { name: 'xl/workbook.xml', ct: `${XS_SML}sheet.main+xml`, data: workbook },
+    {
+      name: 'xl/_rels/workbook.xml.rels',
+      data: xsRels([
+        { id: 'rId8', type: 'sharedStrings', target: 'sharedStrings.xml' },
+        { id: 'rId3', type: 'worksheet', target: 'worksheets/sheet3.xml' },
+        { id: 'rId7', type: 'styles', target: 'styles.xml' },
+        { id: 'rId2', type: 'worksheet', target: 'worksheets/sheet2.xml' },
+        { id: 'rId1', type: 'worksheet', target: 'worksheets/sheet1.xml' },
+        { id: 'rId5', type: 'pivotCacheDefinition', target: 'pivotCache/pivotCacheDefinition1.xml' },
+        { id: 'rId4', type: 'externalLink', target: 'externalLinks/externalLink1.xml' },
+      ]),
+    },
+    { name: 'xl/worksheets/sheet1.xml', ct: `${XS_SML}worksheet+xml`, data: sales },
+    { name: 'xl/worksheets/sheet2.xml', ct: `${XS_SML}worksheet+xml`, data: summary },
+    { name: 'xl/worksheets/sheet3.xml', ct: `${XS_SML}worksheet+xml`, data: pivotSheet },
+    { name: 'xl/pivotCache/pivotCacheDefinition1.xml', ct: `${XS_SML}pivotCacheDefinition+xml`, data: cacheDef },
+    { name: 'xl/pivotCache/pivotCacheRecords1.xml', ct: `${XS_SML}pivotCacheRecords+xml`, data: cacheRecords },
+    { name: 'xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels', data: xsRels([{ id: 'rId1', type: 'pivotCacheRecords', target: 'pivotCacheRecords1.xml' }]) },
+    { name: 'xl/pivotTables/pivotTable1.xml', ct: `${XS_SML}pivotTable+xml`, data: pivotTable },
+    { name: 'xl/pivotTables/_rels/pivotTable1.xml.rels', data: xsRels([{ id: 'rId1', type: 'pivotCacheDefinition', target: '../pivotCache/pivotCacheDefinition1.xml' }]) },
+    { name: 'xl/externalLinks/externalLink1.xml', ct: `${XS_SML}externalLink+xml`, data: externalLink },
+    { name: 'xl/externalLinks/_rels/externalLink1.xml.rels', data: xsRels([{ id: 'rId1', type: 'externalLinkPath', target: 'Prices.xlsx', external: true }]) },
+    { name: 'xl/worksheets/_rels/sheet1.xml.rels', data: xsRels([{ id: 'rId2', type: 'table', target: '../tables/table1.xml' }, { id: 'rId1', type: 'drawing', target: '../drawings/drawing1.xml' }]) },
+    { name: 'xl/worksheets/_rels/sheet3.xml.rels', data: xsRels([{ id: 'rId1', type: 'pivotTable', target: '../pivotTables/pivotTable1.xml' }]) },
+    { name: 'xl/tables/table1.xml', ct: `${XS_SML}table+xml`, data: table },
+    { name: 'xl/drawings/drawing1.xml', ct: `${XS_CT}drawing+xml`, data: drawing },
+    { name: 'xl/drawings/_rels/drawing1.xml.rels', data: xsRels([{ id: 'rId2', type: 'chart', target: '../charts/chart1.xml' }, { id: 'rId1', type: 'image', target: '../media/image1.png' }]) },
+    { name: 'xl/charts/chart1.xml', ct: `${XS_CT}drawingml.chart+xml`, data: chart },
+    { name: 'xl/media/image1.png', data: makeBadgePng(64) },
+    { name: 'xl/styles.xml', ct: `${XS_SML}styles+xml`, data: styles },
+    { name: 'xl/sharedStrings.xml', ct: `${XS_SML}sharedStrings+xml`, data: sst.xml() },
+    common.core,
+    common.app,
+  ]);
+}
+
+// --- formulas.xlsx: 1904 dates, shared / array / dynamic-array formulas (metadata.xml), names, calcChain ---
+async function buildXlsxSaveFormulas() {
+  const sst = new XsStrings();
+  const qty = Array.from({ length: 10 }, (_, i) => 3 * (i + 1));
+  const price = Array.from({ length: 10 }, (_, i) => 1.5 + i * 0.25);
+  const amount = qty.map((q, i) => excelRound(q * price[i]));
+  const total = excelRound(amount.reduce((a, b) => a + b, 0));
+  const calcRows = [{ r: 1, cells: Object.fromEntries(['Qty', 'Price', 'Amount', 'Total', 'Times ten', 'Kind', 'Sorted'].map((h, i) => [columnLetter(i + 1), { text: h, s: 1 }])) }];
+  const kinds = [
+    { f: 'IF(A2>10,"big","small")', t: 'str', v: 'small' },
+    { f: 'ISNUMBER(A3)', t: 'b', v: 1 },
+    { f: 'A4/0', t: 'e', v: '#DIV/0!' },
+    { f: '_xlfn.XLOOKUP(9,A2:A11,B2:B11)', v: price[2] },
+    { f: '"Total: "&TEXT(D2,"0.00")', t: 'str', v: `Total: ${total.toFixed(2)}` },
+    { f: 'TaxRate*D2', v: excelRound(0.2 * total) },
+    { f: 'Dates!Rate*2', v: 0.1 },
+  ];
+  const sorted = qty.slice(0, 5).sort((a, b) => b - a);
+  for (let i = 0; i < 10; i++) {
+    const r = i + 2;
+    const cells = { A: qty[i], B: { v: price[i], s: 5 } };
+    cells.C = i === 0 ? { f: 'A2*B2', fa: ' t="shared" ref="C2:C11" si="0"', v: amount[i], s: 5 } : { f: '', fa: ' t="shared" si="0"', v: amount[i], s: 5 };
+    if (i === 0) cells.D = { f: 'SUM(C2:C11)', v: total, s: 5 };
+    if (i < 3) cells.E = i === 0 ? { f: 'A2:A4*10', fa: ' t="array" ref="E2:E4"', v: qty[0] * 10 } : qty[i] * 10;
+    if (i < kinds.length) cells.F = kinds[i];
+    if (i < 5) cells.G = i === 0 ? { f: '_xlfn._xlws.SORT(A2:A6,1,-1)', fa: ' t="array" ref="G2:G6" aca="false"', cm: 1, v: sorted[0] } : sorted[i];
+    calcRows.push({ r, cells });
+  }
+  const calc = xsWorksheet({
+    sst, uid: 'formulas:calc', dimension: 'A1:G11', selected: true, rows: calcRows,
+    view: '<sheetView tabSelected="1" workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>' +
+      '<selection pane="bottomLeft" activeCell="A2" sqref="A2"/></sheetView>',
+    after: `<autoFilter ref="A1:G11" xr:uid="{${xsGuid('formulas:filter')}}"/>${XS_MARGINS}`,
+  });
+  // 1904 date system: serial 0 = 1904-01-01; 2024-03-15 = 45366 - 1462
+  const day = excelSerial(new Date(Date.UTC(2024, 2, 15))) - 1462;
+  const dates = xsWorksheet({
+    sst, uid: 'formulas:dates', dimension: 'A1:C7',
+    rows: [
+      { r: 1, cells: { A: { text: 'Event', s: 1 }, B: { text: 'When', s: 1 }, C: { text: 'Part', s: 1 } } },
+      { r: 2, cells: { A: 'Launch day', B: { v: day, s: 2 }, C: { f: 'YEAR(B2)', v: 2024 } } },
+      { r: 3, cells: { A: 'Launch time', B: { v: day + 14.5 / 24, s: 3 }, C: { f: 'MONTH(B3)', v: 3 } } },
+      { r: 4, cells: { A: 'Daily check', B: { v: 0.75, s: 4 }, C: { f: 'HOUR(B4)', v: 18 } } },
+      { r: 5, cells: { A: 'Epoch (1904)', B: { v: 0, s: 2 } } },
+      { r: 7, cells: { A: 'Rate', B: { v: 0.05, s: 6 } } },
+    ],
+    cols: '<col min="1" max="1" width="14.7109375" customWidth="1"/><col min="2" max="2" width="18.7109375" customWidth="1"/>',
+  });
+  const reportRows = [
+    { r: 1, cells: { A: { text: 'Quarterly report', s: 1 } } },
+    { r: 2, cells: { A: { text: 'Line', s: 1 }, B: { text: 'Amount', s: 1 }, C: { text: 'Share', s: 1 }, D: { text: 'Note', s: 1 } } },
+  ];
+  for (let r = 3; r <= 20; r++) {
+    reportRows.push({ r, cells: { A: `Line ${r - 2}`, B: { v: (r - 2) * 125, s: 5 }, C: { f: `B${r}/SUM($B$3:$B$20)`, v: excelRound(((r - 2) * 125) / (125 * 171)), s: 6 } } });
+  }
+  const report = xsWorksheet({
+    sst, uid: 'formulas:report', dimension: 'A1:D20', rows: reportRows,
+    after: `${XS_MARGINS}<pageSetup paperSize="9" orientation="landscape" horizontalDpi="300" verticalDpi="300"/>` +
+      '<headerFooter><oddHeader>&amp;C&amp;"-,Bold"Quarterly report</oddHeader><oddFooter>Page &amp;P of &amp;N</oddFooter></headerFooter>',
+  });
+  const metadata = XS_DECL + `<metadata xmlns="${XS_MAIN}" xmlns:xda="http://schemas.microsoft.com/office/spreadsheetml/2017/dynamicarray">` +
+    '<metadataTypes count="1"><metadataType name="XLDAPR" minSupportedVersion="120000" copy="1" pasteAll="1" pasteValues="1" ' +
+    'merge="1" splitFirst="1" rowColShift="1" clearFormats="1" clearComments="1" assign="1" coerce="1" cellMeta="1"/></metadataTypes>' +
+    '<futureMetadata name="XLDAPR" count="1"><bk><extLst><ext uri="{bdbb8cdc-fa1e-496e-a857-3c3f30c029c3}">' +
+    '<xda:dynamicArrayProperties fDynamic="1" fCollapsed="0"/></ext></extLst></bk></futureMetadata>' +
+    '<cellMetadata count="1"><bk><rc t="1" v="0"/></bk></cellMetadata></metadata>';
+  const chain = ['<c r="G2" i="1" a="1"/>', '<c r="E2" a="1"/>', ...amount.map((_, i) => `<c r="C${i + 2}"/>`), '<c r="D2"/>',
+    ...kinds.map((_, i) => `<c r="F${i + 2}"/>`), '<c r="C2" i="2"/>', '<c r="C3"/>', '<c r="C4"/>',
+    ...reportRows.slice(2).map((row, i) => (i === 0 ? `<c r="C${row.r}" i="3"/>` : `<c r="C${row.r}"/>`))];
+  const calcChain = XS_DECL + `<calcChain xmlns="${XS_MAIN}">${chain.join('')}</calcChain>`;
+  const styles = xsStyles({
+    numFmts: [[164, 'yyyy\\-mm\\-dd\\ hh:mm']],
+    fonts: [xsFont(), xsFont('<b/>')],
+    borders: [XS_THIN],
+    xfs: [xsXf({ font: 1, border: 1 }), xsXf({ numFmt: 14 }), xsXf({ numFmt: 164 }), xsXf({ numFmt: 20 }), xsXf({ numFmt: 2 }), xsXf({ numFmt: 10 })],
+  });
+  const common = xsCommonParts(['Calc', 'Dates', 'Report']);
+  const workbook = xsWorkbook({
+    uid: 'formulas', date1904: true,
+    sheets: [{ name: 'Calc', id: 1, rid: 'rId1' }, { name: 'Dates', id: 2, rid: 'rId2' }, { name: 'Report', id: 3, rid: 'rId3' }],
+    names: [
+      '<definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">Calc!$A$1:$G$11</definedName>',
+      '<definedName name="_xlnm.Print_Area" localSheetId="2">Report!$A$1:$D$20</definedName>',
+      '<definedName name="_xlnm.Print_Titles" localSheetId="2">Report!$1:$2</definedName>',
+      '<definedName name="HiddenTotal" hidden="1">Calc!$D$2</definedName>',
+      '<definedName name="Inputs">Calc!$A$2:$B$11</definedName>',
+      '<definedName name="Rate" localSheetId="1">Dates!$B$7</definedName>',
+      '<definedName name="TaxRate">0.2</definedName>',
+    ],
+  });
+  return xsPackage([
+    common.rels,
+    { name: 'xl/workbook.xml', ct: `${XS_SML}sheet.main+xml`, data: workbook },
+    {
+      name: 'xl/_rels/workbook.xml.rels',
+      data: xsRels([
+        { id: 'rId3', type: 'worksheet', target: 'worksheets/sheet3.xml' },
+        { id: 'rId7', type: 'sheetMetadata', target: 'metadata.xml' },
+        { id: 'rId2', type: 'worksheet', target: 'worksheets/sheet2.xml' },
+        { id: 'rId1', type: 'worksheet', target: 'worksheets/sheet1.xml' },
+        { id: 'rId6', type: 'calcChain', target: 'calcChain.xml' },
+        { id: 'rId5', type: 'sharedStrings', target: 'sharedStrings.xml' },
+        { id: 'rId4', type: 'styles', target: 'styles.xml' },
+      ]),
+    },
+    { name: 'xl/worksheets/sheet1.xml', ct: `${XS_SML}worksheet+xml`, data: calc },
+    { name: 'xl/worksheets/sheet2.xml', ct: `${XS_SML}worksheet+xml`, data: dates },
+    { name: 'xl/worksheets/sheet3.xml', ct: `${XS_SML}worksheet+xml`, data: report },
+    { name: 'xl/styles.xml', ct: `${XS_SML}styles+xml`, data: styles },
+    { name: 'xl/sharedStrings.xml', ct: `${XS_SML}sharedStrings+xml`, data: sst.xml() },
+    { name: 'xl/calcChain.xml', ct: `${XS_SML}calcChain+xml`, data: calcChain },
+    { name: 'xl/metadata.xml', ct: `${XS_SML}sheetMetadata+xml`, data: metadata },
+    common.core,
+    common.app,
+  ]);
+}
+
+// --- comments.xlsx: threaded comments + persons (with their legacy notes), plain notes, rich text, hyperlinks ---
+async function buildXlsxSaveComments() {
+  const sst = new XsStrings();
+  const people = [
+    { name: 'Ana Silva', id: xsGuid('comments:person:ana'), user: 'ana@example.com' },
+    { name: 'Ben Okafor', id: xsGuid('comments:person:ben'), user: 'ben@example.com' },
+  ];
+  const threads = [
+    { ref: 'B2', row: 1, col: 1, items: [[0, 'Is this the right owner?'], [1, 'Yes, confirmed with the team.']] },
+    { ref: 'C4', row: 3, col: 2, items: [[1, 'Blocked by the supplier.']] },
+  ].map((thread, t) => ({ ...thread, items: thread.items.map(([person, text], i) => ({ person, text, id: xsGuid(`comments:thread:${t}:${i}`) })) }));
+  const reviewRows = [
+    { r: 1, cells: { A: { text: 'Item', s: 1 }, B: { text: 'Owner', s: 1 }, C: { text: 'Status', s: 1 }, D: { text: 'Notes', s: 1 } } },
+    { r: 2, cells: { A: 'Budget', B: 'Ana', C: 'Open', D: 'Draft ready' } },
+    { r: 3, cells: { A: 'Hiring', B: 'Ben', C: 'Closed', D: { rich: '<r><rPr><b/><sz val="11"/><color theme="1"/><rFont val="Calibri"/><family val="2"/><scheme val="minor"/></rPr><t>Done</t></r>' +
+      '<r><rPr><sz val="11"/><color theme="1"/><rFont val="Calibri"/><family val="2"/><scheme val="minor"/></rPr><t xml:space="preserve"> in March</t></r>' } } },
+    { r: 4, cells: { A: 'Supplies', B: 'Ana', C: 'Waiting', D: 12.5 } },
+    { r: 5, cells: { A: 'Travel', B: 'Ben', C: 'Open', D: { v: 0.25, s: 3 } } },
+    { r: 7, cells: { A: { text: 'Project docs', s: 2 } } },
+    { r: 8, cells: { A: { text: 'Go to Notes', s: 2 } } },
+  ];
+  const review = xsWorksheet({
+    sst, uid: 'comments:review', dimension: 'A1:D8', selected: true, rows: reviewRows,
+    cols: '<col min="1" max="1" width="14.7109375" customWidth="1"/><col min="4" max="4" width="16.7109375" customWidth="1"/>',
+    after: `<hyperlinks><hyperlink ref="A7" r:id="rId4" xr:uid="{${xsGuid('comments:link:1')}}"/>` +
+      `<hyperlink ref="A8" location="'Notes'!A1" display="Go to Notes" xr:uid="{${xsGuid('comments:link:2')}}"/></hyperlinks>` +
+      `${XS_MARGINS}<legacyDrawing r:id="rId2"/>`,
+  });
+  const notes = xsWorksheet({
+    sst, uid: 'comments:notes', dimension: 'A1:B3',
+    rows: [
+      { r: 1, cells: { A: { text: 'Checked', s: 1 }, B: { text: 'By', s: 1 } } },
+      { r: 2, cells: { A: { t: 'b', v: 1 }, B: 'Reviewer' } },
+      { r: 3, cells: { A: { t: 'b', v: 0 }, B: 'Ana' } },
+    ],
+    after: `${XS_MARGINS}<legacyDrawing r:id="rId2"/>`,
+  });
+  const threaded = XS_DECL + `<ThreadedComments xmlns="${XS_TC}" xmlns:x="${XS_MAIN}">` +
+    threads.flatMap(thread => thread.items.map((item, i) =>
+      `<threadedComment ref="${thread.ref}" dT="${XS_TIME.replace('Z', '')}.${String(i).padStart(2, '0')}" personId="{${people[item.person].id}}" ` +
+      `id="{${item.id}}"${i ? ` parentId="{${thread.items[0].id}}"` : ''}><text>${xmlEscape(item.text)}</text></threadedComment>`)).join('') +
+    '</ThreadedComments>';
+  const persons = XS_DECL + `<personList xmlns="${XS_TC}" xmlns:x="${XS_MAIN}">` +
+    people.map(p => `<person displayName="${p.name}" id="{${p.id}}" userId="${p.user}" providerId="None"/>`).join('') + '</personList>';
+  const noteRuns = (author, text) => `<r><rPr><b/><sz val="9"/><color indexed="81"/><rFont val="Tahoma"/><family val="2"/></rPr><t>${author}:</t></r>` +
+    `<r><rPr><sz val="9"/><color indexed="81"/><rFont val="Tahoma"/><family val="2"/></rPr><t xml:space="preserve">\n${xmlEscape(text)}</t></r>`;
+  const legacy1 = xsComments(
+    [...threads.map(thread => `tc={${thread.items[0].id}}`), 'Reviewer'],
+    [
+      { ref: 'B2', author: 0, uid: 'comments:legacy:B2', runs: xsThreadedLegacy(threads[0].items[0].text) },
+      { ref: 'C4', author: 1, uid: 'comments:legacy:C4', runs: xsThreadedLegacy(threads[1].items[0].text) },
+      { ref: 'D3', author: 2, uid: 'comments:legacy:D3', runs: noteRuns('Reviewer', 'Check the dates.') },
+    ],
+  );
+  const legacy2 = xsComments(['Reviewer'], [{ ref: 'A1', author: 0, uid: 'comments:legacy:notes:A1', runs: noteRuns('Reviewer', 'TRUE when the row was checked.') }]);
+  const styles = xsStyles({
+    fonts: [xsFont(), xsFont('<b/>'), '<font><u/><sz val="11"/><color theme="10"/><name val="Calibri"/><family val="2"/><scheme val="minor"/></font>'],
+    xfs: [xsXf({ font: 1 }), xsXf({ font: 2 }), xsXf({ numFmt: 9 })],
+  });
+  const common = xsCommonParts(['Review', 'Notes']);
+  const workbook = xsWorkbook({ uid: 'comments', sheets: [{ name: 'Review', id: 1, rid: 'rId1' }, { name: 'Notes', id: 2, rid: 'rId2' }] });
+  return xsPackage([
+    common.rels,
+    { name: 'xl/workbook.xml', ct: `${XS_SML}sheet.main+xml`, data: workbook },
+    {
+      name: 'xl/_rels/workbook.xml.rels',
+      data: xsRels([
+        { id: 'rId2', type: 'worksheet', target: 'worksheets/sheet2.xml' },
+        { id: 'rId1', type: 'worksheet', target: 'worksheets/sheet1.xml' },
+        { id: 'rId5', type: 'sharedStrings', target: 'sharedStrings.xml' },
+        { id: 'rId4', type: 'styles', target: 'styles.xml' },
+        { id: 'rId6', type: `${XS_MS_REL}/person`, target: 'persons/person.xml' },
+      ]),
+    },
+    { name: 'xl/worksheets/sheet1.xml', ct: `${XS_SML}worksheet+xml`, data: review },
+    { name: 'xl/worksheets/sheet2.xml', ct: `${XS_SML}worksheet+xml`, data: notes },
+    {
+      name: 'xl/worksheets/_rels/sheet1.xml.rels',
+      data: xsRels([
+        { id: 'rId3', type: 'comments', target: '../comments1.xml' },
+        { id: 'rId2', type: 'vmlDrawing', target: '../drawings/vmlDrawing1.vml' },
+        { id: 'rId1', type: `${XS_MS_REL}/threadedComment`, target: '../threadedComments/threadedComment1.xml' },
+        { id: 'rId4', type: 'hyperlink', target: 'https://example.com/docs', external: true },
+      ]),
+    },
+    {
+      name: 'xl/worksheets/_rels/sheet2.xml.rels',
+      data: xsRels([{ id: 'rId1', type: 'comments', target: '../comments2.xml' }, { id: 'rId2', type: 'vmlDrawing', target: '../drawings/vmlDrawing2.vml' }]),
+    },
+    { name: 'xl/threadedComments/threadedComment1.xml', ct: 'application/vnd.ms-excel.threadedcomments+xml', data: threaded },
+    { name: 'xl/drawings/vmlDrawing1.vml', data: xsNotesVml([{ row: 1, col: 1 }, { row: 3, col: 2 }, { row: 2, col: 3 }], 1) },
+    { name: 'xl/drawings/vmlDrawing2.vml', data: xsNotesVml([{ row: 0, col: 0 }], 2) },
+    { name: 'xl/comments1.xml', ct: `${XS_SML}comments+xml`, data: legacy1 },
+    { name: 'xl/comments2.xml', ct: `${XS_SML}comments+xml`, data: legacy2 },
+    { name: 'xl/persons/person.xml', ct: 'application/vnd.ms-excel.person+xml', data: persons },
+    { name: 'xl/styles.xml', ct: `${XS_SML}styles+xml`, data: styles },
+    { name: 'xl/sharedStrings.xml', ct: `${XS_SML}sharedStrings+xml`, data: sst.xml() },
+    common.core,
+    common.app,
+  ]);
+}
+
+// --- formatting.xlsx: unit-format numbers, <b val="0"/> & co., custom palette, CF (duplicateValues ...), big
+//     validations (> 10k cells), merges, page breaks, row and column styles, frozen pane, hidden row ---
+async function buildXlsxSaveFormatting() {
+  const sst = new XsStrings();
+  // custom palette: all 64 entries written, none equal to Excel's default
+  const palette = Array.from({ length: 64 }, (_, i) => {
+    const [r, g, b] = hslToRgb((i * 37) % 360, 0.55, 0.35 + (i % 4) * 0.12);
+    return `FF${[r, g, b].map(v => Math.round(v).toString(16).padStart(2, '0')).join('').toUpperCase()}`;
+  });
+  const numFmts = [[164, '#,##0.00\\ \\m'], [165, '0.0\\ \\k\\m'], [166, '#,##0\\ "mm"'], [167, '[$-409]mmm\\ yyyy;@'], [168, 'd\\-mmm\\-yy'], [169, '0.00%;[Red]\\-0.00%']];
+  const fonts = [
+    xsFont(), xsFont('<b/>'), xsFont('<b val="0"/>'), xsFont('<i val="false"/>'), xsFont('<strike val="0"/>'), xsFont('<b val="1"/>'),
+    xsFont('<b/>', '<color rgb="FF1F3864"/>', 14),
+  ];
+  const fills = ['<fill><patternFill patternType="solid"><fgColor indexed="44"/><bgColor indexed="64"/></patternFill></fill>'];
+  for (let i = 8; i < 64; i++) fills.push(`<fill><patternFill patternType="solid"><fgColor indexed="${i}"/><bgColor indexed="64"/></patternFill></fill>`);
+  const xfs = [
+    xsXf({ font: 6, align: '<alignment horizontal="center"/>' }), // 1 title
+    xsXf({ font: 1, border: 1 }), // 2 header
+    ...numFmts.map(([id]) => xsXf({ numFmt: id })), // 3..8
+    xsXf({ font: 2 }), xsXf({ font: 3 }), xsXf({ font: 4 }), xsXf({ font: 5 }), // 9..12
+    xsXf({ fill: 2 }), // 13 row style
+    xsXf({ border: 1 }), // 14 column style
+  ];
+  const paletteXf = xfs.length + 1;
+  for (let i = 8; i < 64; i++) xfs.push(xsXf({ fill: i - 5 }));
+  const fmt = id => 3 + numFmts.findIndex(([n]) => n === id);
+  const rows = [
+    { r: 1, cells: { A: { text: 'Formatting fixtures', s: 1 }, B: { s: 1 }, C: { s: 1 }, D: { s: 1 } }, attrs: ' ht="18.75" customHeight="1"' },
+    { r: 2, cells: { A: { text: 'Label', s: 2 }, B: { text: 'Value', s: 2 }, C: { text: 'Format', s: 2 } } },
+    { r: 3, cells: { A: 'Length', B: { v: 1234.5, s: fmt(164) }, C: '#,##0.00\\ \\m' } },
+    { r: 4, cells: { A: 'Distance', B: { v: 12.75, s: fmt(165) }, C: '0.0\\ \\k\\m' } },
+    { r: 5, cells: { A: 'Rainfall', B: { v: 845, s: fmt(166) }, C: '#,##0\\ "mm"' } },
+    { r: 6, cells: { A: 'Month', B: { v: 45366, s: fmt(167) }, C: '[$-409]mmm\\ yyyy;@' } },
+    { r: 7, cells: { A: 'Day', B: { v: 45366, s: fmt(168) }, C: 'd\\-mmm\\-yy' } },
+    { r: 8, cells: { A: 'Ratio', B: { v: -0.1234, s: fmt(169) }, C: '0.00%;[Red]\\-0.00%' } },
+    { r: 9, cells: { A: { text: 'Not bold (b val=0)', s: 9 }, B: { v: 1, s: 9 } } },
+    { r: 10, cells: { A: { text: 'Not italic (i val=false)', s: 10 }, B: { v: 2, s: 10 } } },
+    { r: 11, cells: { A: { text: 'Not struck (strike val=0)', s: 11 }, B: { v: 3, s: 11 } } },
+    { r: 12, cells: { A: { text: 'Bold (b val=1)', s: 12 }, B: { v: 4, s: 12 } } },
+    { r: 13, cells: { A: 'Hidden row' }, attrs: ' hidden="1"' },
+    { r: 14, cells: { A: { text: 'Row style', s: 13 }, B: { v: 5, s: 13 } }, attrs: ' s="13" customFormat="1"' },
+  ];
+  const codes = ['A-17', 'B-02', 'C-33', 'A-17', 'D-08', 'B-02'];
+  for (let r = 15; r <= 40; r++) {
+    const i = r - 15;
+    rows.push({ r, cells: { A: codes[i % codes.length], B: (i * 37) % 101, C: excelRound(((i * 53) % 89) / 4) } });
+  }
+  const formats = xsWorksheet({
+    sst, uid: 'formatting:formats', dimension: 'A1:D40', rows,
+    view: '<sheetView tabSelected="1" workbookViewId="0"><pane ySplit="2" topLeftCell="A3" activePane="bottomLeft" state="frozen"/>' +
+      '<selection pane="bottomLeft" activeCell="B3" sqref="B3"/></sheetView>',
+    cols: '<col min="1" max="1" width="28.7109375" customWidth="1"/><col min="2" max="2" width="14.28515625" customWidth="1"/>' +
+      '<col min="3" max="3" width="22.7109375" customWidth="1"/><col min="5" max="7" width="12.7109375" style="14" customWidth="1"/>',
+    after: '<mergeCells count="1"><mergeCell ref="A1:D1"/></mergeCells>' +
+      '<conditionalFormatting sqref="A15:A40"><cfRule type="duplicateValues" dxfId="0" priority="1"/></conditionalFormatting>' +
+      '<conditionalFormatting sqref="B15:B40"><cfRule type="cellIs" dxfId="1" priority="2" operator="greaterThan"><formula>50</formula></cfRule>' +
+      '<cfRule type="colorScale" priority="3"><colorScale><cfvo type="min"/><cfvo type="max"/><color rgb="FFF8696B"/><color rgb="FF63BE7B"/></colorScale></cfRule></conditionalFormatting>' +
+      '<conditionalFormatting sqref="C15:C40"><cfRule type="expression" dxfId="2" priority="4"><formula>MOD(ROW(),2)=0</formula></cfRule>' +
+      '<cfRule type="top10" dxfId="1" priority="5" rank="3"/></conditionalFormatting>' +
+      '<dataValidations count="3">' +
+      '<dataValidation type="list" allowBlank="1" showInputMessage="1" showErrorMessage="1" promptTitle="Status" prompt="Pick a status" sqref="E2:E20001">' +
+      '<formula1>"Open,Closed,Waiting"</formula1></dataValidation>' +
+      '<dataValidation type="whole" allowBlank="1" showErrorMessage="1" errorTitle="Out of range" error="Enter 0 to 100" sqref="F2:F15001">' +
+      '<formula1>0</formula1><formula2>100</formula2></dataValidation>' +
+      '<dataValidation type="custom" allowBlank="1" showErrorMessage="1" sqref="G2:G12001 I2:I3000"><formula1>LEN(G2)&lt;=20</formula1></dataValidation>' +
+      `</dataValidations>${XS_MARGINS}<pageSetup paperSize="9" orientation="landscape" horizontalDpi="300" verticalDpi="300"/>` +
+      '<rowBreaks count="2" manualBreakCount="2"><brk id="20" max="16383" man="1"/><brk id="40" max="16383" man="1"/></rowBreaks>' +
+      '<colBreaks count="1" manualBreakCount="1"><brk id="4" max="1048575" man="1"/></colBreaks>',
+  });
+  const paletteRows = [];
+  for (let r = 1; r <= 7; r++) {
+    const cells = {};
+    for (let c = 1; c <= 8; c++) {
+      const index = 8 + (r - 1) * 8 + (c - 1);
+      cells[columnLetter(c)] = { v: index, s: paletteXf + index - 8 };
+    }
+    paletteRows.push({ r, cells });
+  }
+  const paletteSheet = xsWorksheet({ sst, uid: 'formatting:palette', dimension: 'A1:H7', rows: paletteRows, sheetPr: '<sheetPr><tabColor indexed="44"/></sheetPr>' });
+  const styles = xsStyles({
+    numFmts, fonts, fills, borders: [XS_THIN], xfs,
+    dxfs: [
+      '<dxf><font><color rgb="FF9C0006"/></font><fill><patternFill><bgColor rgb="FFFFC7CE"/></patternFill></fill></dxf>',
+      '<dxf><font><color rgb="FF006100"/></font><fill><patternFill><bgColor rgb="FFC6EFCE"/></patternFill></fill></dxf>',
+      '<dxf><fill><patternFill><bgColor indexed="44"/></patternFill></fill></dxf>',
+    ],
+    colors: `<colors><indexedColors>${palette.map(rgb => `<rgbColor rgb="${rgb}"/>`).join('')}</indexedColors></colors>`,
+  });
+  const common = xsCommonParts(['Formats', 'Palette']);
+  const workbook = xsWorkbook({ uid: 'formatting', sheets: [{ name: 'Formats', id: 1, rid: 'rId1' }, { name: 'Palette', id: 2, rid: 'rId2' }] });
+  return xsPackage([
+    common.rels,
+    { name: 'xl/workbook.xml', ct: `${XS_SML}sheet.main+xml`, data: workbook },
+    {
+      name: 'xl/_rels/workbook.xml.rels',
+      data: xsRels([
+        { id: 'rId2', type: 'worksheet', target: 'worksheets/sheet2.xml' },
+        { id: 'rId1', type: 'worksheet', target: 'worksheets/sheet1.xml' },
+        { id: 'rId4', type: 'sharedStrings', target: 'sharedStrings.xml' },
+        { id: 'rId3', type: 'styles', target: 'styles.xml' },
+      ]),
+    },
+    { name: 'xl/worksheets/sheet1.xml', ct: `${XS_SML}worksheet+xml`, data: formats },
+    { name: 'xl/worksheets/sheet2.xml', ct: `${XS_SML}worksheet+xml`, data: paletteSheet },
+    { name: 'xl/styles.xml', ct: `${XS_SML}styles+xml`, data: styles },
+    { name: 'xl/sharedStrings.xml', ct: `${XS_SML}sharedStrings+xml`, data: sst.xml() },
+    common.core,
+    common.app,
+  ]);
+}
+
+/** test/samples/xlsx-save/<name> -> builder (written by main through writeIfChanged). */
+const XLSX_SAVE_FIXTURES = [
+  ['objects.xlsx', buildXlsxSaveObjects],
+  ['formulas.xlsx', buildXlsxSaveFormulas],
+  ['comments.xlsx', buildXlsxSaveComments],
+  ['formatting.xlsx', buildXlsxSaveFormatting],
+];
+
 // ===== CSV / TSV / PSV / SSV =====
 
 /** Quotes a field when needed (delimiter, quote, CR/LF, surrounding whitespace) or when forced. */
@@ -3940,6 +4714,7 @@ async function main() {
   };
   await step('images/sample.png', () => makeBadgePng(64));
   await step('styled.xlsx', () => generateStyledXlsx(images));
+  for (const [name, build] of XLSX_SAVE_FIXTURES) await step(`xlsx-save/${name}`, build);
   await step('sample.csv', buildSampleCsv);
   await step('sample-semicolon.csv', buildSemicolonCsv);
   await step('sample.tsv', buildSampleTsv);
