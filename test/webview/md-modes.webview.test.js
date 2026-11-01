@@ -551,7 +551,8 @@ H.suite('markdown modes (P6)', ({ test }) => {
 
   test('WYSIWYG: pasted HTML is sanitized; pasted files are refused with a message', async (h) => {
     const host = mdHost('paste.md', DOC);
-    return h.use(host, {}, async (view) => {
+    // The pasted HTML deliberately contains an inline onclick: newer Chrome reports it to the CSP even though it never runs (__pwned stays unset).
+    return h.use(host, { ignoreErrors: /Executing inline event handler|script-src-attr inline/ }, async (view) => {
       await toWysiwyg(view);
       await caretIn(view, 'Last paragraph');
       await view.eval(() => {

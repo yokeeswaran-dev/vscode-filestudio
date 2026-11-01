@@ -342,7 +342,8 @@ H.suite('markdown preview (0.1.x regressions)', ({ test }) => {
   test('K10 a large document (built in parts): an edit right after opening applies; every block arrives once, sanitized', (h) => {
     const big = Array.from({ length: 4000 }, (_, i) => `Paragraph ${i} lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor.`).join('\n\n');
     const src = `# Big\n\n${big}\n\n<style>.md-view { background: rgb(255, 0, 0) !important; }</style>\n\n<img src="data:image/png;base64,AAAA" onerror="window.__pwn = 1">\n\nThe very last paragraph.\n`;
-    return h.use(H.markdownHost('big.md', src), {}, async (view) => {
+    // The page deliberately contains an inline onerror handler: newer Chrome reports it to the CSP even though it never runs (pwn stays 0).
+    return h.use(H.markdownHost('big.md', src), { ignoreErrors: /Executing inline event handler|script-src-attr inline/ }, async (view) => {
       const host = view.host;
       host.text = host.text.replace('Paragraph 0 lorem', 'Inserted at the top.\n\nParagraph 0 lorem');
       host.version++;

@@ -250,6 +250,8 @@ async function startHarness() {
     const { theme = 'light', width = 1280, height = 800 } = opts;
     const pg = await browser.newPage();
     await pg.setViewport({ width, height, deviceScaleFactor: 1 });
+    // A CI machine with animations turned off in the OS would make every page "reduce motion"; the tests set the body class themselves.
+    await pg.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'no-preference' }]);
     const errors = [];
     pg.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
     pg.on('console', (m) => {
