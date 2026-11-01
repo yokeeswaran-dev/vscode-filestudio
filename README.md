@@ -1,4 +1,4 @@
-# FileStudio – Excel & Markdown Editor + CSV, Word, PDF & PowerPoint Viewer for VS Code
+# FileStudio – Excel, CSV, Word, PDF & PowerPoint Viewer for VS Code
 
 **Open `.xlsx`, `.csv`, `.docx`, `.pdf`, `.pptx` and `.md` files right inside VS Code, and edit Excel and Markdown files.**
 No Microsoft Office, no LibreOffice, no browser: click the file and work with it next to your code.

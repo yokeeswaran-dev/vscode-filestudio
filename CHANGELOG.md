@@ -55,8 +55,6 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
-- New Marketplace name and description: **FileStudio – Excel & Markdown Editor + CSV, Word, PDF & PowerPoint
-  Viewer**.
 - README: a new **Editing** section (settings, and when a workbook is read-only), new FAQ answers, limitations and
   roadmap.
 - Third-party notices list the packages of the new Markdown editor.

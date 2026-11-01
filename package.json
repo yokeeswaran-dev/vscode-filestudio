@@ -1,7 +1,7 @@
 {
   "name": "filestudio",
-  "displayName": "FileStudio – Excel & Markdown Editor + CSV, Word, PDF & PowerPoint Viewer",
-  "description": "Edit Excel (.xlsx) and Markdown files, and view CSV, Word (.docx), PDF and PowerPoint (.pptx) files in VS Code. Fast, offline and private: no Office needed.",
+  "displayName": "FileStudio – Excel, CSV, Word, PDF & PowerPoint Viewer",
+  "description": "Open and preview Excel (.xlsx), CSV, Word (.docx), PDF, PowerPoint (.pptx) and Markdown files in VS Code. Fast, offline and private: no Office needed.",
   "version": "0.2.0",
   "publisher": "Yokeeswaran",
   "repository": {
