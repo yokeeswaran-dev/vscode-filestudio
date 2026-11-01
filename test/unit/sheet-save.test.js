@@ -1067,3 +1067,22 @@ test('R3-10: a part that declares more than 512 MB unpacked is refused by parseZ
   buf.writeUInt32LE(600 * 1024 * 1024, p + 24);
   assert.throws(() => S.parseZip(buf), (err) => err instanceof S.ZipError && /too large/.test(err.message));
 });
+
+// ----- final review fix round: XML comments in styles.xml and in a worksheet head -----
+
+test('checkPatchable: a comment or CDATA in styles.xml (it could hide a <cellXfs>) makes the workbook read-only', async () => {
+  const ok = sheetXml('<row r="1"><c r="A1"><v>1</v></c></row>');
+  const comment = STYLES().replace('<cellXfs count="3">', '<!-- <cellXfs count="1"><xf/></cellXfs> --><cellXfs count="3">');
+  const bad = await S.checkPatchable(await makeXlsx({ sheets: [{ name: 'S1', xml: ok }], styles: comment }));
+  assert.equal(bad.ok, false);
+  assert.match(bad.reason, /styles contain an XML comment or CDATA/);
+  assert.deepEqual(await S.checkPatchable(await makeXlsx({ sheets: [{ name: 'S1', xml: ok }] })), { ok: true });
+});
+
+test('checkPatchable: a comment holding <sheetData> in the worksheet head makes the workbook read-only (an edit would go into the comment)', async () => {
+  const head = '<!-- <sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData> -->';
+  const xml = sheetXml('<row r="1"><c r="A1"><v>1</v></c></row>', { head });
+  const bad = await S.checkPatchable(await makeXlsx({ sheets: [{ name: 'S1', xml }] }));
+  assert.equal(bad.ok, false);
+  assert.match(bad.reason, /XML comment or CDATA section before its cell data/);
+});

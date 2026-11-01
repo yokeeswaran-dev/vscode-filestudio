@@ -349,7 +349,7 @@ H.suite('sheet: grid cell editor (P2 core)', ({ test }) => {
       await p.keyboard.press('KeyX');
       await p.keyboard.up('Control');
       await view.settle();
-      assert.match(await status(view), /Cut is not available yet/);
+      assert.match(await status(view), /Cut is not available/);
       assert.equal(host.edits.length, 2);
       assert.equal(await cellText(view, 'Short'), true);
     });
@@ -697,11 +697,13 @@ H.suite('sheet: grid cell editor (P2 core)', ({ test }) => {
       assert.equal(host.edits.length, 3, 'not editable cancels');
       assert.equal(await mode(view), 'Read-only');
       assert.equal(await view.eval(() => document.querySelector('.fv-formula').getAttribute('aria-readonly')), 'true');
+      assert.equal(await view.eval(() => document.querySelector('.fv-scroller').getAttribute('aria-readonly')), 'true', 'the grid says read-only');
       assert.equal(await view.eval(() => document.querySelector('.fv-formula').hasAttribute('contenteditable')), false);
       host.editState = { editable: true, kinds: ['setCells', 'clear'] };
       await view.push({ type: 'editState', state: host.editState });
       await view.settle();
       assert.equal(await mode(view), 'Ready');
+      assert.equal(await view.eval(() => document.querySelector('.fv-scroller').getAttribute('aria-readonly')), 'false', 'the grid says editable again');
 
       // keep: scroll, resize, Ctrl+wheel zoom, theme change: the editor stays open with its text
       await open('E4', 'f');

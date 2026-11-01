@@ -4749,7 +4749,7 @@ function onGridKeyDown(e) {
       else if (ctrl && !e.altKey && !shift && k === 'c') copySelectionFromKeyboard();
       else if (ctrl && !e.altKey && !shift && k === 'x' && isCellEditable()) {
         // Cut is not in 0.2.0 (D-044): nothing is removed, and the key does not reach VS Code's own cut.
-        setStatusMessage('Cut is not available yet; use Copy and Delete.', 'info');
+        setStatusMessage('Cut is not available; use Copy and Delete.', 'info');
         e.preventDefault();
         e.stopPropagation();
         return;
@@ -6410,6 +6410,7 @@ function updateEditUi() {
   if (!g) return;
   const state = g.editState;
   const editable = isCellEditable();
+  g.dom.scroller.setAttribute('aria-readonly', String(!editable)); // screen readers announce the real state
   const mode = g.dom.statusMode;
   if (mode) {
     mode.textContent = editable ? 'Ready' : 'Read-only';
@@ -10296,6 +10297,11 @@ function mdOnModeKeyDown(e) {
 function mdOnEditState(msg) {
   if (currentKind() !== 'markdown' || !mdFrame || !msg.state || typeof msg.state !== 'object') return;
   mdx.editState = msg.state;
+  // The task checkboxes follow the state (an update without html carries nothing else, see MarkdownView.setEditState).
+  const editable = msg.state.editable !== false;
+  mdState.readOnly = !editable;
+  mdState.readOnlyReason = !editable && typeof msg.state.reason === 'string' ? msg.state.reason : '';
+  if (mdState.article) mdTasksAfterRender(mdState.article);
   mdFrameRefresh();
   mdwOnEditStateChange();
 }
@@ -11866,7 +11872,10 @@ function mdwApplyReadonly() {
     logError('Could not change the read-only state of the editor', err);
   }
   holder.classList.toggle('md-wysiwyg-readonly', readonly);
-  holder.querySelector('.ProseMirror')?.setAttribute('aria-readonly', String(readonly));
+  const pm = holder.querySelector('.ProseMirror');
+  pm?.setAttribute('aria-readonly', String(readonly));
+  pm?.setAttribute('aria-multiline', 'true');
+  pm?.setAttribute('aria-label', `${mdState.fileName || 'Markdown'} editor`);
   mdShowStatus();
 }
 

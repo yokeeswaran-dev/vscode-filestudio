@@ -14,6 +14,9 @@ const { T, host, extensionUri, token, writeTmp, lastOf, waitFor } = require('./l
 
 beforeEach(() => T.reset());
 
+/** The edit state a posted message carries (init / markdownUpdate: `editState`; the editState message: `state`). */
+const stateOf = (m) => m.editState ?? m.state;
+
 /** A document of `sections` x (heading, paragraph, list); `tag` makes its text unique (no result is shared between tests). */
 function doc(tag, sections = 40) {
   const parts = [`# ${tag}`];
@@ -38,7 +41,7 @@ async function openMd(name, text) {
   const init = await waitFor(() => lastOf(panel, 'init'), 3000, 'init');
   // the save check ends with an editState that is not "Checking the file…"
   await waitFor(() => {
-    const state = [...panel.posted].reverse().find((m) => m.editState)?.editState;
+    const state = stateOf([...panel.posted].reverse().find(stateOf) ?? {});
     return state && state.reason !== 'Checking the file…';
   }, 3000, 'the save check');
   return { uri, document, panel, init };
@@ -126,4 +129,13 @@ test('after the answer to a WYSIWYG edit the event loop gets a turn before the r
   assert.equal(result.accepted, true);
   await waitFor(() => order.includes('markdownUpdate'), 3000, 'markdownUpdate after the edit');
   assert.deepEqual(order, ['editResult', 'turn', 'markdownUpdate']);
+});
+
+test('opening a panel in Preview renders and posts the HTML once: the save check sends only the edit state', async () => {
+  const text = doc('cost-once');
+  globalThis.__fsMdParses.length = 0;
+  const { panel } = await openMd('cost-once.md', text);
+  await waitFor(() => [...panel.posted].some((m) => m.type === 'editState' && m.state.kinds?.includes('mdText')), 3000, 'the editState after the save check');
+  assert.deepEqual(panel.posted.filter((m) => m.html).map((m) => m.type), ['init'], 'the HTML is posted once');
+  assert.equal(wholeParses(text), 1, 'rendered once');
 });

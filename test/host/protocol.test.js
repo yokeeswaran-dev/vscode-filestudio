@@ -1,7 +1,7 @@
 // Track F (contract §2.7, §14 F WP7): the editing protocol. parseWebviewMessage / parseEditMessage accept every new
 // message in its exact shape, refuse every limit with `invalid` (an `edit` is answered, never dropped), refuse unknown
 // kinds, and leave all 0.1.2 messages unchanged. ViewerSession routes the new messages to optional view handlers; a
-// view without one answers an `edit` with `blocked` "This action is not available yet.". xlsx and CSV stay view-only.
+// view without one answers an `edit` with `blocked` "This action is not available.". xlsx and CSV stay view-only.
 'use strict';
 const { test, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
@@ -10,6 +10,9 @@ const ExcelJS = require('exceljs');
 const { T, host, extensionUri, token, writeTmp, lastOf, waitFor, tick } = require('./load-host');
 
 beforeEach(() => T.reset());
+
+/** The edit state a posted message carries (init / markdownUpdate: `editState`; the editState message: `state`). */
+const stateOf = (m) => m.editState ?? m.state;
 
 const { parseWebviewMessage: parse, parseEditMessage, EDIT_LIMITS, EDIT_TEXT } = host;
 
@@ -298,7 +301,7 @@ test('a Markdown init carries editState (editable) and readOnly = !editable', as
   assert.deepEqual(init.editState, { editable: true, kinds: [], code: 'fidelity', reason: 'Checking the file…' });
   // ... and the state after the check allows mdText.
   const done = await waitFor(
-    () => [...md.panel.posted].reverse().find((m) => m.editState && m.editState.reason !== 'Checking the file…')?.editState,
+    () => stateOf([...md.panel.posted].reverse().find((m) => stateOf(m) && stateOf(m).reason !== 'Checking the file…') ?? {}),
     3000,
     'the save check',
   );

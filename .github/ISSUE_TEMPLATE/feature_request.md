@@ -10,7 +10,7 @@ assignees: ''
 Thank you for your idea!
 - Please search the existing issues first: https://github.com/yokeeswaran-dev/vscode-filestudio/issues
 - Check the Roadmap in the README: https://github.com/yokeeswaran-dev/vscode-filestudio#roadmap
-  (for example, editing is planned for 0.2.0).
+  (for example, editing Word or PDF files).
 -->
 
 ## Problem

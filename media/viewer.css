@@ -2642,6 +2642,25 @@ body.vscode-reduce-motion .md-toc-toggle .fv-icon {
   transition: none;
 }
 
+/* WYSIWYG (Milkdown / Crepe parts): no motion with Reduce Motion, in the OS setting or VS Code's. */
+@media (prefers-reduced-motion: reduce) {
+  .milkdown-block-handle,
+  .crepe-drop-cursor {
+    transition: none !important;
+  }
+
+  .md-wysiwyg * {
+    scroll-behavior: auto !important;
+  }
+}
+body.vscode-reduce-motion .milkdown-block-handle,
+body.vscode-reduce-motion .crepe-drop-cursor {
+  transition: none !important;
+}
+body.vscode-reduce-motion .md-wysiwyg * {
+  scroll-behavior: auto !important;
+}
+
 /* ===== DOCX ===== */
 /* Read-only Word preview: a page-like sheet centered on the editor-background canvas. */
 

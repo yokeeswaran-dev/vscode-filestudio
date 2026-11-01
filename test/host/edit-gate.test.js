@@ -265,9 +265,9 @@ test('kill switch: a task toggle is refused (with the reason) when Markdown edit
   assert.deepEqual([refused.applied, refused.reason], [false, 'Editing is turned off (setting fileStudio.markdown.editing).']);
   assert.equal(document.getText(), '- [ ] a\n- [ ] b\n');
   assert.deepEqual(callsOf('applyEdit'), []);
-  const update = lastOf(panel, 'markdownUpdate');
-  assert.equal(update.readOnly, true);
-  assert.deepEqual(update.editState, {
+  // Only the state changed: a small editState message, not a second rendering (0.2.0 fix round).
+  assert.equal(lastOf(panel, 'markdownUpdate'), undefined);
+  assert.deepEqual(lastOf(panel, 'editState').state, {
     editable: false, code: 'disabled', reason: 'Editing is turned off (setting fileStudio.markdown.editing).', kinds: [],
   });
   assert.ok(!panel.posted.some((m) => m.type === 'error'), 'never the error view');
@@ -276,8 +276,8 @@ test('kill switch: a task toggle is refused (with the reason) when Markdown edit
   panel.posted.length = 0;
   T.config.set('fileStudio.markdown.editing', true);
   T.fireConfigChange(['fileStudio.markdown.editing']);
-  const enabled = await waitFor(() => lastOf(panel, 'markdownUpdate'), 3000, 'markdownUpdate');
-  assert.deepEqual([enabled.readOnly, enabled.editState], [false, { editable: true, kinds: ['mdText'] }]); // P6: WYSIWYG edits are allowed
+  const enabled = await waitFor(() => lastOf(panel, 'editState'), 3000, 'editState');
+  assert.deepEqual(enabled.state, { editable: true, kinds: ['mdText'] }); // P6: WYSIWYG edits are allowed
   const applied = await toggle(panel, 0, true, 1);
   assert.equal(applied.applied, true);
   assert.equal(document.getText(), '- [x] a\n- [ ] b\n');
@@ -287,12 +287,12 @@ test('kill switch: a task toggle is refused (with the reason) when Markdown edit
   T.config.set('fileStudio.xlsx.editing', false);
   T.fireConfigChange(['fileStudio.xlsx.editing']);
   await tick(50);
-  assert.equal(lastOf(panel, 'markdownUpdate'), undefined, 'not affected by the xlsx switch');
+  assert.equal(lastOf(panel, 'editState'), undefined, 'not affected by the xlsx switch');
   T.config.set('fileStudio.editing.enabled', false);
   T.fireConfigChange(['fileStudio.editing.enabled']);
-  const off = await waitFor(() => lastOf(panel, 'markdownUpdate'), 3000, 'markdownUpdate');
-  assert.equal(off.readOnly, true);
-  assert.equal(off.editState.reason, 'Editing is turned off (setting fileStudio.editing.enabled).');
+  const off = await waitFor(() => lastOf(panel, 'editState'), 3000, 'editState');
+  assert.equal(off.state.editable, false);
+  assert.equal(off.state.reason, 'Editing is turned off (setting fileStudio.editing.enabled).');
 });
 
 test('task toggles of all panels of one document run one at a time in the document queue', async (t) => {

@@ -1,7 +1,7 @@
 {
   "name": "filestudio",
-  "displayName": "FileStudio – Excel, CSV, Word, PDF & PowerPoint Viewer",
-  "description": "Open and preview Excel (.xlsx), CSV, Word (.docx), PDF, PowerPoint (.pptx) and Markdown files in VS Code. Fast, offline and private: no Office needed.",
+  "displayName": "FileStudio – Excel & Markdown Editor + CSV, Word, PDF & PowerPoint Viewer",
+  "description": "Edit Excel (.xlsx) and Markdown files, and view CSV, Word (.docx), PDF and PowerPoint (.pptx) files in VS Code. Fast, offline and private: no Office needed.",
   "version": "0.1.2",
   "publisher": "Yokeeswaran",
   "repository": {
@@ -229,7 +229,7 @@
           "default": true,
           "scope": "resource",
           "order": 0,
-          "description": "Allow FileStudio to change files (xlsx, csv/tsv/psv/ssv and Markdown, including task checkboxes). When off, every FileStudio view is read-only. Undo, save and revert of changes already made keep working."
+          "description": "Allow FileStudio to change files (Excel .xlsx cells, and Markdown: WYSIWYG mode and task checkboxes). When off, every FileStudio view is read-only. Undo, save and revert of changes already made keep working."
         },
         "fileStudio.xlsx.editing": {
           "type": "boolean",
@@ -237,13 +237,6 @@
           "scope": "resource",
           "order": 1,
           "description": "Allow editing of Excel workbooks (.xlsx) in FileStudio. Has no effect when fileStudio.editing.enabled is off."
-        },
-        "fileStudio.csv.editing": {
-          "type": "boolean",
-          "default": true,
-          "scope": "resource",
-          "order": 2,
-          "description": "Allow editing of delimited text files (.csv, .tsv, .psv, .ssv) in the FileStudio grid. Has no effect when fileStudio.editing.enabled is off."
         },
         "fileStudio.markdown.editing": {
           "type": "boolean",

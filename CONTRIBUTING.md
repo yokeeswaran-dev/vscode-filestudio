@@ -158,6 +158,8 @@ if from the first panel of that document and get the messages posted back), `sta
 - **Licence rule:** only dependencies with a permissive licence are accepted: **MIT, Apache-2.0, BSD
   (2-Clause or 3-Clause) or ISC**. A dual licence is fine when one of its options is in this list.
   No GPL, LGPL, AGPL or other copyleft-only licences.
+  Two packages that FileStudio already gets through other packages use other permissive licences and are accepted:
+  pako (MIT AND **Zlib**) and tslib (**0BSD**). A new dependency must still use one of the licences above.
 - Every new or updated runtime dependency must be added to (or updated in) **[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)**.
 - Commit the updated `package-lock.json`.
 
@@ -270,8 +272,12 @@ A release is a pull request from `dev` (or `hotfix`) into `main`:
    git checkout main
    git pull
    npm ci
-   npx @vscode/vsce@4.0.0 package --no-dependencies
+   npx @vscode/vsce@4.0.0 package --no-dependencies --githubBranch main
    ```
+
+   `--githubBranch main` makes the relative links and images of the README point to the `main` branch on GitHub
+   (without it, vsce uses `HEAD`). For another branch, or a different host, use
+   `--baseContentUrl <url> --baseImagesUrl <url>` instead.
 
    Upload `filestudio-X.Y.Z.vsix` on the
    [Marketplace publisher page](https://marketplace.visualstudio.com/manage/publishers/yokeeswaran) (**… → Update**).

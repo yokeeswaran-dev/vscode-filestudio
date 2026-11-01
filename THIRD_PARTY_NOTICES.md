@@ -168,7 +168,7 @@ pako is licensed under MIT AND Zlib: both texts are included.
 | [markdown-table](#markdown-table-3-0-4) | 3.0.4 | MIT | webview | https://github.com/wooorm/markdown-table |
 | [marked](#marked-16-4-2) | 16.4.2 | MIT | webview | https://github.com/markedjs/marked |
 | [mdast-util-definitions](#mdast-util-definitions-6-0-0) | 6.0.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-definitions |
-| [mdast-util-find-and-replace](#mdast-util-find-and-replace-3-0-3) | 3.0.3 | MIT | webview | https://github.com/syntax-tree/mdast-util-find-and-replace |
+| [mdast-util-find-and-replace](#mdast-util-find-and-replace-3-0-4) | 3.0.4 | MIT | webview | https://github.com/syntax-tree/mdast-util-find-and-replace |
 | [mdast-util-from-markdown](#mdast-util-from-markdown-2-1-0) | 2.1.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-from-markdown |
 | [mdast-util-gfm](#mdast-util-gfm-3-1-0) | 3.1.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-gfm |
 | [mdast-util-gfm-autolink-literal](#mdast-util-gfm-autolink-literal-2-0-1) | 2.0.1 | MIT | webview | https://github.com/syntax-tree/mdast-util-gfm-autolink-literal |
@@ -177,7 +177,7 @@ pako is licensed under MIT AND Zlib: both texts are included.
 | [mdast-util-gfm-table](#mdast-util-gfm-table-2-0-0) | 2.0.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-gfm-table |
 | [mdast-util-gfm-task-list-item](#mdast-util-gfm-task-list-item-2-0-0) | 2.0.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-gfm-task-list-item |
 | [mdast-util-phrasing](#mdast-util-phrasing-4-1-0) | 4.1.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-phrasing |
-| [mdast-util-to-markdown](#mdast-util-to-markdown-2-2-0) | 2.2.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-to-markdown |
+| [mdast-util-to-markdown](#mdast-util-to-markdown-2-2-1) | 2.2.1 | MIT | webview | https://github.com/syntax-tree/mdast-util-to-markdown |
 | [mdast-util-to-string](#mdast-util-to-string-4-0-0) | 4.0.0 | MIT | webview | https://github.com/syntax-tree/mdast-util-to-string |
 | [mdurl](#mdurl-2-1-0) | 2.1.0 | MIT | extension host | https://github.com/markdown-it/mdurl |
 | [mermaid](#mermaid-12-1-0) | 12.1.0 | MIT | webview | https://github.com/mermaid-js/mermaid |
@@ -235,8 +235,8 @@ pako is licensed under MIT AND Zlib: both texts are included.
 | [prosemirror-schema-list](#prosemirror-schema-list-1-5-1) | 1.5.1 | MIT | webview | https://github.com/prosemirror/prosemirror-schema-list |
 | [prosemirror-state](#prosemirror-state-1-4-4) | 1.4.4 | MIT | webview | https://github.com/prosemirror/prosemirror-state |
 | [prosemirror-tables](#prosemirror-tables-1-8-5) | 1.8.5 | MIT | webview | https://github.com/ProseMirror/prosemirror-tables |
-| [prosemirror-transform](#prosemirror-transform-1-12-2) | 1.12.2 | MIT | webview | https://code.haverbeke.berlin/prosemirror/prosemirror-transform |
-| [prosemirror-view](#prosemirror-view-1-42-6) | 1.42.6 | MIT | webview | https://code.haverbeke.berlin/prosemirror/prosemirror-view |
+| [prosemirror-transform](#prosemirror-transform-1-12-4) | 1.12.4 | MIT | webview | https://code.haverbeke.berlin/prosemirror/prosemirror-transform |
+| [prosemirror-view](#prosemirror-view-1-42-8) | 1.42.8 | MIT | webview | https://code.haverbeke.berlin/prosemirror/prosemirror-view |
 | [prosemirror-virtual-cursor](#prosemirror-virtual-cursor-0-4-2) | 0.4.2 | MIT | webview | https://github.com/ocavue/prosemirror-virtual-cursor |
 | [punycode.js](#punycode-js-2-3-1) | 2.3.1 | MIT | extension host | https://github.com/mathiasbynens/punycode.js |
 | [readable-stream](#readable-stream-2-3-7) | 2.3.7 | MIT | extension host (inside pptxtojson) | https://github.com/nodejs/readable-stream |
@@ -271,8 +271,8 @@ pako is licensed under MIT AND Zlib: both texts are included.
 | [unified](#unified-11-0-5) | 11.0.5 | MIT | webview | https://github.com/unifiedjs/unified |
 | [unist-util-is](#unist-util-is-6-0-1) | 6.0.1 | MIT | webview | https://github.com/syntax-tree/unist-util-is |
 | [unist-util-stringify-position](#unist-util-stringify-position-4-0-0) | 4.0.0 | MIT | webview | https://github.com/syntax-tree/unist-util-stringify-position |
-| [unist-util-visit](#unist-util-visit-5-1-0) | 5.1.0 | MIT | webview | https://github.com/syntax-tree/unist-util-visit |
-| [unist-util-visit-parents](#unist-util-visit-parents-6-0-2) | 6.0.2 | MIT | webview | https://github.com/syntax-tree/unist-util-visit-parents |
+| [unist-util-visit](#unist-util-visit-5-2-0) | 5.2.0 | MIT | webview | https://github.com/syntax-tree/unist-util-visit |
+| [unist-util-visit-parents](#unist-util-visit-parents-6-1-0) | 6.1.0 | MIT | webview | https://github.com/syntax-tree/unist-util-visit-parents |
 | [util-deprecate](#util-deprecate-1-0-2) | 1.0.2 | MIT | extension host (also inside pptxtojson) | https://github.com/TooTallNate/util-deprecate |
 | [uuid](#uuid-8-3-2) | 8.3.2 | MIT | extension host | https://github.com/uuidjs/uuid |
 | [uuid](#uuid-14-0-2) | 14.0.2 | MIT | webview | https://github.com/uuidjs/uuid |
@@ -1084,7 +1084,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 <a id="ccount-2-0-1"></a>
 <a id="mdast-util-to-string-4-0-0"></a>
 <a id="remark-inline-links-7-0-0"></a>
-<a id="unist-util-visit-5-1-0"></a>
+<a id="unist-util-visit-5-2-0"></a>
 ### bail 2.0.2 and 4 more
 
 - **bail** 2.0.2 — MIT — https://github.com/wooorm/bail  
@@ -1095,7 +1095,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
   Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>
 - **remark-inline-links** 7.0.0 — MIT — https://github.com/remarkjs/remark-inline-links  
   Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>
-- **unist-util-visit** 5.1.0 — MIT — https://github.com/syntax-tree/unist-util-visit  
+- **unist-util-visit** 5.2.0 — MIT — https://github.com/syntax-tree/unist-util-visit  
   Copyright (c) 2015 Titus Wormer <tituswormer@gmail.com>
 
 ````text
@@ -2227,12 +2227,12 @@ SOFTWARE.
 
 <a id="decode-named-character-reference-1-3-0"></a>
 <a id="markdown-table-3-0-4"></a>
-<a id="mdast-util-find-and-replace-3-0-3"></a>
+<a id="mdast-util-find-and-replace-3-0-4"></a>
 <a id="mdast-util-from-markdown-2-1-0"></a>
 <a id="mdast-util-gfm-3-1-0"></a>
 <a id="mdast-util-gfm-footnote-2-1-0"></a>
 <a id="mdast-util-gfm-strikethrough-2-0-1"></a>
-<a id="mdast-util-to-markdown-2-2-0"></a>
+<a id="mdast-util-to-markdown-2-2-1"></a>
 <a id="micromark-4-0-3"></a>
 <a id="micromark-core-commonmark-2-0-4"></a>
 <a id="micromark-extension-gfm-table-2-1-2"></a>
@@ -2260,7 +2260,7 @@ SOFTWARE.
   Copyright (c) Titus Wormer <tituswormer@gmail.com>
 - **markdown-table** 3.0.4 — MIT — https://github.com/wooorm/markdown-table  
   Copyright (c) Titus Wormer <tituswormer@gmail.com>
-- **mdast-util-find-and-replace** 3.0.3 — MIT — https://github.com/syntax-tree/mdast-util-find-and-replace  
+- **mdast-util-find-and-replace** 3.0.4 — MIT — https://github.com/syntax-tree/mdast-util-find-and-replace  
   Copyright (c) Titus Wormer <tituswormer@gmail.com>
 - **mdast-util-from-markdown** 2.1.0 — MIT — https://github.com/syntax-tree/mdast-util-from-markdown  
   Copyright (c) Titus Wormer <tituswormer@gmail.com>
@@ -2270,7 +2270,7 @@ SOFTWARE.
   Copyright (c) Titus Wormer <tituswormer@gmail.com>
 - **mdast-util-gfm-strikethrough** 2.0.1 — MIT — https://github.com/syntax-tree/mdast-util-gfm-strikethrough  
   Copyright (c) Titus Wormer <tituswormer@gmail.com>
-- **mdast-util-to-markdown** 2.2.0 — MIT — https://github.com/syntax-tree/mdast-util-to-markdown  
+- **mdast-util-to-markdown** 2.2.1 — MIT — https://github.com/syntax-tree/mdast-util-to-markdown  
   Copyright (c) Titus Wormer <tituswormer@gmail.com>
 - **micromark** 4.0.3 — MIT — https://github.com/micromark/micromark/tree/main/packages/micromark  
   Copyright (c) Titus Wormer <tituswormer@gmail.com>
@@ -2780,10 +2780,30 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ### fastdom 1.0.12
 
 - **fastdom** 1.0.12 — MIT — https://github.com/wilsonpage/fastdom  
-  Copyright: no copyright line in the package; package.json author: Wilson Page.
+  Copyright (c) 2016 Wilson Page <wilsonpage@me.com>
 
 ````text
 (The MIT License)
+
+Copyright (c) 2016 Wilson Page <wilsonpage@me.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ````
 
 <a id="fs-constants-1-0-0"></a>
@@ -3094,10 +3114,30 @@ THIS SOFTWARE.
 ### isarray 1.0.0
 
 - **isarray** 1.0.0 — MIT — https://github.com/juliangruber/isarray  
-  Copyright: no copyright line in the package; package.json author: Julian Gruber.
+  Copyright (c) 2013 Julian Gruber <julian@juliangruber.com>
 
 ````text
-(MIT)
+(The MIT License)
+
+Copyright (c) 2013 Julian Gruber <julian@juliangruber.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ````
 
 <a id="js-yaml-4-3-0"></a>
@@ -5723,8 +5763,8 @@ THE SOFTWARE.
 <a id="prosemirror-model-1-25-12"></a>
 <a id="prosemirror-schema-list-1-5-1"></a>
 <a id="prosemirror-state-1-4-4"></a>
-<a id="prosemirror-transform-1-12-2"></a>
-<a id="prosemirror-view-1-42-6"></a>
+<a id="prosemirror-transform-1-12-4"></a>
+<a id="prosemirror-view-1-42-8"></a>
 ### prosemirror-commands 1.7.2 and 9 more
 
 - **prosemirror-commands** 1.7.2 — MIT — https://code.haverbeke.berlin/prosemirror/prosemirror-commands  
@@ -5743,9 +5783,9 @@ THE SOFTWARE.
   Copyright (C) 2015-2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
 - **prosemirror-state** 1.4.4 — MIT — https://github.com/prosemirror/prosemirror-state  
   Copyright (C) 2015-2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
-- **prosemirror-transform** 1.12.2 — MIT — https://code.haverbeke.berlin/prosemirror/prosemirror-transform  
+- **prosemirror-transform** 1.12.4 — MIT — https://code.haverbeke.berlin/prosemirror/prosemirror-transform  
   Copyright (C) 2015-2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
-- **prosemirror-view** 1.42.6 — MIT — https://code.haverbeke.berlin/prosemirror/prosemirror-view  
+- **prosemirror-view** 1.42.8 — MIT — https://code.haverbeke.berlin/prosemirror/prosemirror-view  
   Copyright (C) 2015-2017 by Marijn Haverbeke <marijn@haverbeke.berlin> and others
 
 ````text
@@ -6958,13 +6998,13 @@ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ````
 
 <a id="unist-util-stringify-position-4-0-0"></a>
-<a id="unist-util-visit-parents-6-0-2"></a>
+<a id="unist-util-visit-parents-6-1-0"></a>
 <a id="zwitch-2-0-4"></a>
 ### unist-util-stringify-position 4.0.0 and 2 more
 
 - **unist-util-stringify-position** 4.0.0 — MIT — https://github.com/syntax-tree/unist-util-stringify-position  
   Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com>
-- **unist-util-visit-parents** 6.0.2 — MIT — https://github.com/syntax-tree/unist-util-visit-parents  
+- **unist-util-visit-parents** 6.1.0 — MIT — https://github.com/syntax-tree/unist-util-visit-parents  
   Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com>
 - **zwitch** 2.0.4 — MIT — https://github.com/wooorm/zwitch  
   Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com>

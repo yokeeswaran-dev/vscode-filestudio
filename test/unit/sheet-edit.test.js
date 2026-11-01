@@ -480,7 +480,7 @@ test('clear contents: values and formulas go, styles stay; notes and links of ot
   assert.deepEqual(edit.after.ops[0].cells, [[r, c, { value: null }]]);
   S.invertEdit(model, edit);
   assert.deepEqual(grid(model, 0), before);
-  assert.deepEqual(S.planEdit(model, { kind: 'clear', sheetId: id, ranges: [{ r0: 0, c0: 0, r1: 1, c1: 1 }], what: 'formats' }).blocked[0].message, 'This action is not available yet.');
+  assert.deepEqual(S.planEdit(model, { kind: 'clear', sheetId: id, ranges: [{ r0: 0, c0: 0, r1: 1, c1: 1 }], what: 'formats' }).blocked[0].message, 'This action is not available.');
 });
 
 // ----- blocks -----
@@ -556,7 +556,7 @@ test('invalid input: unknown sheet, bad shapes, limits, lone surrogates, formula
   assert.deepEqual(S.planEdit(model, setCells(id, [0, 0, '=Nope!A1'])), { invalid: "There's a problem with this formula." });
   assert.match(S.planEdit(model, setCells(id, [0, 0, '=SEQUENCE(3)'])).blocked[0].message, /spilling/);
   // kinds P2 does not do yet
-  assert.equal(S.planEdit(model, { kind: 'insertRows', sheetId: id, at: 0, count: 1 }).blocked[0].message, 'This action is not available yet.');
+  assert.equal(S.planEdit(model, { kind: 'insertRows', sheetId: id, at: 0, count: 1 }).blocked[0].message, 'This action is not available.');
   assert.equal(S.planEdit(model, { kind: 'mdText', edits: [] }).blocked[0].code, 'unsupported');
   // CRLF from a paste is stored as LF
   const e = S.planEdit(model, setCells(id, [0, 0, 'a\r\nb\rc']));

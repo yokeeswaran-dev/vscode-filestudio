@@ -529,6 +529,32 @@ H.suite('markdown modes (P6)', ({ test }) => {
     });
   });
 
+  test('WYSIWYG: the editor has an accessible name and is marked multi-line', async (h) => {
+    const host = mdHost('named.md', DOC);
+    return h.use(host, {}, async (view) => {
+      await toWysiwyg(view);
+      const attrs = await view.eval(() => {
+        const pm = document.querySelector('.md-wysiwyg .ProseMirror');
+        return [pm.getAttribute('aria-label'), pm.getAttribute('aria-multiline'), pm.getAttribute('aria-readonly')];
+      });
+      assert.deepEqual(attrs, ['named.md editor', 'true', 'false']);
+    });
+  });
+
+  test('Preview: an editState message alone (no rendering) switches the task checkboxes off and on', async (h) => {
+    const host = mdHost('tasks-state.md', '- [ ] one\n- [x] two\n');
+    return h.use(host, {}, async (view) => {
+      const disabled = () => view.eval(() => [...document.querySelectorAll('.md-view input[type=checkbox]')].map((i) => i.disabled));
+      assert.deepEqual(await disabled(), [false, false]);
+      const reason = 'Editing is turned off (setting fileStudio.markdown.editing).';
+      await view.push({ type: 'editState', state: { editable: false, code: 'disabled', reason, kinds: [] } });
+      await view.page.waitForFunction(() => [...document.querySelectorAll('.md-view input[type=checkbox]')].every((i) => i.disabled), { timeout: 4000 });
+      assert.equal(await view.eval(() => document.querySelector('.md-view input[type=checkbox]').title), reason);
+      await view.push({ type: 'editState', state: { editable: true, kinds: ['mdText'] } });
+      await view.page.waitForFunction(() => [...document.querySelectorAll('.md-view input[type=checkbox]')].every((i) => !i.disabled), { timeout: 4000 });
+    });
+  });
+
   test('WYSIWYG: Ctrl+click on a link asks the host to open it; a plain click only places the caret', async (h) => {
     const host = mdHost('links.md', DOC);
     return h.use(host, {}, async (view) => {

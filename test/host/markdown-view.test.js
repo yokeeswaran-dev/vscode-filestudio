@@ -10,6 +10,9 @@ const { vscode, T, host, extensionUri, token, tick, writeTmp, lastOf, callsOf, w
 
 beforeEach(() => T.reset());
 
+/** The edit state a posted message carries (init / markdownUpdate: `editState`; the editState message: `state`). */
+const stateOf = (m) => m.editState ?? m.state;
+
 /**
  * Opens `text` as a Markdown panel (the file on disk holds `disk`, default = the same text) and waits for the init and
  * for the save check to finish (editState.kinds has 'mdText' or the check said something else).
@@ -30,7 +33,7 @@ async function openMd(name, text, { disk = text, settle = true } = {}) {
 async function settled(panel) {
   return waitFor(
     () => {
-      const state = [...panel.posted].reverse().find((m) => m.editState)?.editState;
+      const state = stateOf([...panel.posted].reverse().find(stateOf) ?? {});
       return state && state.reason !== 'Checking the file…' ? state : undefined;
     },
     3000,
@@ -552,8 +555,8 @@ test('a file VS Code would save with other line breaks: WYSIWYG read-only with "
   api.answer('fidelity', 'Edit anyway');
   opened.panel.posted.length = 0;
   opened.panel.send({ type: 'editAnyway' });
-  const accepted = await waitFor(() => [...opened.panel.posted].reverse().find((m) => m.editState && m.editState.kinds?.includes('mdText')), 3000, 'accepted state');
-  assert.deepEqual(accepted.editState, { editable: true, kinds: ['mdText'] });
+  const accepted = await waitFor(() => [...opened.panel.posted].reverse().find((m) => stateOf(m)?.kinds?.includes('mdText')), 3000, 'accepted state');
+  assert.deepEqual(stateOf(accepted), { editable: true, kinds: ['mdText'] });
   const ok = await sendEdit(opened, 'b', 'bb');
   assert.equal(ok.accepted, true);
   assert.equal(opened.document.getText(), 'a\r\n\r\nbb\r\n');
@@ -580,7 +583,7 @@ test('re-check after a reload from disk (clean document): the old verdict and "E
   opened.panel.posted.length = 0;
   opened.document.setText('a\r\n\r\nb\r\n', false);
   const state = await waitFor(
-    () => [...opened.panel.posted].reverse().find((m) => m.editState?.code === 'fidelity')?.editState,
+    () => stateOf([...opened.panel.posted].reverse().find((m) => stateOf(m)?.code === 'fidelity') ?? {}),
     3000,
     'fidelity state after the reload',
   );
@@ -607,7 +610,7 @@ test('re-check with the same verdict keeps "Edit anyway"', async () => {
   const api = host.createTestApi();
   api.answer('fidelity', 'Edit anyway');
   opened.panel.send({ type: 'editAnyway' });
-  await waitFor(() => [...opened.panel.posted].reverse().find((m) => m.editState?.kinds?.includes('mdText')), 3000, 'accepted');
+  await waitFor(() => [...opened.panel.posted].reverse().find((m) => stateOf(m)?.kinds?.includes('mdText')), 3000, 'accepted');
   // A reload that leaves the same situation on disk.
   opened.document.setText('a\r\n\r\nb\r\n', false);
   await tick(700);

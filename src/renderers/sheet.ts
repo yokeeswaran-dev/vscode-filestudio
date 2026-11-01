@@ -5919,7 +5919,7 @@ export interface RowsChange {
 export type PlanResult = Edit | { blocked: BlockReason[] } | { invalid: string } | { noop: true };
 
 export const EDIT_TOO_LARGE_TEXT = 'This change is too large (max 1,000,000 cells).';
-export const EDIT_NOT_AVAILABLE_TEXT = 'This action is not available yet.';
+export const EDIT_NOT_AVAILABLE_TEXT = 'This action is not available.';
 const EDIT_UNKNOWN_SHEET_TEXT = 'This sheet is no longer in the workbook.';
 const EDIT_BAD_REQUEST_TEXT = 'This change is not valid.';
 const EDIT_BAD_TEXT = 'The text contains a character Excel cannot store.';
@@ -6197,7 +6197,7 @@ function planSetCells(m: WorkbookModel, i: Extract<EditIntent, { kind: 'setCells
         r = merge.r0;
         c = merge.c0;
       } else {
-        if (text !== '') blocks.add('merge', `${rangeText(merge)} is a merged cell. Paste a block that matches the merged cells, or unmerge first.`, `${quoteSheetForRef(sheetName)}!${indexToCol(c)}${r + 1}`);
+        if (text !== '') blocks.add('merge', `${rangeText(merge)} is a merged cell. Paste a block that matches the merged cells, or paste somewhere else.`, `${quoteSheetForRef(sheetName)}!${indexToCol(c)}${r + 1}`);
         continue;
       }
     }
@@ -8457,6 +8457,9 @@ async function sheetLayout(buf: Buffer, where: string, onYield?: SaveYieldHook):
   const P = xmlRootPrefix(buf.toString('latin1', 0, Math.min(buf.length, 16384)), 'worksheet', where);
   const sdOpen = findStartTag(buf, Buffer.from(`<${P}sheetData`), 0, buf.length);
   if (sdOpen < 0) throw new PatchError(`${where} has no cell data (<sheetData>)`);
+  // The locator walks bytes, not an XML tree: a comment in the head could hold a fake <sheetData> (the edit would go into the comment).
+  const head = buf.subarray(0, sdOpen);
+  if (head.includes('<!--') || head.includes('<![CDATA[')) throw new PatchError(`${where} has an XML comment or CDATA section before its cell data`);
   const gt = buf.indexOf(0x3e, sdOpen);
   if (gt < 0) throw new PatchError(`${where} is damaged`);
   const sdSelfClosing = buf[gt - 1] === 0x2f;
@@ -10079,6 +10082,10 @@ export async function checkPatchable(
         const text = partText(await readEntry(zip, entry, onYield), entry.name);
         if (path === pkg.sstPath && (text.includes('<!--') || text.includes('<![CDATA['))) {
           return { ok: false, reason: 'its shared strings contain an XML comment or CDATA section' };
+        }
+        // The styles patcher finds <cellXfs> and the other containers by text search: a comment could hold a fake one.
+        if (path === pkg.stylesPath && (text.includes('<!--') || text.includes('<![CDATA['))) {
+          return { ok: false, reason: 'its styles contain an XML comment or CDATA section' };
         }
       }
     }

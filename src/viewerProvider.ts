@@ -1110,7 +1110,7 @@ function errorDetailOf(err: unknown): string {
 /**
  * (v0.2.0) Optional handlers of a view for the editing messages of contract §2.7. A view sets the ones its phase
  * implements (`session.editHandlers = { onEdit: … }`, a one-line hook); a missing handler means "not available yet":
- * an `edit` is answered `blocked` "This action is not available yet.", any other message is logged and dropped.
+ * an `edit` is answered `blocked` "This action is not available.", any other message is logged and dropped.
  * `onEdit` must answer with exactly one `editResult` before the promise it returns settles (the session answers
  * `internal` for an edit that is still unanswered then, and drops a second answer).
  */
@@ -1723,7 +1723,7 @@ export const EDIT_TEXT = {
   loneSurrogate: 'The text has an unpaired surrogate character and cannot be saved.',
   internal: 'Internal check failed. Nothing was changed.',
   poisoned: 'An internal error happened. Your file on disk was not changed. Use Revert File to reload.',
-  notAvailable: 'This action is not available yet.',
+  notAvailable: 'This action is not available.',
 } as const;
 
 // ----- serial queue (contract §3.1) -----
@@ -3078,8 +3078,8 @@ export class SheetDocument implements vscode.CustomDocument {
     this._onDidChange.fire({
       document: this,
       label: edit.label,
-      undo: () => this.queue.run(() => this.step('undo', edit, generation)),
-      redo: () => this.queue.run(() => this.step('redo', edit, generation)),
+      undo: () => this.queueStep('undo', edit, generation),
+      redo: () => this.queueStep('redo', edit, generation),
     });
     // A content-change event (no undo/redo) sets VS Code's sticky changed flag until save/revert. Without it VS Code's own
     // undo stack can land on its save point again (save, undo, new edit) and show the tab clean while this document is dirty.
@@ -3088,8 +3088,14 @@ export class SheetDocument implements vscode.CustomDocument {
     return edit;
   }
 
+  /** Queues a VS Code undo / redo; whether a save is around is read now, when VS Code asks (not when the step runs). */
+  private queueStep(direction: 'undo' | 'redo', edit: JournalEdit, generation: number): Promise<void> {
+    const duringSave = this.saves > 0;
+    return this.queue.run(() => this.step(direction, edit, generation, duringSave));
+  }
+
   /** One VS Code undo / redo of `edit` (in the queue). A closure that no longer fits changes nothing and says so. */
-  private async step(direction: 'undo' | 'redo', edit: JournalEdit, generation: number): Promise<void> {
+  private async step(direction: 'undo' | 'redo', edit: JournalEdit, generation: number, duringSave: boolean): Promise<void> {
     const fits =
       generation === this.generation &&
       (direction === 'undo' ? this.journal[this.pos - 1] === edit : this.journal[this.pos] === edit);
@@ -3115,6 +3121,19 @@ export class SheetDocument implements vscode.CustomDocument {
     if (edit.structural) this.structureVersion = this.version;
     if (change) this.onContentChange?.(change, this.version);
     this.changed();
+    // A step asked for while a save was running: VS Code sets its save point when the save call has RETURNED to it (a moment
+    // after this step ends), which also clears the changed flag. A mark fired now would be cleared, so it is fired again
+    // after short delays while this document still has unsaved changes. A step with no save around it needs nothing.
+    if (duringSave) this.fireDirtyMarkLater();
+  }
+
+  private fireDirtyMarkLater(): void {
+    for (const ms of [150, 600, 2000]) {
+      const timer = setTimeout(() => {
+        if (this.hasUnsavedChanges) this.fireDirtyMark();
+      }, ms);
+      timer.unref?.();
+    }
   }
 
   private stepRefused(message: string): void {
@@ -3163,8 +3182,14 @@ export class SheetDocument implements vscode.CustomDocument {
   // ----- save, save as, revert -----
 
   /** Writes the document to its own file (contract §4.2). Runs in the queue; stays dirty on any failure. */
+  /** Saves that were asked for and have not ended (queued or running); see step(). */
+  private saves = 0;
+
   save(token: vscode.CancellationToken): Promise<void> {
-    return this.queue.run(() => this.saveNow(token));
+    this.saves++;
+    return this.queue.run(() => this.saveNow(token)).finally(() => {
+      this.saves--;
+    });
   }
 
   saveAs(target: vscode.Uri, token: vscode.CancellationToken): Promise<void> {
@@ -4935,7 +4960,8 @@ class MarkdownView {
             : `[markdown] ${name}: ${state.reason ?? 'not editable'} Its task checkboxes are disabled.`,
       );
     }
-    if (push) this.pushUpdate();
+    // Only the state changed: a small message, not a second rendering of the whole document (0.2.0 fix round).
+    if (push && this.session.isReady) this.session.post({ type: 'editState', state });
   }
 
   /** Sends the current rendering: a cheap markdownUpdate when content is shown, otherwise a full init. */
