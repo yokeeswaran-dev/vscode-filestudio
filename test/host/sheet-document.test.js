@@ -301,6 +301,12 @@ test('write in place (hard link): a pre-image first; ENOSPC after half the bytes
   const before = sha(uri.fsPath);
   host.sheetSaveHooks.fs = {
     ...fsp,
+    // As on Linux (CI): a copy gets a new mtime, so writing the pre-image back changes the stamp but not the content.
+    copyFile: async (from, to, mode) => {
+      await fsp.copyFile(from, to, mode);
+      const later = new Date(Date.now() + 5000);
+      await fsp.utimes(to, later, later);
+    },
     open: async (p, flags, mode) => {
       const handle = await fsp.open(p, flags, mode);
       if (flags !== 'r+' || path.basename(p) !== path.basename(uri.fsPath)) return handle;

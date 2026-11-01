@@ -2548,8 +2548,6 @@ export async function writeFileSafely(
   }
   const posix = process.platform !== 'win32';
   if (st && st.nlink > 1) return writeInPlace(fs, real, bytes, o.storageDir);
-  // A new file would get the folder's permissions and lose the Hidden / System flags: write such a file in place.
-  if (st && process.platform === 'win32' && (await hasCustomWindowsMetadata(real))) return writeInPlace(fs, real, bytes, o.storageDir);
 
   const dir = path.dirname(real);
   const name = path.basename(real);
@@ -2569,6 +2567,11 @@ export async function writeFileSafely(
     if (st && posix) await handle.chmod(Number(st.mode) & 0o7777); // a 0600 workbook must not become 0644
     await handle.close();
     handle = undefined;
+    // The new file got the folder's permissions and no Hidden / System flag: if the real file has others, write it in place.
+    if (st && process.platform === 'win32' && (await windowsMetadataOf(real)) !== (await windowsMetadataOf(tmp))) {
+      await fs.unlink(tmp).catch(() => undefined);
+      return writeInPlace(fs, real, bytes, o.storageDir);
+    }
     if (st && process.platform === 'win32') await copyZoneIdentifier(fs, real, tmp);
     try {
       await renameWithRetry(fs, tmp, real);
@@ -2629,23 +2632,26 @@ async function findPreImages(file: string, storageDir: string | undefined): Prom
 }
 
 /**
- * Windows only: true when the file has its own ACL (an entry that is not inherited from the folder) or the Hidden / System
- * flag. A temp file + rename would lose both. Any failure of the tools means "no" (the normal path).
+ * Windows only: the file's explicit (not inherited) ACL entries, incl. an integrity label, and its Hidden / System flags,
+ * as one text. A temp file + rename keeps them only when a new file in the same folder gets the same ones (for example the
+ * High label every file of an elevated VS Code gets), so the caller compares the real file with its temp file. Any failure
+ * of the tools gives '' (the normal path).
  */
-async function hasCustomWindowsMetadata(file: string): Promise<boolean> {
+async function windowsMetadataOf(file: string): Promise<string> {
   const run = (cmd: string): Promise<string> =>
     new Promise((resolve, reject) => {
       execFile(cmd, [file], { windowsHide: true, timeout: 5000 }, (err, out) => (err ? reject(err) : resolve(String(out))));
     });
   try {
-    const acl = await run('icacls');
     // The file path is in the first line: a name like "Budget (I).xlsx" must not look like an inherited entry.
-    if (acl.split(file).join('').split('\n').some((line) => line.includes(':(') && !line.includes('(I)'))) return true;
+    const acl = (await run('icacls')).split(file).join('').split(/\r?\n/).map((line) => line.trim());
+    const own = acl.filter((line) => line.includes(':(') && !line.includes('(I)')).sort();
     const attrs = await run('attrib');
     const at = attrs.toLowerCase().indexOf(file.toLowerCase());
-    return at > 0 && /[HS]/i.test(attrs.slice(0, at));
+    const flags = at > 0 ? (attrs.slice(0, at).toUpperCase().match(/[HS]/g) ?? []).join('') : '';
+    return [...own, flags].join('|');
   } catch {
-    return false;
+    return '';
   }
 }
 
@@ -2673,6 +2679,9 @@ async function copyZoneIdentifier(fs: SafeFs, from: string, to: string): Promise
     // No mark, or a file system without streams.
   }
 }
+
+/** Errors of an in-place write after which the old bytes were written back: the file has its old content (but a new mtime on Linux). */
+const restoredWrites = new WeakSet<object>();
 
 async function writeInPlace(
   fs: SafeFs,
@@ -2719,6 +2728,7 @@ async function writeInPlace(
       try {
         await fs.copyFile(preImage, real);
         await fs.unlink(preImage).catch(() => undefined);
+        if (typeof err === 'object' && err !== null) restoredWrites.add(err);
       } catch (restoreErr) {
         logError(`[sheet] Could not write the pre-image ${preImage} back to ${real}`, restoreErr);
         throw new Error(`${errorMessageOf(err)} The original file is saved at ${preImage}.`);
@@ -3291,7 +3301,14 @@ export class SheetDocument implements vscode.CustomDocument {
       () => undefined,
       () => undefined,
     );
-    const written = await write;
+    let written: { stamp: DiskStamp | undefined };
+    try {
+      written = await write;
+    } catch (err) {
+      // The old bytes are back, but copying them gave the file a new mtime: a retry must not ask about an external change.
+      if (typeof err === 'object' && err !== null && restoredWrites.has(err)) this.diskStamp = await diskStampOf(this.uri);
+      throw err;
+    }
     // Step 8.
     this.lastSaveReport = report;
     this.stampUnknown = false;
