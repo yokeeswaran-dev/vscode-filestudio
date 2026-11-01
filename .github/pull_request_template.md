@@ -46,5 +46,5 @@ light / dark theme, operating system.
 - [ ] I added or updated tests where it makes sense.
 - [ ] I updated `CHANGELOG.md` (`## [Unreleased]`) for changes users will notice.
 - [ ] I updated the documentation (README, settings descriptions) if needed.
-- [ ] New or updated dependencies use an allowed licence (MIT, Apache-2.0, BSD or ISC) and are listed in `THIRD_PARTY_NOTICES.md`.
+- [ ] New or updated dependencies use an allowed licence (MIT, Apache-2.0, BSD or ISC; Zlib and 0BSD only for the existing pako and tslib) and are listed in `THIRD_PARTY_NOTICES.md`.
 - [ ] HTML shown in a webview is still sanitised, and the Content Security Policy is not weakened.
