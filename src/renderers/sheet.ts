@@ -278,6 +278,8 @@ export interface SelectionStats {
    * first `scanned` cells, row by row, and are lower bounds / partial aggregates. Absent when complete.
    */
   partial?: boolean;
+  /** True when the host did not count (a big sheet: too many rows to load for this request). count / sum are then NOT figures (0.2.1). */
+  unknown?: boolean;
   /** With `partial`: how many cells (present in the sheet) were read before stopping. */
   scanned?: number;
 }
@@ -4149,6 +4151,25 @@ export class WorkbookModel implements GridSource {
     return meta;
   }
 
+  /** True when the sheet at this position loads its rows by window. */
+  isLazyIndex(index: number): boolean {
+    const ctx = this.sheets[index];
+    return !!ctx && isLazyWorksheet(ctx.ws);
+  }
+
+  /** True when the sheet's rows are loaded by window (a big sheet): call ensureRows before reading cells. */
+  isLazy(id: SheetId): boolean {
+    const ctx = this.sheets[this.sheetById.get(id) ?? -1];
+    return !!ctx && isLazyWorksheet(ctx.ws);
+  }
+
+  /** Loads the rows (0-based, inclusive) of a big sheet that are not loaded; no-op for other sheets. See ensureLazyRows. */
+  ensureRows(sheet: number | SheetId, ranges: readonly { r0: number; r1: number }[], pin = false, forEdit = false, editCells?: readonly Range[]): Promise<void> {
+    const index = typeof sheet === 'number' ? sheet : this.sheetById.get(sheet);
+    const ctx = index === undefined ? undefined : this.sheets[index];
+    return ctx && isLazyWorksheet(ctx.ws) ? ensureLazyRows(ctx.ws, ranges, pin, forEdit, editCells) : Promise.resolve();
+  }
+
   /** The cached lists of data validations read from cells: dropped after any edit (the next read looks again). */
   dropListCaches(): void {
     for (const ctx of this.sheets) ctx.lists.clear();
@@ -4812,7 +4833,12 @@ export class WorkbookModel implements GridSource {
   private usedRange(ws: XWorksheet, merges: Range[], images: ImageAnchor[], autoFilter: Range | undefined, colPx: number, rowPx: number): { rowCount: number; colCount: number } {
     let maxRow = 0;
     let maxCol = 0;
-    ws._rows.forEach((row, r) => {
+    const lazy = lazyUsed(ws); // a big sheet: from its row index (its rows are not all loaded)
+    if (lazy) {
+      maxRow = lazy.rows;
+      maxCol = lazy.cols;
+    }
+    if (!lazy) ws._rows.forEach((row, r) => {
       if (!row) {
         return;
       }
@@ -4873,7 +4899,7 @@ export class WorkbookModel implements GridSource {
 
   private rowInfos(ws: XWorksheet, defaultPx: number): Record<number, RowInfo> {
     const out: Record<number, RowInfo> = {};
-    ws._rows.forEach((row, r) => {
+    (lazyAttrRows(ws) ?? ws._rows).forEach((row, r) => {
       if (!row) {
         return;
       }
@@ -8321,6 +8347,12 @@ async function scanLossyFeatures(data: Uint8Array): Promise<string[]> {
   if (has(/^xl\/(queryTables\/|connections\.xml$)/i)) found.add(LOSSY.queryTables);
   if (has(/^xl\/model\//i)) found.add(LOSSY.dataModel);
   if (has(/^xl\/richData\//i)) found.add(LOSSY.richValues);
+  let native: ZipPackage | undefined;
+  try {
+    native = parseZip(data);
+  } catch {
+    native = undefined; // jszip reads it (or reports the damage)
+  }
   const sheetFlags = [LOSSY.sparklines, LOSSY.x14Cf, LOSSY.controls, LOSSY.oleObjects, LOSSY.dataTables, LOSSY.richValues];
 
   for (const name of names) {
@@ -8328,7 +8360,7 @@ async function scanLossyFeatures(data: Uint8Array): Promise<string[]> {
     if (/^xl\/drawings\/[^/]+\.xml$/i.test(path) && !found.has(LOSSY.shapes)) {
       if (drawingHasShapes(await zip.files[name].async('string'))) found.add(LOSSY.shapes);
     } else if (/^xl\/worksheets\/[^/]+\.xml$/i.test(path)) {
-      await scanZipEntry(zip.files[name], (text) => {
+      const inspectSheet = (text: string): boolean => {
         if (text.includes('sparklineGroup')) found.add(LOSSY.sparklines);
         if (text.includes('x14:cfRule')) {
           for (const m of text.matchAll(/<x14:cfRule\b[^>]*?\btype\s*=\s*["']([^"']+)["']/g)) {
@@ -8341,7 +8373,12 @@ async function scanLossyFeatures(data: Uint8Array): Promise<string[]> {
         // vm = value metadata: a picture in a cell or a linked data type (rich value)
         if (text.includes('vm=') && /<(?:\w+:)?c\s[^>]*?\bvm\s*=/.test(text)) found.add(LOSSY.richValues);
         return sheetFlags.every((label) => found.has(label));
-      });
+      };
+      const markers = ['sparklineGroup', 'x14:cfRule', 'controls', 'oleObjects', 'dataTable', 'vm='];
+      // A big part is unpacked with zlib (jszip's inflate is about six times slower) and searched in slices.
+      const entry = native?.get(path);
+      if (native && entry && entry.usize > lazyTuning.scanBytes) await scanBuffer(await readEntry(native, entry), inspectSheet, markers);
+      else await scanZipEntry(zip.files[name], inspectSheet, markers);
     }
   }
   return LOSSY_ORDER.filter((label) => found.has(label));
@@ -8368,22 +8405,47 @@ function drawingHasShapes(xml: string): boolean {
 /** x14 rule types ExcelJS reads and writes itself (xlsx/xform/sheet/cf-ext): data bars and icon sets. */
 const X14_CF_ROUND_TRIPPED: ReadonlySet<string> = new Set(['dataBar', 'iconSet']);
 
+/** Like scanZipEntry for bytes already in memory: 4 MB slices (with 256 bytes of the previous one), skipped when no marker is in them. */
+async function scanBuffer(buf: Buffer, inspect: (text: string) => boolean, markers: readonly string[]): Promise<void> {
+  const needles = markers.map((m) => Buffer.from(m));
+  const SLICE = 4 << 20;
+  for (let pos = 0; pos < buf.length; pos += SLICE) {
+    const part = buf.subarray(Math.max(0, pos - 256), Math.min(buf.length, pos + SLICE));
+    if (needles.some((n) => part.includes(n)) && inspect(part.toString('latin1'))) return;
+    await saveTick();
+  }
+}
+
 /**
  * Streams a zip entry as text without building one big string. `inspect` sees
  * every chunk prefixed with the tail of the previous one (so short tags split
  * across chunks are still seen) and returns true to stop early.
  */
-function scanZipEntry(file: JSZip.JSZipObject, inspect: (text: string) => boolean): Promise<void> {
+function scanZipEntry(file: JSZip.JSZipObject, inspect: (text: string) => boolean, markers?: readonly string[]): Promise<void> {
   return new Promise((resolve, reject) => {
     let tail = '';
     let done = false;
     // ZipObject#internalStream (jszip/lib/zipObject.js) is public at runtime but missing from the typings.
-    const stream = (file as unknown as { internalStream(type: 'string'): JSZip.JSZipStreamHelper<string> }).internalStream('string');
+    // With `markers` the chunks are bytes: a chunk that holds none of the marker texts is skipped without decoding it (a
+    // 200 MB worksheet is read in about a second instead of six); the others are decoded as Latin-1 (tags and attributes
+    // are ASCII) and inspected as before.
+    const bytes = markers !== undefined;
+    const needles = (markers ?? []).map((m) => Buffer.from(m));
+    const stream = (file as unknown as { internalStream(type: 'string' | 'uint8array'): JSZip.JSZipStreamHelper<string | Uint8Array> }).internalStream(bytes ? 'uint8array' : 'string');
+    let tailBytes: Buffer = Buffer.alloc(0);
     stream
-      .on('data', (chunk: string) => {
+      .on('data', (chunk: string | Uint8Array) => {
         if (done) return;
-        const text = tail + chunk;
-        tail = text.slice(-256);
+        let text: string;
+        if (typeof chunk === 'string') {
+          text = tail + chunk;
+          tail = text.slice(-256);
+        } else {
+          const buf = Buffer.concat([tailBytes, Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength)]);
+          tailBytes = Buffer.from(buf.subarray(Math.max(0, buf.length - 256)));
+          if (!needles.some((n) => buf.includes(n))) return;
+          text = buf.toString('latin1');
+        }
         if (inspect(text)) {
           done = true;
           stream.pause();
@@ -8466,12 +8528,63 @@ export function xlsxEditCostBytes(base: Uint8Array): number {
 export const XLSX_TOO_LARGE_TEXT =
   'This file is too large to edit safely in this version. You can view, scroll and copy, but not edit. Editing large files comes in a later version. It is open read-only.';
 
-/** Reason text when the workbook is over XLSX_EDIT_LIMITS, or undefined. `cells` = sum of used rows x columns of all sheets. */
-export function xlsxTooLargeReason(meta: WorkbookMeta, bytes: number): string | undefined {
+/** (0.2.1) Text for a workbook with large sheets over its byte limit (XLSX_LAZY_EDIT_BYTES). */
+export const XLSX_LAZY_TOO_LARGE_TEXT =
+  'This file is too large to edit safely in this version (more than 25 MB of unpacked data in its sheets and styles). You can view, scroll and copy, but not edit. Editing very large files comes in a later version. It is open read-only.';
+
+/**
+ * Reason text when the workbook is over its edit limit, or undefined. Sheets that load row by row (`isLazy`, 0.2.1) are
+ * not counted in `cells` (they do not cost memory or time per cell); the byte limit is XLSX_LAZY_EDIT_BYTES for a workbook
+ * with such a sheet, XLSX_EDIT_LIMITS.bytes for any other. `cells` = sum of used rows x columns of the other sheets.
+ */
+export function xlsxTooLargeReason(meta: WorkbookMeta, bytes: number, isLazy?: (index: number) => boolean): string | undefined {
   let cells = 0;
-  for (const sheet of meta.sheets) cells += sheet.rowCount * sheet.colCount;
-  if (cells <= XLSX_EDIT_LIMITS.cells && bytes <= XLSX_EDIT_LIMITS.bytes) return undefined;
-  return XLSX_TOO_LARGE_TEXT;
+  let lazy = false;
+  meta.sheets.forEach((sheet, i) => {
+    if (isLazy?.(i)) lazy = true;
+    else cells += sheet.rowCount * sheet.colCount;
+  });
+  if (cells > XLSX_EDIT_LIMITS.cells) return XLSX_TOO_LARGE_TEXT;
+  if (bytes > (lazy ? XLSX_LAZY_EDIT_BYTES : XLSX_EDIT_LIMITS.bytes)) return lazy ? XLSX_LAZY_TOO_LARGE_TEXT : XLSX_TOO_LARGE_TEXT;
+  return undefined;
+}
+
+export const XLSX_EDIT_BYTES_TOO_LARGE_TEXT =
+  'This change would make the workbook too large to edit safely (the unpacked size of its sheets would pass the limit). It was not applied. Edit it in Excel.';
+
+/** Worst case bytes of a text in the XML: 2 per unit (a margin), more for what is escaped ('&' 5, '<' '>' 4) or UTF-8 multi-byte (3). */
+function xmlTextBytes(s: string): number {
+  if (!/[&<>\u0080-\uffff]/.test(s)) return s.length * 2;
+  let n = 0;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s.charCodeAt(i);
+    n += ch === 0x26 ? 5 : ch === 0x3c || ch === 0x3e ? 4 : ch > 0x7f ? 3 : 2;
+  }
+  return n;
+}
+
+/** A safe upper estimate of the bytes the cell patches of `ops` add to the unpacked parts (B1): the text of every cell + its XML. */
+export function opsGrowthBytes(ops: readonly PackageOp[]): number {
+  let n = 0;
+  for (const op of ops) {
+    if (op.kind !== 'cells') continue;
+    for (const [, , patch] of op.cells) {
+      const v = patch.value;
+      const c = patch.cached;
+      if (patch.value === null && !patch.formula) continue; // a clear removes the cell: no growth
+      n += 96 + xmlTextBytes(patch.formula ?? '') + (v?.t === 's' ? xmlTextBytes(v.v) : 24) + (c?.t === 's' ? xmlTextBytes(c.v) : 0) + (patch.style ? 64 : 0);
+    }
+  }
+  return n;
+}
+
+/**
+ * The byte rule for an edit (B1): the parts a save rewrites, as they are in the file, plus what the applied edits add
+ * (`appliedGrowth`, which goes down again with undo) plus this edit, must stay within the limit of the workbook.
+ */
+export function editGrowsBytesTooLarge(baseBytes: number, appliedGrowth: number, plan: Edit, lazy: boolean): string | undefined {
+  const limit = lazy ? XLSX_LAZY_EDIT_BYTES : XLSX_EDIT_LIMITS.bytes;
+  return baseBytes + appliedGrowth + opsGrowthBytes(plan.after.ops) > limit ? XLSX_EDIT_BYTES_TOO_LARGE_TEXT : undefined;
 }
 
 export const XLSX_EDIT_GROWS_TOO_LARGE_TEXT =
@@ -8485,12 +8598,13 @@ export const XLSX_EDIT_GROWS_TOO_LARGE_TEXT =
 export function editGrowsTooLarge(m: WorkbookModel, plan: Edit): string | undefined {
   const sheet = plan.sheetId === null ? undefined : m.sheetMeta(plan.sheetId);
   if (!sheet || !plan.range || plan.kind === 'clear') return undefined;
+  if (plan.sheetId !== null && m.isLazy(plan.sheetId)) return undefined; // a big sheet: the byte rule (editGrowsBytesTooLarge) applies
   const rows = Math.max(sheet.rowCount, plan.range.r1 + 1);
   const cols = Math.max(sheet.colCount, plan.range.c1 + 1);
   if (rows === sheet.rowCount && cols === sheet.colCount) return undefined;
   let cells = rows * cols;
   for (let i = 0, id = m.sheetIdAt(0); id !== undefined; id = m.sheetIdAt(++i)) {
-    const other = id === plan.sheetId ? undefined : m.sheetMeta(id);
+    const other = id === plan.sheetId || m.isLazy(id) ? undefined : m.sheetMeta(id);
     if (other) cells += other.rowCount * other.colCount;
   }
   return cells > XLSX_EDIT_LIMITS.cells ? XLSX_EDIT_GROWS_TOO_LARGE_TEXT : undefined;
@@ -8498,7 +8612,7 @@ export function editGrowsTooLarge(m: WorkbookModel, plan: Edit): string | undefi
 
 /** Text for a workbook the save path cannot patch (`reason` from checkPatchable); there is no "Edit anyway". */
 export function hardReadOnlyText(reason: string): string {
-  if (reason === XLSX_TOO_LARGE_TEXT) return reason;
+  if (reason === XLSX_TOO_LARGE_TEXT || reason === XLSX_LAZY_TOO_LARGE_TEXT) return reason;
   return `FileStudio cannot edit this file safely: ${reason}. It is open read-only.`;
 }
 
@@ -10260,11 +10374,17 @@ export const VERIFY_DEEP_MAX_BYTES = 10 << 20;
 /** V4 also needs a modest sharedStrings part: text-heavy workbooks compress 25:1, a 3.7 MB file can hold 95 MB of strings. */
 export const VERIFY_DEEP_MAX_SST_BYTES = 32 << 20;
 
-/** Whether V4 (a synchronous ExcelJS reload) may run: the zip is small AND its parts are small once unpacked. */
+/**
+ * Whether V4 (a synchronous ExcelJS reload) may run: the zip is small AND its parts are small once unpacked. A worksheet
+ * part big enough to load row by row (lazyTuning.sheetBytes, 0.2.1) is not reloaded as a whole: that would block the host
+ * for seconds (V1-V3 check it; its rows are checked cell by cell).
+ */
 export function deepVerifyAllowed(bytes: Uint8Array): boolean {
   if (bytes.length > VERIFY_DEEP_MAX_BYTES) return false;
   try {
-    return !parseZip(bytes).entries.some((e) => /sharedStrings[^/]*$/i.test(e.name) && e.usize > VERIFY_DEEP_MAX_SST_BYTES);
+    return !parseZip(bytes).entries.some(
+      (e) => (/sharedStrings[^/]*$/i.test(e.name) && e.usize > VERIFY_DEEP_MAX_SST_BYTES) || (/^xl\/worksheets\/[^/]+\.xml$/i.test(e.name) && e.usize > lazyTuning.sheetBytes),
+    );
   } catch {
     return false; // V1 reports a damaged zip
   }
@@ -11084,4 +11204,496 @@ export async function checkPatchable(
     if (err instanceof ZipError || err instanceof PatchError) return { ok: false, reason: err.message };
     return { ok: false, reason: `it could not be checked (${saveErrorText(err)})` };
   }
+}
+
+// ===== XLSX LAZY =====
+//
+// Big sheets (0.2.1). A worksheet part of more than lazyTuning.sheetBytes unpacked is not loaded into ExcelJS as a whole (35 s,
+// 2.5 GB for 5 million cells). Instead its XML is kept as bytes with a row index, and the rows on screen are parsed by the
+// same loadWorkbook code in small windows ("ensureLazyRows"). The FILE is never written from this display model: the save
+// patches the original bytes (buildXlsx), so a display bug cannot damage the file. A sheet that is not simple enough
+// (arrays, comments, relations, XML comments, odd rows ...) is NOT lazy: it loads as before (fail closed).
+
+/** Sizes of the lazy load. Tests lower them to exercise window loads and eviction with small files. */
+export const lazyTuning = { sheetBytes: 3 * 1024 * 1024, chunkRows: 100, keepRows: 6000, maxRequestRows: 10_000, sstBytes: 2 * 1024 * 1024, scanBytes: 4 << 20 };
+/**
+ * Unpacked size of the rewritten parts up to which a workbook with a lazy sheet may be edited (byte guard, B1). Measured
+ * (real host code, busy 15 GB PC): a sheet of 19 MB XML = 500,000 cells opens in 1.1 s, first edit 0.6 s, save 2.2 s,
+ * longest block 53 ms. large.xlsx (191 MB) opens in about 3 s but its save takes 40-50 s on that PC, so it stays read-only:
+ * raise this number only after a measured run of large.xlsx meets the budgets (save < 5 s, block < 250 ms; see p9-bigsave).
+ */
+export const XLSX_LAZY_EDIT_BYTES = 25 * 1024 * 1024;
+const LAZY_MAX_ATTR_ROWS = 20_000;
+/** A row without cells counts in the used range like in the full load: it has a height, is hidden, or has its own non-default style (fix r2). */
+function lazyRowIsUsed(tag: string): boolean {
+  const attr = (name: string): string | undefined => new RegExp('\\s' + name + '\\s*=\\s*"([^"]*)"').exec(tag)?.[1];
+  const on = (v: string | undefined): boolean => v === '1' || v === 'true';
+  if (attr('ht') !== undefined || on(attr('hidden'))) return true;
+  const s = attr('s');
+  return on(attr('customFormat')) && s !== undefined && Number(s) !== 0;
+}
+const LAZY_MAX_MASTERS = 5000;
+const LAZY_MAX_PINNED_ROWS = 30_000;
+const EMPTY_WORKSHEET = Buffer.from(
+  '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData/></worksheet>',
+);
+
+export const LAZY_TOO_MANY_ROWS_TEXT = `This change reaches more than ${(10_000).toLocaleString('en-US')} rows of a large sheet. Change fewer rows at a time.`;
+export const LAZY_TOO_MANY_EDITS_TEXT = 'Too many rows of this large sheet were changed without saving. Close and reopen the file, then continue.';
+export const LAZY_SHARED_TEXT = 'This cell is the first cell of a shared formula that covers too many rows of a large sheet to change safely here. Edit it in Excel.';
+
+/** A read reached a row that is not loaded (a bug guard: the caller must load rows first). */
+export class LazyRowError extends Error {
+  constructor(row: number) {
+    super(`row ${row + 1} of a large sheet is not loaded`);
+    this.name = 'LazyRowError';
+  }
+}
+
+/** A request is refused with a text for the user (not a bug). */
+export class LazyLimitError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'LazyLimitError';
+  }
+}
+
+interface LazyShared {
+  /** Every part of the package except the lazy worksheet parts, by entry name. */
+  parts: Map<string, Buffer>;
+  /** Entry names of all worksheet parts (replaced by an empty sheet in window loads). */
+  sheetParts: Set<string>;
+}
+
+interface LazySheet {
+  shared: LazyShared;
+  part: string;
+  sheetId: number;
+  buf: Buffer;
+  head: Buffer;
+  tail: Buffer;
+  /** Index of the rows: 0-based row number and byte span of each <row>, in file order. */
+  n: number;
+  num: Int32Array;
+  start: Float64Array;
+  end: Float64Array;
+  /** 0-based row -> index + 1 (0 = no such row). */
+  slot: Int32Array;
+  lastRow: number;
+  usedRows: number;
+  usedCols: number;
+  /** Shared formula masters: si -> { index of the master row, last row of its range }. */
+  masters: Map<number, { idx: number; r1: number; c0: number }>;
+  /** Rows that carry row properties (height, hidden, style), as ExcelJS read them from the stub. */
+  attr: (XRow | undefined)[];
+  /** The loaded rows (what ws._rows shows), their last use, and the rows that must stay loaded. */
+  target: (XRow | undefined)[];
+  loaded: number;
+  stamps: Map<number, number>;
+  pinned: Set<number>;
+  seq: number;
+}
+
+const lazySheets = new WeakMap<object, LazySheet>();
+
+/** True when the worksheet is lazy (its rows are loaded by window). */
+export function isLazyWorksheet(ws: object): boolean {
+  return lazySheets.has(ws);
+}
+
+const LAZY_NEEDLES = ['<!--', '<![CDATA[', ' cm="', ' vm="', 't="array"'].map((s) => Buffer.from(s));
+
+/** Index of the first row whose number is >= r (0-based), or n. */
+function lazyFirstAtOrAfter(lz: LazySheet, r: number): number {
+  let lo = 0;
+  let hi = lz.n;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (lz.num[mid] < r) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/** "A2:A99" -> its range (0-based), or undefined. */
+function parseA1Range(text: string): Range | undefined {
+  const m = /^\$?([A-Z]{1,3})\$?(\d+)(?::\$?([A-Z]{1,3})\$?(\d+))?$/.exec(text.trim());
+  if (!m) return undefined;
+  const c0 = colToIndex(m[1]);
+  const r0 = Number(m[2]) - 1;
+  const c1 = m[3] ? colToIndex(m[3]) : c0;
+  const r1 = m[4] ? Number(m[4]) - 1 : r0;
+  return r0 >= 0 && r1 >= r0 && c1 >= c0 ? { r0, c0, r1, c1 } : undefined;
+}
+
+/** Index + checks for one worksheet part. A string = why the sheet cannot be lazy. */
+async function indexLazySheet(
+  shared: LazyShared,
+  part: string,
+  sheetId: number,
+  buf: Buffer,
+  onYield?: SaveYieldHook,
+): Promise<{ lz: LazySheet; stubRows: Buffer } | string> {
+  try {
+    const L = await sheetLayout(buf, part, onYield);
+    if (L.P !== '' || L.sdSelfClosing) return 'its tags have a prefix or it has no rows';
+    for (const needle of LAZY_NEEDLES) {
+      if ((await indexOfCooperative(buf, needle, L.sdOpenEnd, onYield)) >= 0) return `it contains ${needle.toString('latin1')}`;
+    }
+    const rowsMax = MAX_ROWS;
+    const num = new Int32Array(rowsMax);
+    const start = new Float64Array(rowsMax);
+    const end = new Float64Array(rowsMax);
+    let n = 0;
+    let pos = L.sdOpenEnd;
+    let prevR = -1;
+    let usedRows = 0;
+    let usedCols = 0;
+    const stubParts: Buffer[] = [];
+    const step = saveSlicer(onYield, 4000);
+    for (;;) {
+      const rs = findStartTag(buf, L.rowTag, pos, L.sdClose);
+      for (let g = pos; g < (rs < 0 ? L.sdClose : rs); g++) {
+        const ch = buf[g];
+        if (ch !== 0x20 && ch !== 0x0a && ch !== 0x0d && ch !== 0x09) return 'it has something between its rows';
+      }
+      if (rs < 0) break;
+      const row = readRowAt(buf, L, rs);
+      if (row.r <= prevR) return `its rows are out of order (row ${row.r + 1})`;
+      if (row.tag.includes("'")) return 'it uses single quotes';
+      prevR = row.r;
+      num[n] = row.r;
+      start[n] = row.start;
+      end[n] = row.end;
+      n++;
+      // Row properties: anything but r / spans / dyDescent. The row is kept in the stub without cells.
+      const rest = row.tag
+        .replace(/\s(?:r|spans|x14ac:dyDescent)\s*=\s*"[^"]*"/g, '')
+        .replace(/^<row/, '')
+        .replace(/\/?>$/, '')
+        .trim();
+      if (rest !== '') {
+        if (stubParts.length >= LAZY_MAX_ATTR_ROWS) return 'it has too many rows with their own formatting';
+        stubParts.push(Buffer.from(row.selfClosing ? row.tag : `${row.tag.slice(0, -1)}/>`, 'latin1'));
+        if (lazyRowIsUsed(row.tag)) usedRows = Math.max(usedRows, row.r + 1);
+      }
+      if (!row.selfClosing) {
+        const first = buf.indexOf('<c', row.openEnd);
+        if (first >= 0 && first < row.end) {
+          if (!/^<c\s(?:[^>]*?\s)?r="[A-Z]{1,3}\d+"/.test(buf.toString('latin1', first, Math.min(first + 60, row.end)))) return `a cell of row ${row.r + 1} has no reference`;
+          let hiEnd = row.end;
+          for (let k = buf.lastIndexOf('<c ', row.end - 1); k >= first; k = buf.lastIndexOf('<c ', k - 1)) {
+            const text = buf.toString('latin1', k, Math.min(hiEnd, k + 400));
+            hiEnd = k;
+            if (!/<v[ >]|<f[ >/]|<is[ >]|\ss="[1-9]/.test(text)) continue;
+            const ref = /^<c\s(?:[^>]*?\s)?r="([A-Z]{1,3})\d+"/.exec(text);
+            if (!ref) return `a cell of row ${row.r + 1} has no reference`;
+            usedCols = Math.max(usedCols, colToIndex(ref[1]) + 1);
+            usedRows = Math.max(usedRows, row.r + 1);
+            break;
+          }
+        }
+      }
+      pos = row.end;
+      const pause = step();
+      if (pause) await pause;
+    }
+    if (n === 0) return 'it has no rows';
+    // Shared formulas: the master rows (the formula with ref), found by one pass over the part.
+    const masters = new Map<number, { idx: number; r1: number; c0: number }>();
+    const childSi = new Set<number>();
+    const sharedNeedle = Buffer.from('t="shared"');
+    for (let p = L.sdOpenEnd; ;) {
+      const i = await indexOfCooperative(buf, sharedNeedle, p, onYield);
+      if (i < 0 || i >= L.sdClose) break;
+      const open = buf.lastIndexOf('<f', i);
+      const close = buf.indexOf('>', i);
+      const tag = buf.toString('latin1', open, close + 1);
+      const si = /\ssi="(\d+)"/.exec(tag);
+      if (!si || open < L.sdOpenEnd || !/^<f[\s>]/.test(tag)) return 'it has a shared formula it cannot read';
+      const ref = /\sref="([^"]*)"/.exec(tag);
+      if (ref) {
+        let lo = 0;
+        let hi = n - 1;
+        while (lo < hi) {
+          const mid = (lo + hi + 1) >> 1;
+          if (start[mid] <= open) lo = mid;
+          else hi = mid - 1;
+        }
+        const range = parseA1Range(ref[1]);
+        if (!range) return 'it has a shared formula range it cannot read';
+        masters.set(Number(si[1]), { idx: lo, r1: range.r1, c0: range.c0 });
+        if (masters.size > LAZY_MAX_MASTERS) return 'it has too many shared formulas';
+      } else {
+        childSi.add(Number(si[1]));
+      }
+      p = close + 1;
+      if (p >= L.sdClose) break;
+      const pause = step();
+      if (pause) await pause;
+    }
+    for (const si of childSi) if (!masters.has(si)) return 'a shared formula has no first cell';
+    const slot = new Int32Array(prevR + 2);
+    for (let i = 0; i < n; i++) slot[num[i]] = i + 1;
+    const lz: LazySheet = {
+      shared,
+      part,
+      sheetId,
+      buf,
+      head: Buffer.from(buf.subarray(0, L.sdOpenEnd)),
+      tail: Buffer.from(buf.subarray(L.sdClose)),
+      n,
+      num: num.slice(0, n),
+      start: start.slice(0, n),
+      end: end.slice(0, n),
+      slot,
+      lastRow: prevR + 1,
+      usedRows,
+      usedCols,
+      masters,
+      attr: [],
+      target: [],
+      loaded: 0,
+      stamps: new Map(),
+      pinned: new Set(),
+      seq: 0,
+    };
+    return { lz, stubRows: Buffer.concat(stubParts) };
+  } catch (err) {
+    if (err instanceof PatchError || err instanceof ZipError) return err.message;
+    throw err;
+  }
+}
+
+function lazyZip(parts: Iterable<[string, Buffer]>): Promise<Buffer> {
+  const zip = new JSZip();
+  for (const [name, data] of parts) zip.file(name, data, { binary: true });
+  return zip.generateAsync({ type: 'nodebuffer', compression: 'STORE' });
+}
+
+/** ws._rows of a lazy sheet: reading a row that exists but is not loaded fails loudly instead of showing it empty. */
+function lazyRowsProxy(lz: LazySheet): (XRow | undefined)[] {
+  lz.target.length = lz.lastRow;
+  return new Proxy(lz.target, {
+    get(t, p, receiver): unknown {
+      if (typeof p === 'string' && p.length > 0 && p.length < 9 && /^\d+$/.test(p)) {
+        const r = Number(p);
+        const row = t[r];
+        if (row !== undefined) return row;
+        if (r < lz.slot.length && lz.slot[r] !== 0) throw new LazyRowError(r);
+        return undefined;
+      }
+      return Reflect.get(t, p, receiver) as unknown;
+    },
+  });
+}
+
+/**
+ * Like loadWorkbook, but a worksheet part that is big and simple enough is not parsed: only its head, tail and the
+ * row properties are (a "stub"); its rows are loaded by ensureLazyRows. Same result as loadWorkbook when no sheet
+ * qualifies. `onYield` is called between slices of work.
+ */
+export async function loadWorkbookLazy(data: Uint8Array, options?: LoadOptions, onYield?: SaveYieldHook, why?: (sheetPart: string, reason: string) => void): Promise<ExcelJS.Workbook> {
+  const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  let zip: ZipPackage;
+  let pkg: XlsxPackage;
+  let candidates: XlsxSheetRef[];
+  try {
+    zip = parseZip(buffer);
+    if (!zip.entries.some((e) => e.usize > lazyTuning.sheetBytes && /^xl\/worksheets\//i.test(e.name))) return loadWorkbook(data, options);
+    pkg = await openXlsxPackage(zip, onYield);
+    if (pkg.strict) return loadWorkbook(data, options);
+    candidates = pkg.sheets.filter((s) => WORKSHEET_REL_RE.test(s.type) && !!s.part && (zip.get(s.part)?.usize ?? 0) > lazyTuning.sheetBytes);
+  } catch {
+    return loadWorkbook(data, options);
+  }
+  if (!candidates.length) return loadWorkbook(data, options);
+  // Every window load parses the shared strings again: a big string table makes each window slow, so such a file loads as a whole.
+  const sstSize = (pkg.sstPath ? zip.get(pkg.sstPath)?.usize : undefined) ?? 0;
+  if (sstSize > lazyTuning.sstBytes) {
+    for (const sheet of candidates) why?.(sheet.part as string, `its shared strings are large (${Math.round(sstSize / 1048576)} MB)`);
+    return loadWorkbook(data, options);
+  }
+  const shared: LazyShared = { parts: new Map(), sheetParts: new Set(pkg.sheets.map((s) => s.part).filter((p): p is string => !!p)) };
+  const lazyParts = new Set<string>();
+  const found: { lz: LazySheet; stubRows: Buffer }[] = [];
+  for (const sheet of candidates) {
+    const entry = zip.get(sheet.part as string);
+    if (!entry) continue;
+    // A relation of the sheet (comments, drawings, hyperlinks, tables, ...) is not handled by window loads.
+    if (zip.get(relsPartOf(entry.name))) {
+      why?.(entry.name, 'the sheet has relations (comments, drawings, hyperlinks or tables)');
+      continue;
+    }
+    const res = await indexLazySheet(shared, entry.name, sheet.sheetId, await readEntry(zip, entry, onYield), onYield);
+    if (typeof res === 'string') {
+      why?.(entry.name, res);
+      continue;
+    }
+    found.push(res);
+    lazyParts.add(entry.name);
+  }
+  if (!found.length) return loadWorkbook(data, options);
+  for (const e of zip.entries) {
+    if (e.name.endsWith('/') || lazyParts.has(e.name)) continue;
+    shared.parts.set(e.name, await readEntry(zip, e, onYield));
+  }
+  const stubParts = new Map(shared.parts);
+  for (const { lz, stubRows } of found) stubParts.set(lz.part, Buffer.concat([lz.head, stubRows, lz.tail]));
+  const workbook = await loadWorkbook(await lazyZip(stubParts), options);
+  for (const { lz } of found) {
+    const ws = (workbook as unknown as XWorkbook).worksheets.find((w) => w.id === lz.sheetId);
+    if (!ws) throw new Error('lazy load: the stub of a sheet was not found');
+    lz.attr = ws._rows;
+    ws._rows = lazyRowsProxy(lz);
+    lazySheets.set(ws, lz);
+  }
+  return workbook;
+}
+
+/** The package of one window load: the other worksheets are empty, this one has `body` as its rows. */
+function lazyWindowParts(lz: LazySheet, body: Buffer): Map<string, Buffer> {
+  const parts = new Map<string, Buffer>();
+  for (const [name, bytes] of lz.shared.parts) {
+    if (/^xl\/(media|embeddings|printerSettings|worksheets\/_rels)\//i.test(name)) continue;
+    parts.set(name, lz.shared.sheetParts.has(name) ? EMPTY_WORKSHEET : bytes);
+  }
+  for (const name of lz.shared.sheetParts) if (!parts.has(name)) parts.set(name, EMPTY_WORKSHEET);
+  parts.set(lz.part, Buffer.concat([lz.head, body, lz.tail]));
+  return parts;
+}
+
+/**
+ * Loads the rows (0-based, inclusive) of a lazy worksheet that are not loaded yet. `pin`: keep them loaded (edited rows:
+ * undo and redo read them). `forEdit`: also the rows of the shared formula that starts in a requested row.
+ * Throws LazyLimitError (a text for the user) when the request is too big.
+ */
+export async function ensureLazyRows(ws: object, ranges: readonly { r0: number; r1: number }[], pin = false, forEdit = false, editCells?: readonly Range[]): Promise<void> {
+  const lz = lazySheets.get(ws);
+  if (!lz) return;
+  const seq = ++lz.seq;
+  const set = new Set<number>(); // indexes of the rows
+  for (const g of ranges) {
+    const r0 = Math.max(0, Math.floor(g.r0));
+    const r1 = Math.min(lz.lastRow - 1, Math.floor(g.r1));
+    for (let i = lazyFirstAtOrAfter(lz, r0); r1 >= r0 && i < lz.n && lz.num[i] <= r1; i++) {
+      set.add(i);
+      if (set.size > lazyTuning.maxRequestRows) throw new LazyLimitError(LAZY_TOO_MANY_ROWS_TEXT);
+    }
+  }
+  if (forEdit) {
+    for (const i of [...set]) {
+      for (const m of lz.masters.values()) {
+        if (m.idx !== i) continue;
+        // Only an edit of the master cell itself needs the group (when the edited cells are known).
+        if (editCells && !editCells.some((g) => g.r0 <= lz.num[i] && lz.num[i] <= g.r1 && g.c0 <= m.c0 && m.c0 <= g.c1)) continue;
+        if (m.r1 - lz.num[i] > lazyTuning.maxRequestRows) throw new LazyLimitError(LAZY_SHARED_TEXT);
+        for (let j = i + 1; j < lz.n && lz.num[j] <= m.r1; j++) set.add(j);
+      }
+    }
+    if (set.size > lazyTuning.maxRequestRows) throw new LazyLimitError(LAZY_TOO_MANY_ROWS_TEXT);
+    // A copy of a shared formula needs its master row loaded (and kept) too: planEdit reads it (fix r2).
+    if (lz.masters.size) {
+      const masterIdx = new Set<number>();
+      for (const i of set) {
+        const rowText = lz.buf.subarray(lz.start[i], lz.end[i]).toString('latin1');
+        if (!rowText.includes('t="shared"')) continue;
+        for (const m of rowText.matchAll(/<f[^>]*t="shared"[^>]*>/g)) {
+          const si = /ssi="(d+)"/.exec(m[0]);
+          const master = si && !/sref="/.test(m[0]) ? lz.masters.get(Number(si[1])) : undefined;
+          if (master) masterIdx.add(master.idx);
+        }
+      }
+      for (const i of masterIdx) set.add(i);
+    }
+  }
+  const needed = [...set].sort((x, y) => x - y);
+  if (pin) {
+    const fresh = needed.filter((i) => !lz.pinned.has(lz.num[i])).length;
+    if (lz.pinned.size + fresh > LAZY_MAX_PINNED_ROWS) throw new LazyLimitError(LAZY_TOO_MANY_EDITS_TEXT);
+  }
+  const missing: number[] = [];
+  for (const i of needed) {
+    const r = lz.num[i];
+    lz.stamps.delete(r);
+    lz.stamps.set(r, seq);
+    if (pin) lz.pinned.add(r);
+    if (lz.target[r] === undefined) missing.push(i);
+  }
+  for (let k = 0; k < missing.length; ) {
+    let e = k + 1;
+    while (e < missing.length && missing[e] === missing[e - 1] + 1 && e - k < lazyTuning.chunkRows) e++;
+    await loadLazyChunk(lz, missing[k], missing[e - 1] + 1, seq);
+    k = e;
+    if (k < missing.length) await new Promise<void>((resolve) => setImmediate(resolve)); // let the host answer other messages between chunks (fix r2)
+  }
+  evictLazyRows(lz, seq);
+}
+
+/** Parses rows [a, b) (indexes) with the master rows of their shared formulas in front, and adopts them. */
+async function loadLazyChunk(lz: LazySheet, a: number, b: number, seq: number): Promise<void> {
+  const window = lz.buf.subarray(lz.start[a], lz.end[b - 1]);
+  const lead: number[] = [];
+  if (lz.masters.size) {
+    const seen = new Set<number>();
+    for (const m of window.toString('latin1').matchAll(/<f\b[^>]*\bt="shared"[^>]*>/g)) {
+      const si = /\ssi="(\d+)"/.exec(m[0]);
+      if (!si || /\sref="/.test(m[0])) continue;
+      const id = Number(si[1]);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const master = lz.masters.get(id);
+      if (!master) throw new Error('a shared formula has no first cell');
+      if (master.idx >= b) throw new Error('a shared formula starts below its copies');
+      if (master.idx < a && !lead.includes(master.idx)) lead.push(master.idx);
+    }
+  }
+  lead.sort((x, y) => x - y);
+  const body = Buffer.concat([...lead.map((i) => lz.buf.subarray(lz.start[i], lz.end[i])), window]);
+  const wb = await loadWorkbook(await lazyZip(lazyWindowParts(lz, body)));
+  const ws = (wb as unknown as XWorkbook).worksheets.find((w) => w.id === lz.sheetId);
+  if (!ws) throw new Error('lazy load: the window sheet was not found');
+  const adopt = (i: number, keep: boolean): void => {
+    const r = lz.num[i];
+    const row = ws._rows[r];
+    if (keep && lz.target[r] !== undefined) lz.pinned.add(r);
+    if (!row || lz.target[r] !== undefined) return;
+    lz.target[r] = row;
+    lz.loaded++;
+    lz.stamps.set(r, seq);
+    if (keep) lz.pinned.add(r);
+  };
+  for (const i of lead) adopt(i, true);
+  for (let i = a; i < b; i++) adopt(i, false);
+}
+
+function evictLazyRows(lz: LazySheet, seq: number): void {
+  if (lz.loaded <= lazyTuning.keepRows) return;
+  for (const [r, stamp] of lz.stamps) {
+    if (lz.loaded <= lazyTuning.keepRows || stamp >= seq - 32) break;
+    if (lz.pinned.has(r)) continue;
+    lz.stamps.delete(r);
+    if (lz.target[r] !== undefined) {
+      lz.target[r] = undefined;
+      lz.loaded--;
+    }
+  }
+}
+
+/** Whole-sheet facts of a lazy sheet from its index (WorkbookModel: used range). */
+function lazyUsed(ws: object): { rows: number; cols: number } | undefined {
+  const lz = lazySheets.get(ws);
+  return lz ? { rows: lz.usedRows, cols: lz.usedCols } : undefined;
+}
+
+/** The rows with their own properties of a lazy sheet (WorkbookModel: row infos). */
+function lazyAttrRows(ws: object): (XRow | undefined)[] | undefined {
+  return lazySheets.get(ws)?.attr;
+}
+
+/** How many worksheets of the workbook are lazy. */
+export function lazySheetCount(workbook: ExcelJS.Workbook): number {
+  let n = 0;
+  for (const ws of (workbook as unknown as XWorkbook).worksheets) if (lazySheets.has(ws)) n++;
+  return n;
 }

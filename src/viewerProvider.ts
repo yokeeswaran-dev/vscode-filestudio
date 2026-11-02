@@ -37,6 +37,11 @@ import {
   planEdit,
   xlsxTooLargeReason,
   editGrowsTooLarge,
+  editGrowsBytesTooLarge,
+  opsGrowthBytes,
+  LazyLimitError,
+
+  loadWorkbookLazy,
   xlsxEditCostBytes,
   lossyEditAnyway,
   SaveVerifyError,
@@ -2519,6 +2524,9 @@ export type SafeFs = Pick<
   'open' | 'rename' | 'unlink' | 'copyFile' | 'realpath' | 'stat' | 'readFile' | 'writeFile' | 'access' | 'mkdir' | 'readdir'
 >;
 
+/** Seam for tests only: lowers the sizes of the row-by-row load of big sheets so that small files use it. */
+export { lazyTuning } from './renderers/sheet';
+
 /** Seams for tests only (nothing in the product sets them): a faulty file system, a pause after the verify step. */
 export const sheetSaveHooks: {
   fs: SafeFs;
@@ -2952,6 +2960,10 @@ export class SheetDocument implements vscode.CustomDocument {
   private hardReadOnlyReason: string | undefined;
   /** Over the size limit (set at load): no edit is recorded, so nothing can write the file. */
   private tooLarge = false;
+  /** Unpacked bytes of the parts a save rewrites, as in the file (the byte rule of edits, B1), and whether a sheet loads row by row. */
+  private baseCostBytes = 0;
+  private hasLazySheet = false;
+  private readonly growthOf = new WeakMap<JournalEdit, number>();
   private scan: Promise<void> | undefined;
   private warnedStamp: DiskStamp | undefined;
   /** Our own write to the file, if one is in progress (its watcher events must not trigger a reload). */
@@ -3653,9 +3665,32 @@ export class SheetDocument implements vscode.CustomDocument {
   private startScanIfEditing(): void {
     this.scan = undefined;
     // Too large to save within budget: hard read-only now, no scan, no edit (size limit of 0.2.0; streaming save = 0.2.1).
-    this.hardReadOnlyReason = this._model ? xlsxTooLargeReason(this._model.getMeta(), xlsxEditCostBytes(this.base)) : undefined;
+    const model = this._model;
+    this.baseCostBytes = xlsxEditCostBytes(this.base);
+    this.hasLazySheet = !!model && model.getMeta().sheets.some((_, i) => model.isLazyIndex(i));
+    this.hardReadOnlyReason = model ? xlsxTooLargeReason(model.getMeta(), this.baseCostBytes, (i) => model.isLazyIndex(i)) : undefined;
     this.tooLarge = this.hardReadOnlyReason !== undefined;
     if (this.tooLarge) this.scan = Promise.resolve();
+  }
+
+  /** Bytes the applied edits add to the unpacked parts (an upper estimate; goes down with undo, up with redo). */
+  appliedGrowthBytes(): number {
+    let n = 0;
+    for (let i = 0; i < this.pos; i++) {
+      const e = this.journal[i];
+      let g = this.growthOf.get(e);
+      if (g === undefined) {
+        g = opsGrowthBytes(e.after.ops);
+        this.growthOf.set(e, g);
+      }
+      n += g;
+    }
+    return n;
+  }
+
+  /** The byte rule for a planned edit (B1): undefined = allowed, else the reason. */
+  editBytesTooLarge(plan: Edit): string | undefined {
+    return editGrowsBytesTooLarge(this.baseCostBytes, this.appliedGrowthBytes(), plan, this.hasLazySheet);
   }
 
   /** Starts the patch check at the first edit, save or backup (when editing is on). */
@@ -3725,7 +3760,7 @@ export class SheetDocument implements vscode.CustomDocument {
     // Relative links to other workbooks are shown in the file's folder (Excel's formula bar does the same).
     const folder = this.uri.scheme === 'file' ? path.dirname(this.uri.fsPath) : undefined;
     const [workbook, lossy] = await Promise.all([
-      loadWorkbook(data, { folder }),
+      loadWorkbookLazy(data, { folder }, undefined, (part, reason) => getLog().info(`[sheet] ${this.fileName}: ${part} loads as a whole sheet: ${reason}`)),
       detectLossyFeatures(data).catch((err: unknown): string[] => {
         lossyError = err ?? new Error('Unknown error');
         return [];
@@ -3859,6 +3894,53 @@ function answerGetStats(session: ViewerSession, source: GridSource | undefined, 
 }
 
 // ----- edit answers (xlsx) -----
+
+/** The sheet and rows an edit reads (the cells of a setCells, the ranges of a clear); undefined for other edits. */
+function editRowRanges(intent: EditIntent): { sheetId: SheetId; ranges: { r0: number; r1: number }[] } | undefined {
+  if (intent.kind === 'setCells') {
+    let r0 = Infinity;
+    let r1 = -1;
+    for (const [r] of intent.cells) {
+      r0 = Math.min(r0, r);
+      r1 = Math.max(r1, r);
+    }
+    return { sheetId: intent.sheetId, ranges: intent.cells.length ? [{ r0, r1 }] : [] };
+  }
+  if (intent.kind === 'clear') return { sheetId: intent.sheetId, ranges: intent.ranges.map((g) => ({ r0: Math.min(g.r0, g.r1), r1: Math.max(g.r0, g.r1) })) };
+  return undefined;
+}
+
+/** The cells an edit writes (one box per cell, or the ranges of a clear), so a shared formula group is loaded only when its first cell is edited. */
+function editCellBoxes(intent: EditIntent): Range[] | undefined {
+  if (intent.kind === 'setCells') return intent.cells.map(([r, c]) => ({ r0: r, r1: r, c0: c, c1: c }));
+  if (intent.kind === 'clear') return intent.ranges.map((g) => ({ r0: Math.min(g.r0, g.r1), r1: Math.max(g.r0, g.r1), c0: Math.min(g.c0, g.c1), c1: Math.max(g.c0, g.c1) }));
+  return undefined;
+}
+
+/** Loads (and keeps) the rows of a big sheet that an edit reads. Throws LazyLimitError when it reaches too many rows. */
+async function ensureEditRows(model: WorkbookModel, intent: EditIntent): Promise<void> {
+  const need = editRowRanges(intent);
+  if (!need || !model.isLazy(need.sheetId) || need.ranges.length === 0) return;
+  // The planner looks at the whole box of the cells (merges, tables, arrays), so every row of the box is loaded,
+  // plus the first row of a merged area that touches the box (the planner moves an edit to its top-left cell).
+  const ranges = need.ranges.slice();
+  const merges = model.getMeta().sheets.find((sh) => sh.id === need.sheetId)?.merges ?? [];
+  for (const mg of merges) {
+    if (need.ranges.some((g) => mg.r0 <= g.r1 && mg.r1 >= g.r0 && (mg.r0 < g.r0 || mg.r1 > g.r1))) ranges.push({ r0: mg.r0, r1: mg.r0 });
+  }
+  await model.ensureRows(need.sheetId, ranges, true, true, editCellBoxes(intent));
+}
+
+/** Rows a status-bar figure reads; false when a big sheet's selection is too big to load (no figures then). */
+async function ensureStatsRows(model: WorkbookModel, index: number, ranges: Range[]): Promise<boolean> {
+  try {
+    await model.ensureRows(index, ranges.map((g) => ({ r0: Math.min(g.r0, g.r1), r1: Math.max(g.r0, g.r1) })));
+    return true;
+  } catch (err) {
+    if (err instanceof LazyLimitError) return false;
+    throw err;
+  }
+}
 
 /** Test hook: runs on the planned edit after its display change was applied and before it is journaled (host tests corrupt the ops to prove check V3). */
 export const sheetEditHooks: { afterApply?: (plan: Edit) => void } = {};
@@ -4016,13 +4098,28 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
         // (v0.2.0) A request with a `sheetId` is resolved by id (the tab may have moved); the position stays for 0.1.2.
         const model = document.model;
         const index = msg.sheetId !== undefined && model ? model.sheetIndexOf(msg.sheetId) : msg.sheet;
+        // A big sheet loads the rows asked for first (a window of 60 rows takes about 50 ms).
+        if (model && index >= 0 && Number.isFinite(msg.start) && Number.isFinite(msg.end)) {
+          try {
+            await model.ensureRows(index, [{ r0: msg.start, r1: msg.end - 1 }]);
+          } catch (err) {
+            logError(`[sheet] Could not load rows ${msg.start + 1}-${msg.end} of ${document.fileName}`, err);
+            session.postError(`Could not read rows ${msg.start + 1}-${msg.end}`, err);
+            return;
+          }
+        }
         answerGetRows(session, model, msg, document.loadError, { index, version: document.versions.version });
         return;
       }
       case 'getStats': {
         await document.loading;
         const model = document.model;
-        answerGetStats(session, model, msg, msg.sheetId !== undefined && model ? model.sheetIndexOf(msg.sheetId) : undefined);
+        const statsIndex = msg.sheetId !== undefined && model ? model.sheetIndexOf(msg.sheetId) : undefined;
+        if (model && !(await ensureStatsRows(model, statsIndex ?? msg.sheet, msg.ranges))) {
+          session.post({ type: 'stats', reqId: msg.reqId, stats: { ...EMPTY_STATS, unknown: true } }); // too many rows of a big sheet: no figures, and the viewer must not read 0 as a count
+          return;
+        }
+        answerGetStats(session, model, msg, statsIndex);
         return;
       }
       default:
@@ -4078,6 +4175,13 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
       if (!model) return reject('internal', EDIT_TEXT.internal);
       // The check of every worksheet part (§4.7) is finished before the edit is judged.
       await document.lazyScan();
+      // A big sheet: the rows the edit reads are loaded (and kept loaded for undo / redo) before the synchronous steps below.
+      try {
+        await ensureEditRows(model, msg.intent);
+      } catch (err) {
+        if (err instanceof LazyLimitError) return reject('blocked', err.message);
+        throw err;
+      }
       const gate = await checkEditable('xlsx', document.uri, document.gateState);
       if (!gate.ok) {
         for (const panel of document.panels) void this.gates.get(panel)?.doc.refresh(); // the panels learn why
@@ -4094,7 +4198,7 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
       if ('blocked' in plan) {
         return reject('blocked', plan.blocked.map((b) => b.message).join(' '), plan.blocked.flatMap((b) => b.where));
       }
-      const tooLarge = editGrowsTooLarge(model, plan); // the open-time size rule, kept for edits that grow the sheet
+      const tooLarge = editGrowsTooLarge(model, plan) ?? document.editBytesTooLarge(plan); // cells grown past the open-time rule; unpacked bytes (B1)
       if (tooLarge) return reject('blocked', tooLarge);
       return this.commitSheetEdit(document, session, msg, model, plan, reject);
     } catch (err) {

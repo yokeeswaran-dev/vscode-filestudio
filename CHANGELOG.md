@@ -25,6 +25,18 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Changed
 
+#### Spreadsheets (`.xlsx`)
+
+- Big worksheets open fast and use little memory: a sheet of more than 3 MB of XML is read row by row (only the rows
+  you scroll to are parsed). A 100,000 x 50 workbook opens in a few seconds instead of about 35 seconds and 2.5 GB.
+- The 100,000-cell edit limit is gone for such sheets. The limit is now the unpacked size: a workbook whose sheets,
+  strings and styles unpack to at most 25 MB can be edited, however many cells it has (measured: 500,000 cells, save
+  about 2 seconds). Bigger files open read-only, as before.
+- The size guard for edits counts bytes, not cells: an edit (or a paste of long text) that would push the unpacked size
+  over the limit is refused, and undo gives the room back.
+- A sheet that FileStudio cannot read row by row safely (comments, tables, hyperlinks, array formulas, XML comments,
+  large shared strings) is loaded as a whole sheet, as before.
+
 #### Markdown
 
 - WYSIWYG on big documents: a Loading message with a percentage while the editor is built (the page stays

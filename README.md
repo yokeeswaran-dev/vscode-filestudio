@@ -103,8 +103,9 @@ A workbook opens read-only (you can view, scroll and copy) when:
 - editing is turned off in the settings,
 - VS Code treats the file as read-only: for example a Git version in **Open Changes**, or a file matched by the
   **Files: Readonly Include** setting,
-- the workbook is too large: more than about **100,000 cells** (used rows x columns of all sheets), or sheets,
-  strings and styles that unpack to more than **25 MB** (pictures do not count). A banner says so.
+- the workbook is too large: its sheets, strings and styles unpack to more than **25 MB** (pictures do not count),
+  or it has a sheet with more than about **100,000 cells** that FileStudio cannot load row by row (for example a sheet
+  with comments, tables, hyperlinks or large shared strings). A banner says so.
 - FileStudio cannot save the file safely, for example a Strict Open XML or ZIP64 file, or a damaged file. A banner
   gives the reason.
 
@@ -148,9 +149,10 @@ No. Everything runs on your computer: no telemetry, no uploads. Links open only 
 
 ## ⚠️ Known limitations
 
-- Very large `.xlsx` files take a while to open. In this version, a workbook with more than about 100,000 cells or a
-  file whose sheets, strings and styles unpack to more than 25 MB opens read-only (pictures do not count). You can
-  view and copy, but not edit. Editing large files comes in a later version.
+- Big sheets open fast: FileStudio reads only the rows you look at. You can edit them while the sheets, strings and
+  styles of the file unpack to at most 25 MB (about 500,000 cells). A bigger file (for example 100,000 rows x 50
+  columns) opens quickly but read-only: you can view, scroll and copy, but not edit. Editing such files comes in a
+  later version.
 - FileStudio does not calculate formulas (see the FAQ).
 - In `.xlsx`, you can change cell values and formulas only: not rows, columns, sheets or cell formatting.
 - Cut (Ctrl+X) is not available in the grid: use Copy and then Delete.

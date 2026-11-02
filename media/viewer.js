@@ -4971,6 +4971,7 @@ const searches = { chain: /** @type {Promise<void>} */ (Promise.resolve()), pend
 const SEARCHING = 'Searching…';
 /** Thrown by a search whose result is no longer wanted (the selection changed): it stops asking the host. */
 const SEARCH_STALE = new Error('The selection changed during the search.');
+const SEARCH_UNKNOWN = new Error('The host could not count the cells of this big sheet.');
 
 /**
  * Runs a keyboard search: `quick` answers from loaded rows (null = rows missing), else `slow` asks the host and
@@ -5009,7 +5010,8 @@ function searchThen(quick, slow, apply) {
     })
     // Superseded, or the data changed under the search (reload, edit): the key press is dropped.
     .catch((err) => {
-      if (err !== SEARCH_STALE) log('warn', `Keyboard search stopped: ${errorDetail(err)}`);
+      if (err === SEARCH_UNKNOWN) setStatusMessage('This sheet is too big to jump to the end of the data here. Use the scroll bar, or Page Down.', 'info');
+      else if (err !== SEARCH_STALE) log('warn', `Keyboard search stopped: ${errorDetail(err)}`);
     })
     .finally(() => {
       searches.pending--;
@@ -8470,7 +8472,9 @@ function onStats(msg) {
   const probe = rowCache.probes.get(msg.reqId);
   if (probe) {
     rowCache.probes.delete(msg.reqId);
-    probe.resolve(msg.stats.count);
+    // A big sheet that cannot be counted: never answer "0 cells" (Ctrl+Arrow would jump to the sheet edge).
+    if (msg.stats.unknown) probe.reject(SEARCH_UNKNOWN);
+    else probe.resolve(msg.stats.count);
     return;
   }
   const req = G.statsReq;
