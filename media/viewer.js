@@ -7845,7 +7845,7 @@ function formatCount(n) {
  * @typedef {{ level: number, text: string, slug: string, line: number }} MdTocEntry
  * @typedef {{ type?: string, kind?: string, fileName?: string, html: string, toc?: MdTocEntry[], source?: string,
  *   mode?: string, version: number, readOnly?: boolean, editState?: EditState, blocks?: MdSourceBlock[], eol?: string,
- *   limits?: { wysiwyg: boolean, reason?: string }, resourceBase?: string }} MdMessage  Fields shared by `init` (kind 'markdown') and
+ *   limits?: { wysiwyg: boolean, reason?: string, weight?: number }, resourceBase?: string }} MdMessage  Fields shared by `init` (kind 'markdown') and
  *   `markdownUpdate` (`readOnly`: the document cannot be edited, task checkboxes are disabled; an update without it
  *   keeps the current state).
  * @typedef {{ key: string, dark: boolean, variables: Record<string, string | boolean> }} MdMermaidTheme
@@ -10047,7 +10047,7 @@ const MD_FRAME_ICONS = {
 const mdx = {
   /** @type {EditState | null} */
   editState: null,
-  /** @type {{ wysiwyg: boolean, reason?: string } | null} */
+  /** @type {{ wysiwyg: boolean, reason?: string, weight?: number } | null} */
   limits: null,
   eol: /** @type {'\n' | '\r\n'} */ ('\n'),
   /** @type {MdSourceBlock[] | null} */
@@ -10172,7 +10172,7 @@ function mdShowStatus() {
     const availability = mdWysiwygAvailability();
     if (availability.state === 'readonly') text = mdReadonlyText(availability.reason);
     else if (mdw.failure) text = mdw.failure;
-    else if (!mdw.ready) text = 'Loading the WYSIWYG editor…';
+    else if (!mdw.ready) text = mdw.progress || 'Loading the WYSIWYG editor…';
   }
   if (frame.status.textContent !== text) frame.status.textContent = text;
 }
@@ -10973,8 +10973,10 @@ function mdwPlugins(mw, hooks) {
           },
         },
         view: () => ({
+          // (0.2.1, B2) An identity check, not `doc.eq`: a deep compare of a big document on every key press was a main cost. A
+          // transaction that gave an equal document only schedules one flush that finds no edit.
           update: (/** @type {any} */ view, /** @type {any} */ prev) => {
-            if (!view.state.doc.eq(prev.doc)) hooks.onChange();
+            if (view.state.doc !== prev.doc) hooks.onChange();
           },
         }),
       }),
@@ -11098,6 +11100,40 @@ function mdwKeepTableDelimiters(out, old) {
 }
 
 /**
+ * (0.2.1, B7) A setext heading's underline ("=====" / "-----") is written back as the author wrote it when it is the same
+ * kind (= or -): the serializer makes it as long as the text, which would change a line the user did not edit.
+ * @param {string} out serialized heading
+ * @param {string} old the heading as it was in the source
+ */
+function mdwKeepSetextUnderline(out, old) {
+  const under = /\n( *(=+|-+) *)$/;
+  const x = under.exec(out);
+  const y = under.exec(old);
+  if (!x || !y || x[2][0] !== y[2][0]) return out;
+  return out.slice(0, x.index + 1) + y[1];
+}
+
+/**
+ * (0.2.1, B7) Whether a block written as `node` starts a new block even right after a paragraph line (an ATX heading or a
+ * fenced code block), so no blank line has to be added before it.
+ * @param {any} node
+ * @param {Record<string, any> | undefined} opts
+ */
+function mdwStartsBlockNode(node, opts) {
+  const name = node.type.name;
+  return (name === 'heading' && !(opts && opts.setext)) || name === 'code_block';
+}
+
+/**
+ * (0.2.1, B7) Whether the source text of a block starts with an ATX heading marker or a code fence: a paragraph line above it
+ * is not joined to it, whatever the paragraph says.
+ * @param {string} text
+ */
+function mdwStartsBlockText(text) {
+  return /^ {0,3}(#{1,6}([ \t]|\r?\n|$)|`{3,}|~{3,})/.test(text);
+}
+
+/**
  * @param {MdwModules} mw
  * @param {any} ctx
  * @param {any[]} nodes
@@ -11119,57 +11155,151 @@ function mdwSerializeNodes(mw, ctx, nodes, opts) {
  * @returns {MdwModel}
  */
 function mdwLoadModel(editor, mw, source, blocks, eol) {
-  const { parserCtx, serializerCtx, editorViewCtx, schemaCtx } = mw.core;
+  const { parserCtx, schemaCtx } = mw.core;
   return editor.action((/** @type {any} */ ctx) => {
     const schema = ctx.get(schemaCtx);
     const parse = ctx.get(parserCtx);
-    void serializerCtx;
     /** @type {MdwItem[]} */
     const items = [];
-    const stats = { blocks: blocks.length, editable: 0, raw: 0, fails: /** @type {{ kind: string, text: string, out: string }[]} */ ([]) };
-    for (const b of blocks) {
-      const text = mdwNl(source.slice(b.start, b.end));
-      /** @type {any[] | null} */
-      let nodes = null;
-      let why = b.fixed ? b.reason : undefined;
-      /** @type {Record<string, any> | undefined} */
-      let opts;
-      if (!b.fixed) {
-        try {
-          const d = parse(text);
-          opts = mdwStyleOf(text, b.kind);
-          const out = mdwKeepTableDelimiters(mdwSerializerFor(mw, ctx, opts)(d).replace(/\n$/, ''), text);
-          if (out === text && d.childCount > 0) {
-            nodes = [];
-            d.forEach((/** @type {any} */ n) => nodes?.push(n));
-          } else {
-            why = 'round trip';
-            if (stats.fails.length < 50) stats.fails.push({ kind: b.kind, text: text.slice(0, 200), out: out.slice(0, 200) });
-          }
-        } catch (err) {
-          why = `parse error ${mdErrorMessage(err)}`;
-        }
-      }
-      if (nodes) stats.editable++;
-      else {
-        stats.raw++;
-        nodes = [schema.nodes.fs_raw.create({ kind: b.kind }, text ? schema.text(text) : null)];
-      }
-      items.push({ start: b.start, end: b.end, kind: b.kind, opts, nodes, raw: why !== undefined, ...(why === undefined ? {} : { why }) });
+    const stats = mdwNewStats(blocks.length);
+    for (const b of blocks) items.push(mdwBuildItem(ctx, mw, schema, parse, source, b, stats));
+    return mdwApplyItems(ctx, mw, source, eol, items, stats);
+  });
+}
+
+/**
+ * (0.2.1, B2) The same as mdwLoadModel, but in short steps: the page gets its turn between them (a Loading state with progress,
+ * no frozen UI), and `alive()` false stops the work (the view was left or replaced). Resolves null when stopped.
+ * @param {any} editor
+ * @param {MdwModules} mw
+ * @param {string} source
+ * @param {MdSourceBlock[]} blocks
+ * @param {string} eol
+ * @param {(done: number, total: number) => void} onProgress
+ * @param {() => boolean} alive
+ * @returns {Promise<MdwModel | null>}
+ */
+async function mdwLoadModelSteps(editor, mw, source, blocks, eol, onProgress, alive) {
+  const { parserCtx, schemaCtx } = mw.core;
+  /** @type {MdwItem[]} */
+  const items = [];
+  const stats = mdwNewStats(blocks.length);
+  let at = 0;
+  while (at < blocks.length) {
+    const until = performance.now() + MD_WYSIWYG_STEP_MS;
+    editor.action((/** @type {any} */ ctx) => {
+      const schema = ctx.get(schemaCtx);
+      const parse = ctx.get(parserCtx);
+      while (at < blocks.length && (performance.now() < until || at % 8 !== 0)) items.push(mdwBuildItem(ctx, mw, schema, parse, source, blocks[at++], stats));
+    });
+    onProgress(at, blocks.length);
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+    if (!alive()) return null;
+  }
+  // The nodes go into the editor in steps too (a big document is one long DOM build otherwise).
+  const { editorViewCtx } = mw.core;
+  const all = items.flatMap((i) => i.nodes);
+  if (all.length <= MD_WYSIWYG_STEP_NODES) return editor.action((/** @type {any} */ ctx) => mdwApplyItems(ctx, mw, source, eol, items, stats));
+  mdw.loading = true;
+  try {
+    let at = 0;
+    let size = MD_WYSIWYG_STEP_NODES;
+    while (at < all.length) {
+      const started = performance.now();
+      const chunk = all.slice(at, at + size);
+      editor.action((/** @type {any} */ ctx) => {
+        const view = ctx.get(editorViewCtx);
+        const tr = at === 0 ? view.state.tr.replaceWith(0, view.state.doc.content.size, chunk) : view.state.tr.insert(view.state.doc.content.size, chunk);
+        view.dispatch(tr.setMeta('addToHistory', false));
+      });
+      at += chunk.length;
+      onProgress(items.length, items.length);
+      // About one step of MD_WYSIWYG_STEP_MS: the next chunk is as big as that time allows.
+      size = Math.max(10, Math.min(400, Math.round((size * MD_WYSIWYG_STEP_MS) / Math.max(1, performance.now() - started))));
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+      if (!alive()) return null;
     }
-    const all = items.flatMap((i) => i.nodes);
-    if (!all.length) all.push(schema.nodes.paragraph.create());
+  } finally {
+    mdw.loading = false;
+  }
+  return editor.action((/** @type {any} */ ctx) => {
     const view = ctx.get(editorViewCtx);
-    // The whole document is replaced by one transaction (not a new EditorState): the plugin views of the editor (cursor,
-    // tooltips, ...) stay, so the focus and the toolbar are not lost on a reload. The nodes keep their identity.
-    mdw.loading = true;
-    try {
-      view.dispatch(view.state.tr.replaceWith(0, view.state.doc.content.size, all).setMeta('addToHistory', false));
-    } finally {
-      mdw.loading = false;
-    }
     return { source, eol, items, stats, loadedDoc: view.state.doc };
   });
+}
+
+/** @param {number} blocks */
+function mdwNewStats(blocks) {
+  return { blocks, editable: 0, raw: 0, fails: /** @type {{ kind: string, text: string, out: string }[]} */ ([]) };
+}
+
+/**
+ * The editor nodes of one source block (or one protected raw node) and the bookkeeping item for it.
+ * @param {any} ctx
+ * @param {MdwModules} mw
+ * @param {any} schema
+ * @param {any} parse
+ * @param {string} source
+ * @param {MdSourceBlock} b
+ * @param {{ blocks: number, editable: number, raw: number, fails: { kind: string, text: string, out: string }[] }} stats
+ * @returns {MdwItem}
+ */
+function mdwBuildItem(ctx, mw, schema, parse, source, b, stats) {
+  const text = mdwNl(source.slice(b.start, b.end));
+  /** @type {any[] | null} */
+  let nodes = null;
+  let why = b.fixed ? b.reason : undefined;
+  /** @type {Record<string, any> | undefined} */
+  let opts;
+  if (!b.fixed) {
+    try {
+      const d = parse(text);
+      opts = mdwStyleOf(text, b.kind);
+      const out = mdwKeepTableDelimiters(mdwSerializerFor(mw, ctx, opts)(d).replace(/\n$/, ''), text);
+      if (out === text && d.childCount > 0) {
+        nodes = [];
+        d.forEach((/** @type {any} */ n) => nodes?.push(n));
+      } else {
+        why = 'round trip';
+        if (stats.fails.length < 50) stats.fails.push({ kind: b.kind, text: text.slice(0, 200), out: out.slice(0, 200) });
+      }
+    } catch (err) {
+      why = `parse error ${mdErrorMessage(err)}`;
+    }
+  }
+  if (nodes) stats.editable++;
+  else {
+    stats.raw++;
+    nodes = [schema.nodes.fs_raw.create({ kind: b.kind }, text ? schema.text(text) : null)];
+  }
+  return { start: b.start, end: b.end, kind: b.kind, opts, nodes, raw: why !== undefined, ...(why === undefined ? {} : { why }) };
+}
+
+/**
+ * Makes the items the editor's document (one transaction) and returns the model.
+ * @param {any} ctx
+ * @param {MdwModules} mw
+ * @param {string} source
+ * @param {string} eol
+ * @param {MdwItem[]} items
+ * @param {NonNullable<MdwModel['stats']>} stats
+ * @returns {MdwModel}
+ */
+function mdwApplyItems(ctx, mw, source, eol, items, stats) {
+const { editorViewCtx, schemaCtx } = mw.core;
+const schema = ctx.get(schemaCtx);
+const all = items.flatMap((i) => i.nodes);
+if (!all.length) all.push(schema.nodes.paragraph.create());
+const view = ctx.get(editorViewCtx);
+// The whole document is replaced by one transaction (not a new EditorState): the plugin views of the editor (cursor,
+// tooltips, ...) stay, so the focus and the toolbar are not lost on a reload. The nodes keep their identity.
+mdw.loading = true;
+try {
+  view.dispatch(view.state.tr.replaceWith(0, view.state.doc.content.size, all).setMeta('addToHistory', false));
+} finally {
+  mdw.loading = false;
+}
+return { source, eol, items, stats, loadedDoc: view.state.doc };
 }
 
 /**
@@ -11333,6 +11463,9 @@ function mdwComputeEdits(editor, mw, model) {
         if (oldTo - oldFrom === 1 && nodes.length === 1 && nodes[0].type.name === 'table') {
           text = mdwKeepTableDelimiters(text, src.slice(model.items[oldFrom].start, model.items[oldFrom].end).replace(/\r\n?/g, '\n'));
         }
+        if (oldTo - oldFrom === 1 && nodes.length === 1 && nodes[0].type.name === 'heading' && emitOpts && emitOpts.setext) {
+          text = mdwKeepSetextUnderline(text, src.slice(model.items[oldFrom].start, model.items[oldFrom].end).replace(/\r\n?/g, '\n'));
+        }
         text = text.replace(/\n/g, eol);
         if (oldTo > oldFrom) {
           let start = model.items[oldFrom].start;
@@ -11345,8 +11478,19 @@ function mdwComputeEdits(editor, mw, model) {
             // Never let a changed block merge with a neighbour that follows / precedes it without a blank line.
             const lazy = (/** @type {MdwItem | undefined} */ it) => !!it && /^(paragraph|blockquote|bullet_list|ordered_list|gap)$/.test(it.kind || '');
             const blank = /\r?\n[ \t]*\r?\n/;
-            const head = prev && !blank.test(src.slice(model.items[prev.ii].end, start)) && (nodes[0].type.name === 'paragraph' || lazy(model.items[prev.ii])) ? eol : '';
-            const tail = a && !blank.test(src.slice(end, model.items[a.ii].start)) && nodes[nodes.length - 1].type.name === 'paragraph' ? eol : '';
+            // (0.2.1, B7) The author's separator stays: a blank line is added only where the blocks could merge. An ATX heading
+            // and a fenced code block start a new block even right after a paragraph line, so none is added next to them.
+            const head =
+              prev && !blank.test(src.slice(model.items[prev.ii].end, start)) && (nodes[0].type.name === 'paragraph' || lazy(model.items[prev.ii])) && !mdwStartsBlockNode(nodes[0], emitOpts)
+                ? eol
+                : '';
+            const tail =
+              a &&
+              !blank.test(src.slice(end, model.items[a.ii].start)) &&
+              nodes[nodes.length - 1].type.name === 'paragraph' &&
+              !mdwStartsBlockText(src.slice(model.items[a.ii].start, model.items[a.ii].end))
+                ? eol
+                : '';
             emit(start, end, head + text + tail, nodes, head.length, text.length);
           }
         } else if (nodes.length) {
@@ -11383,6 +11527,40 @@ function mdwApplyEdits(source, edits) {
   for (const e of [...edits].sort((a, b) => b.start - a.start)) {
     if (out.slice(e.start, e.end) !== e.oldText) throw new Error(`oldText mismatch at ${e.start}`);
     out = out.slice(0, e.start) + e.text + out.slice(e.end);
+  }
+  return out;
+}
+
+/**
+ * (0.2.1, B3) Edits made on `oldSource`, moved onto `newSource` (the file after a change that came from elsewhere, for example
+ * an undo). Only when every edit lies clearly before or clearly after the one region where the two texts differ (not
+ * touching it) and its old text is found at the moved place; otherwise null (the caller drops the typing and says so).
+ * @param {string} oldSource
+ * @param {string} newSource
+ * @param {MdTextEdit[]} edits
+ * @returns {MdTextEdit[] | null}
+ */
+function mdwRebaseEdits(oldSource, newSource, edits) {
+  if (!edits.length) return null; // nothing to move (the host refuses an empty list)
+  const max = Math.min(oldSource.length, newSource.length);
+  let p = 0;
+  while (p < max && oldSource.charCodeAt(p) === newSource.charCodeAt(p)) p++;
+  while (p > 0 && (mdwIsLow(oldSource.charCodeAt(p)) || (oldSource.charCodeAt(p) === 10 && oldSource.charCodeAt(p - 1) === 13))) p--;
+  let s = 0;
+  while (s < max - p && oldSource.charCodeAt(oldSource.length - 1 - s) === newSource.charCodeAt(newSource.length - 1 - s)) s++;
+  while (s > 0 && (mdwIsLow(oldSource.charCodeAt(oldSource.length - s)) || (oldSource.charCodeAt(oldSource.length - s) === 10 && oldSource.charCodeAt(oldSource.length - s - 1) === 13))) s--;
+  const regionEnd = oldSource.length - s;
+  const delta = newSource.length - oldSource.length;
+  /** @type {MdTextEdit[]} */
+  const out = [];
+  for (const e of edits) {
+    /** @type {MdTextEdit} */
+    let moved;
+    if (e.end < p) moved = e;
+    else if (e.start > regionEnd) moved = { ...e, start: e.start + delta, end: e.end + delta };
+    else return null;
+    if (moved.start < 0 || newSource.slice(moved.start, moved.end) !== moved.oldText) return null;
+    out.push(moved);
   }
   return out;
 }
@@ -11445,6 +11623,7 @@ function mdwLineOfOffset(source, offset) {
  * @property {typeof import('@milkdown/kit/prose/state')} proseState
  * @property {typeof import('@milkdown/kit/plugin/history')} history
  * @property {typeof import('@milkdown/kit/plugin/trailing')} trailing
+ * @property {typeof import('@milkdown/kit/preset/commonmark')} commonmark
  * @property {typeof import('@milkdown/kit/plugin/upload')} upload
  * @property {typeof import('remark-stringify')} remarkStringify
  * @property {typeof import('remark-gfm')} remarkGfm
@@ -11477,11 +11656,12 @@ function mdwLoad() {
       import('@milkdown/kit/plugin/upload'),
       import('remark-stringify'),
       import('remark-gfm'),
+      import('@milkdown/kit/preset/commonmark'),
     ]).then(
       ([builder, listItem, linkTooltip, toolbar, table, cursor, blockEdit, placeholder, core, transformer, utils,
-        proseState, history, trailing, upload, remarkStringify, remarkGfm]) => ({
+        proseState, history, trailing, upload, remarkStringify, remarkGfm, commonmark]) => ({
         builder, listItem, linkTooltip, toolbar, table, cursor, blockEdit, placeholder, core, transformer, utils,
-        proseState, history, trailing, upload, remarkStringify, remarkGfm,
+        proseState, history, trailing, upload, remarkStringify, remarkGfm, commonmark,
       }),
       (err) => {
         mdwLoading = null; // allow a retry
@@ -11500,6 +11680,17 @@ function mdwLoad() {
 // Ctrl/Cmd+S flush, then ask the host (`command`) to run VS Code's undo / redo / save after the queued edit.
 
 const MD_WYSIWYG_FLUSH_MS = 400;
+/** (0.2.1, B2) Building a big document runs in steps of about this long, so the page stays alive and shows its progress. */
+const MD_WYSIWYG_STEP_MS = 40;
+/** The first step puts this many nodes into the editor (then the size follows the time of the last step). */
+const MD_WYSIWYG_STEP_NODES = 60;
+/**
+ * (0.2.1, B2) Above this weight of the document (see markdownWeight in the host; a paragraph is 1, a table row about 1.5) the editor
+ * is made lighter: the browser's own caret instead of the editor's virtual cursor (it measures the layout of the whole page
+ * after every key) and no heading-id pass over the whole document on every key. Typing stays fast; only the drop line of a
+ * dragged block and the caret between blocks (gap cursor) are given up.
+ */
+const MD_WYSIWYG_LITE_WEIGHT = 1500;
 /** An edit the host does not answer within this time is given up (the editor is reloaded from the source). */
 const MD_WYSIWYG_ANSWER_MS = 15_000;
 const MD_WYSIWYG_LOAD_FAILED = 'The WYSIWYG editor could not be loaded.';
@@ -11524,7 +11715,7 @@ const mdw = {
   /** The document version the model was made from / last accepted edit. */
   version: 0,
   nextEditId: 0,
-  /** @type {{ editId: number, next: MdwModel, timer: number } | null} */
+  /** `next` is null for typing moved onto a newer source (B3): the host's update then reloads the editor. @type {{ editId: number, next: MdwModel | null, timer: number } | null} */
   inflight: null,
   /** @type {(() => void)[]} */
   waiters: [],
@@ -11537,6 +11728,15 @@ const mdw = {
   session: 0,
   /** The document is being replaced by mdwLoadModel (not a change by the user). */
   loading: false,
+  /** (0.2.1, B3) A moved edit was accepted: the host's update (this version or newer) has not arrived, so the model is behind the file. No edit is sent meanwhile. */
+  awaitVersion: 0,
+  awaitTimer: 0,
+  /** (0.2.1) The session whose stepped load is running (an update during it must not restart it). */
+  loadingSession: 0,
+  /** (0.2.1, B2) The status text while a big document is built ("Loading the WYSIWYG editor… 40%"). */
+  progress: '',
+  /** The editor was made without the cursor feature and the heading-id pass (big document). */
+  lite: false,
 };
 
 /**
@@ -11548,7 +11748,9 @@ async function mdwEnter() {
   if (!frame) return;
   const session = ++mdw.session;
   mdw.failure = '';
+  mdw.progress = '';
   mdw.ready = false;
+  mdwEndAwait();
   mdShowStatus();
   /** @type {MdwModules} */
   let mw;
@@ -11566,7 +11768,22 @@ async function mdwEnter() {
   try {
     if (!mdw.editor) await mdwCreate(mw, frame, session);
     if (session !== mdw.session || mdState.mode !== 'wysiwyg') return;
-    const loaded = mdwLoadSource(mdState.source, mdx.blocks, mdx.eol);
+    const loadedSource = mdState.source;
+    mdw.loadingSession = session;
+    let loaded;
+    try {
+      loaded = await mdwLoadSourceSteps(loadedSource, mdx.blocks, mdx.eol, session);
+    } finally {
+      if (mdw.loadingSession === session) mdw.loadingSession = 0;
+    }
+    if (loaded === null) return; // left or replaced while it was built
+    const announce = mdw.progress !== '';
+    mdw.progress = '';
+    // (0.2.1) The file changed while the editor was being built (updates do not restart a running load): load once more.
+    if (loaded && mdState.source !== loadedSource) {
+      void mdwEnter();
+      return;
+    }
     if (!loaded) {
       mdFallbackToPreview(MD_WYSIWYG_CHANGED);
       return;
@@ -11575,6 +11792,7 @@ async function mdwEnter() {
     mdw.ready = true;
     mdwShow(true);
     mdwApplyReadonly();
+    if (announce) mdFlash('The WYSIWYG editor is ready.'); // the live region only said "Loading" before
     mdFrameRefresh();
     mdTocCurrentSoon();
   } catch (err) {
@@ -11600,9 +11818,14 @@ async function mdwCreate(mw, frame, session) {
     .addFeature(mw.linkTooltip.linkTooltip)
     .addFeature(mw.toolbar.toolbar)
     .addFeature(mw.table.table)
-    .addFeature(mw.cursor.cursor)
     .addFeature(mw.blockEdit.blockEdit)
     .addFeature(mw.placeholder.placeholder);
+  // (0.2.1, B2) A heavy document gets the lighter editor (see MD_WYSIWYG_LITE_WEIGHT): no virtual cursor, no heading-id pass.
+  const lite = (mdx.limits?.weight ?? 0) > MD_WYSIWYG_LITE_WEIGHT;
+  // The lite editor keeps the gap cursor and the drop indicator (keyboard access before / after a block at the edge); only the
+  // virtual cursor (the costly layout read per key) is off.
+  builder.addFeature(mw.cursor.cursor, lite ? { virtual: false } : undefined);
+  mdw.lite = lite;
   const editor = builder.editor;
   for (const plugin of mdwPlugins(mw, {
     onChange: mdwOnChange,
@@ -11615,6 +11838,7 @@ async function mdwCreate(mw, frame, session) {
   // line the user did not type. Nothing is uploaded: a dropped or pasted file is refused (mdwPlugins).
   await editor.remove(mw.history.history);
   await editor.remove(mw.trailing.trailing);
+  if (lite) await editor.remove(mw.commonmark.syncHeadingIdPlugin);
   editor.config((/** @type {any} */ ctx) =>
     ctx.update(mw.upload.uploadConfig.key, (/** @type {any} */ p) => ({
       ...p,
@@ -11639,7 +11863,7 @@ async function mdwCreate(mw, frame, session) {
   // itself there (the webview tests drive ProseMirror transactions through it). Without it nothing is exposed.
   const testHooks = /** @type {any} */ (globalThis).__fsTestHooks;
   if (testHooks && typeof testHooks === 'object') {
-    testHooks.mdw = { mw, editor: builder.editor, state: mdw, computeEdits: () => mdwComputeEdits(builder.editor, mw, /** @type {MdwModel} */ (mdw.model)) };
+    testHooks.mdw = { mw, editor: builder.editor, state: mdw, rebase: mdwRebaseEdits, computeEdits: () => mdwComputeEdits(builder.editor, mw, /** @type {MdwModel} */ (mdw.model)) };
   }
   // Keys, composition, links and focus: on the holder, in the capture phase where VS Code must not see the key.
   listen(holder, 'keydown', mdwOnKeyDown, true);
@@ -11675,6 +11899,58 @@ function mdwLoadSource(source, blocks, eol) {
   const view = editor.action((/** @type {any} */ ctx) => ctx.get(mw.core.editorViewCtx));
   const before = view.state.selection.from;
   const model = mdwLoadModel(editor, mw, source, blocks, eol);
+  return mdwAcceptLoad(mw, editor, view, model, before);
+}
+
+/**
+ * (0.2.1, B2) mdwLoadSource in steps with a progress text (the entry of the editor; a reload after an edit stays in one step).
+ * @param {string} source
+ * @param {MdSourceBlock[]} blocks
+ * @param {string} eol
+ * @param {number} session the entry this load belongs to
+ * @returns {Promise<boolean | null>} null: stopped (the view was left or entered again)
+ */
+async function mdwLoadSourceSteps(source, blocks, eol, session) {
+  const mw = mdw.mw;
+  const editor = mdw.editor?.editor;
+  if (!mw || !editor) return false;
+  const view = editor.action((/** @type {any} */ ctx) => ctx.get(mw.core.editorViewCtx));
+  const before = view.state.selection.from;
+  let shown = -1;
+  const model = await mdwLoadModelSteps(
+    editor,
+    mw,
+    source,
+    blocks,
+    eol,
+    (done, total) => {
+      // Announced in steps of 10 %: the status line is a live region.
+      // Never 100 %: the blocks are built, but the nodes still go into the editor (a long step); the status ends when it is ready.
+      const percent = Math.min(90, Math.floor((done / Math.max(1, total)) * 10) * 10);
+      const inserting = done >= total;
+      const key = inserting ? -1 : percent;
+      if (key === shown) return;
+      shown = key;
+      mdw.progress = inserting
+        ? `Loading the WYSIWYG editor… ${percent}% (inserting the blocks)`
+        : `Loading the WYSIWYG editor… ${percent}% (${done.toLocaleString('en-US')} of ${total.toLocaleString('en-US')} blocks)`;
+      mdShowStatus();
+    },
+    () => session === mdw.session && mdState.mode === 'wysiwyg' && mdFrame !== null,
+  );
+  if (!model) return null;
+  return mdwAcceptLoad(mw, editor, view, model, before);
+}
+
+/**
+ * The self-check after a load (no edit may come out of a document that was not touched), then the caret goes back.
+ * @param {MdwModules} mw
+ * @param {any} editor
+ * @param {any} view
+ * @param {MdwModel} model
+ * @param {number} before the caret before the load
+ */
+function mdwAcceptLoad(mw, editor, view, model, before) {
   const { edits } = mdwComputeEdits(editor, mw, model);
   if (edits.length) {
     logError(`WYSIWYG self-check failed: ${edits.length} edit(s) right after the load: ${JSON.stringify(edits[0]).slice(0, 300)}`);
@@ -11729,7 +12005,7 @@ function mdwSchedule() {
 async function mdwFlush() {
   window.clearTimeout(mdw.timer);
   for (let round = 0; round < 20; round++) {
-    if (mdw.inflight) await new Promise((resolve) => mdw.waiters.push(() => resolve(undefined)));
+    while (mdw.inflight || mdw.awaitVersion) await new Promise((resolve) => mdw.waiters.push(() => resolve(undefined)));
     if (!mdw.ready || mdw.readonly || mdw.composing) return;
     if (!mdwSendPending()) return;
   }
@@ -11740,7 +12016,7 @@ function mdwSendPending() {
   const mw = mdw.mw;
   const editor = mdw.editor?.editor;
   const model = mdw.model;
-  if (!mw || !editor || !model || mdw.inflight) return false;
+  if (!mw || !editor || !model || mdw.inflight || mdw.awaitVersion) return false;
   let result;
   try {
     result = mdwComputeEdits(editor, mw, model);
@@ -11772,13 +12048,38 @@ function mdwOnEditResult(msg) {
   const inflight = mdw.inflight;
   if (!inflight || inflight.editId !== msg.editId) return;
   if (msg.accepted) {
-    mdw.model = inflight.next;
+    if (inflight.next) mdw.model = inflight.next;
+    else if (mdState.version < msg.version) mdwBeginAwait(msg.version);
     mdw.version = msg.version;
     mdwEditDone(true);
   } else {
     log('info', `WYSIWYG edit refused (${msg.code}): ${msg.reason}`);
     mdwEditDone(false, msg.reason);
   }
+}
+
+/**
+ * (0.2.1, B3) After a moved edit the file has the typing but the model does not: until the host's update has reloaded the editor
+ * no new edit is built from the model (it would be placed at a shifted offset). If the update never comes, the wait ends.
+ * @param {number} version
+ */
+function mdwBeginAwait(version) {
+  mdwEndAwait();
+  mdw.awaitVersion = version;
+  mdw.awaitTimer = window.setTimeout(() => {
+    mdw.awaitTimer = 0;
+    mdwEndAwait(true);
+  }, MD_WYSIWYG_ANSWER_MS);
+}
+
+/** @param {boolean} [timedOut] */
+function mdwEndAwait(timedOut) {
+  window.clearTimeout(mdw.awaitTimer);
+  mdw.awaitTimer = 0;
+  if (!mdw.awaitVersion) return;
+  mdw.awaitVersion = 0;
+  if (timedOut) logError('The host did not send its update after an accepted edit');
+  for (const resolve of mdw.waiters.splice(0)) resolve();
 }
 
 /**
@@ -11824,9 +12125,24 @@ function mdwOnUpdate(msg) {
     return;
   }
   if (!mdw.ready) {
-    if (mdState.mode === 'wysiwyg') void mdwEnter(); // the blocks have just arrived
+    // The blocks have just arrived. A load that is running is not restarted (it would start from 0 at every update): when it
+    // ends, mdwEnter loads again if the file changed meanwhile.
+    if (mdState.mode === 'wysiwyg' && !mdw.loadingSession) void mdwEnter();
     return;
   }
+  if (mdw.awaitVersion && mdState.version >= mdw.awaitVersion) {
+    try {
+      mdwOnUpdateNow();
+    } finally {
+      mdwEndAwait(); // the waiting flushes go on after the editor shows the new text
+    }
+    return;
+  }
+  mdwOnUpdateNow();
+}
+
+/** The update of a ready editor (see mdwOnUpdate). */
+function mdwOnUpdateNow() {
   const model = mdw.model;
   if (model && model.source === mdState.source) {
     mdw.version = mdState.version;
@@ -11835,16 +12151,41 @@ function mdwOnUpdate(msg) {
   }
   const mw = mdw.mw;
   const editor = mdw.editor?.editor;
+  /** @type {MdTextEdit[]} */
+  let pending = [];
   let typed = false;
   try {
-    typed = !!(mw && editor && model && mdwComputeEdits(editor, mw, model).edits.length);
+    pending = mw && editor && model ? mdwComputeEdits(editor, mw, model).edits : [];
+    typed = pending.length > 0;
   } catch {
     typed = true;
   }
-  if (typed) mdFlash(MD_WYSIWYG_FILE_CHANGED);
+  // (0.2.1, B3) Typing made on the old text (for example in the moments after Ctrl+Z, before the undo reached the editor) is
+  // moved onto the new text when it does not touch the part that changed; every offset and old text is checked again here
+  // and by the host. Otherwise it is dropped, with a message (never written to the wrong place).
+  const moved = typed && model && !mdw.readonly && pending.length > 0 ? mdwRebaseEdits(model.source, mdState.source, pending) : null;
+  if (typed && !moved) mdFlash(MD_WYSIWYG_FILE_CHANGED);
   window.clearTimeout(mdw.timer);
   mdwReloadFromSource();
   mdwApplyReadonly();
+  if (moved && mdw.ready) mdwSendMoved(moved);
+}
+
+/**
+ * Sends typing that was moved onto the current source (see mdwOnUpdate). The editor shows the current source; when the host
+ * accepts, its update brings the text with the typing and the editor is reloaded from it.
+ * @param {MdTextEdit[]} edits
+ */
+function mdwSendMoved(edits) {
+  if (mdw.inflight || mdw.readonly) return;
+  const editId = ++mdw.nextEditId;
+  const timer = window.setTimeout(() => {
+    if (mdw.inflight?.editId !== editId) return;
+    logError(`WYSIWYG edit ${editId} was not answered by the host`);
+    mdwEditDone(false, 'The host did not answer; the editor was reloaded from the file.');
+  }, MD_WYSIWYG_ANSWER_MS);
+  mdw.inflight = { editId, next: null, timer };
+  post({ type: 'edit', editId, baseVersion: mdw.version, intent: { kind: 'mdText', edits } });
 }
 
 /** The edit state changed (settings, read-only, the save check finished): read-only or editable, or back to Preview. */

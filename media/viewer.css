@@ -2415,8 +2415,16 @@ body.vscode-high-contrast-light .docx-view .docx-page mark {
   min-height: 0;
 }
 @media (max-width: 480px) {
+  /* Hidden to the eye, still in the accessibility tree: the status is a live region (progress, read-only, failures). */
   .md-status {
-    display: none;
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
 }
 

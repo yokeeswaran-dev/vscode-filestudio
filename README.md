@@ -148,8 +148,12 @@ No. Everything runs on your computer: no telemetry, no uploads. Links open only 
 - In `.xlsx`, you can change cell values and formulas only: not rows, columns, sheets or cell formatting.
 - Cut (Ctrl+X) is not available in the grid: use Copy and then Delete.
 - If you close a tab while a cell is still open for typing, the text in that cell is not kept. Press Enter first.
-- Very large Markdown files (thousands of blocks, especially many tables and lists) are slow in WYSIWYG mode. Use Split
-  for those.
+- Very large Markdown files are slow to open in WYSIWYG mode (a Loading message with a percentage is shown while the
+  editor is built). WYSIWYG is turned off above 200,000 characters, 3,000 blocks, or a weight of 10,000 points (a
+  paragraph counts 1, a table row about 1.5, a list line 1): use Split for those. Above about 1,500 points the editor
+  uses the browser's own text caret and shows no drop line when you drag a block, to keep typing fast.
+- In Markdown WYSIWYG mode, a file whose line breaks are only carriage returns (old Mac-style files) cannot be edited:
+  the change is refused ("could not read this change") and nothing is written. Use Split.
 - In Markdown WYSIWYG mode, raw HTML, front matter and some special blocks are shown as protected blocks. You edit
   them as plain Markdown text.
 - Charts and pivot tables in `.xlsx`, and video and animations in `.pptx`, are not shown yet.

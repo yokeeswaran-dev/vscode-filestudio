@@ -132,6 +132,27 @@ test('more than 3,000 blocks: limits.wysiwyg false', async () => {
   assert.equal(opened.document.getText(), text);
 });
 
+test('too heavy: tables and lists count more than paragraphs; over the weight limit limits.wysiwyg is false (0.2.1, B2)', async () => {
+  const table = (i) => `| a | b |\n| - | - |\n| ${i} | x |\n| y | z |`;
+  const text = Array.from({ length: 1400 }, (_, i) => table(i)).join('\n\n') + '\n'; // 1,400 blocks (under 3,000), 5,600 lines
+  assert.ok(text.length < 200_000);
+  const opened = await openMd('heavy.md', text);
+  assert.equal(opened.init.limits.wysiwyg, false);
+  assert.ok(opened.init.limits.weight > 10_000, `weight ${opened.init.limits.weight}`);
+  assert.match(opened.init.limits.reason, /too heavy for WYSIWYG.*10,000.*Use Split/);
+  const edit = await sendEdit(opened, '| 1 |', '| 2 |');
+  assert.deepEqual([edit.accepted, edit.code], [false, 'blocked']);
+  assert.equal(opened.document.getText(), text);
+});
+
+test('a document under the weight limit: the WYSIWYG answer carries the weight (the editor opens lighter above 1,500)', async () => {
+  const text = Array.from({ length: 600 }, (_, i) => `p${i}`).join('\n\n') + '\n';
+  const opened = await openMd('light.md', text);
+  const update = await setMode(opened, 'wysiwyg');
+  assert.deepEqual(update.limits, { wysiwyg: true, weight: 600 });
+  assert.equal(update.blocks.length > 0, true);
+});
+
 test('defaultMode wysiwyg: the init already carries the blocks and no html', async () => {
   T.config.set('fileStudio.markdown.defaultMode', 'wysiwyg');
   const uri = writeTmp('dm.md', DOC);

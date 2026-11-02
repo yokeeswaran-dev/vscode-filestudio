@@ -7,6 +7,19 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Changed
+
+#### Markdown
+
+- WYSIWYG on big documents: a Loading message with a percentage while the editor is built (the page stays
+  responsive), a lighter caret above about 1,500 weight points (typing stays under 30 ms up to about 3,000 mixed
+  blocks), and a new limit of 10,000 weight points (tables and lists count more than paragraphs) above which Split
+  is used.
+- WYSIWYG keeps your typing when it is made right after Ctrl+Z, if it does not touch the text that the undo changed.
+  Typing that does touch it is still dropped with a message.
+- WYSIWYG no longer adds a blank line next to a heading or a code fence that had none, and a setext heading keeps
+  its `=====` / `-----` underline.
+
 ## [0.2.0] - 2026-11-01
 
 ### Added

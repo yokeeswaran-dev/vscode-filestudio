@@ -1666,6 +1666,36 @@ export function markdownBlocks(source: string, opts?: { contextCheck?: boolean }
   return out;
 }
 
+/**
+ * WYSIWYG is not offered above this weight (v0.2.1, B2): the editor's cost grows with the weight of the document, not only the
+ * block count. A mixed document of about 3,000 blocks is over it; Split (VS Code's own editor beside the preview) is the way
+ * to edit such a file.
+ */
+export const MD_WEIGHT_LIMIT = 10_000;
+
+/**
+ * How costly the WYSIWYG editor finds a document (v0.2.1, B2): the sum of a weight per top-level block. A paragraph, a heading
+ * and a rule cost 1; a quote 1 + half a line; a list 1 + one per line; a table 2 + 1.5 per line (rows are cells, each cell an
+ * editor node); a code block 1 + 0.2 per line; a protected (fixed) block, shown as plain text, 0.5; a gap 0.2; a very long
+ * paragraph adds 1 per 500 characters. Rounded to a whole number. The host uses it for the limit; the webview gets the total
+ * (`limits.weight`) to decide how to open the editor (Loading steps, a lighter caret).
+ */
+export function markdownWeight(source: string, blocks: MdBlock[]): number {
+  let weight = 0;
+  for (const block of blocks) {
+    const lines = Math.max(1, block.endLine - block.line + 1);
+    if (block.kind === 'gap') weight += 0.2;
+    else if (block.fixed) weight += 0.5;
+    else if (block.kind === 'table') weight += 2 + 1.5 * lines;
+    else if (block.kind === 'bullet_list' || block.kind === 'ordered_list') weight += 1 + lines;
+    else if (block.kind === 'blockquote') weight += 1 + 0.5 * lines;
+    else if (block.kind === 'fence') weight += 1 + 0.2 * lines;
+    else weight += 1 + Math.floor(Math.max(0, block.end - block.start - 500) / 500);
+  }
+  void source;
+  return Math.round(weight);
+}
+
 const isHighSurrogate = (c: number): boolean => c >= 0xd800 && c <= 0xdbff;
 const isLowSurrogate = (c: number): boolean => c >= 0xdc00 && c <= 0xdfff;
 

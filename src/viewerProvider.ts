@@ -46,7 +46,7 @@ import {
   type GridSource,
   type WorkbookModel,
 } from './renderers/sheet';
-import { applyMdTextEdits, markdownBlocks, markdownHeadings, renderMarkdown, verifyMdEdit, type RenderResult } from './renderers/markdown';
+import { applyMdTextEdits, markdownBlocks, markdownHeadings, markdownWeight, MD_WEIGHT_LIMIT, renderMarkdown, verifyMdEdit, type RenderResult } from './renderers/markdown';
 import { renderDocx, type DocxResult } from './renderers/docx';
 import { checkPdf, PDF_HEADER_SEARCH_BYTES } from './renderers/pdf';
 import { renderPptx, type PptxDocument as PptxDeck } from './renderers/pptx';
@@ -139,8 +139,8 @@ export type HostMessage =
       blocks?: MdBlock[];
       /** (v0.2.0, P6) Line break of the document. */
       eol?: '\n' | '\r\n';
-      /** (v0.2.0, P6) Whether WYSIWYG can be used for this document (and why not). */
-      limits?: { wysiwyg: boolean; reason?: string };
+      /** (v0.2.0, P6) Whether WYSIWYG can be used for this document (and why not). `weight` (0.2.1): how costly the editor finds it. */
+      limits?: { wysiwyg: boolean; reason?: string; weight?: number };
       /** (v0.2.0, P6) Webview URI base for relative resources in WYSIWYG mode. */
       resourceBase?: string;
     }
@@ -4623,6 +4623,8 @@ function resolveMarkdownResource(href: string, documentUri: vscode.Uri, webview:
 const MD_WYSIWYG_MAX_CHARS = 200_000;
 const MD_WYSIWYG_MAX_BLOCKS = 3_000;
 const MD_TOO_LARGE = 'This file is too large for WYSIWYG editing. Use Split to edit the Markdown source.';
+/** (0.2.1, B2) Above the weight limit (tables and lists count more than paragraphs, see markdownWeight) WYSIWYG is off too. */
+const MD_TOO_HEAVY = `This file is too heavy for WYSIWYG editing (limit ${MD_WEIGHT_LIMIT.toLocaleString('en-US')} weight points: a paragraph is 1, a table row about 1.5). Use Split to edit the Markdown source.`;
 const MD_OTHER_PARTS = 'This change would also change other parts of the file; it was not applied.';
 /** Our own `revealRange` and the scroll events it causes (Split) are ignored for this long. */
 const MD_REVEAL_ECHO_MS = 150;
@@ -4754,11 +4756,12 @@ async function markdownEditState(document: vscode.TextDocument): Promise<EditSta
 }
 
 /** Whether WYSIWYG can be used for `source` (size limits only; `blockCount` when known). */
-function mdLimitsOf(source: string, blockCount?: number): { wysiwyg: boolean; reason?: string } {
+function mdLimitsOf(source: string, blockCount?: number, weight?: number): { wysiwyg: boolean; reason?: string; weight?: number } {
   if (source.length > MD_WYSIWYG_MAX_CHARS || (blockCount !== undefined && blockCount > MD_WYSIWYG_MAX_BLOCKS)) {
     return { wysiwyg: false, reason: MD_TOO_LARGE };
   }
-  return { wysiwyg: true };
+  if (weight !== undefined && weight > MD_WEIGHT_LIMIT) return { wysiwyg: false, reason: MD_TOO_HEAVY, weight };
+  return weight === undefined ? { wysiwyg: true } : { wysiwyg: true, weight };
 }
 
 /** Whether the edit state allows showing the WYSIWYG editor (read-only while the save check is open: "Edit anyway"). */
@@ -4796,7 +4799,7 @@ class MarkdownView {
   private mode: MarkdownMode;
   private readonly docState: MdDocState;
   /** The size limits of the last rendering (an edit is refused when WYSIWYG is not allowed for the document any more). */
-  private limits: { wysiwyg: boolean; reason?: string } = { wysiwyg: true };
+  private limits: { wysiwyg: boolean; reason?: string; weight?: number } = { wysiwyg: true };
   /** Split: the text editor the user scrolled last, and when we revealed a line ourselves (echo guard). */
   private lastUserEditor: vscode.TextEditor | undefined;
   private lastReveal = 0;
@@ -4888,7 +4891,7 @@ class MarkdownView {
       const countBlocks = this.mode === 'wysiwyg' || this.document.lineCount > MD_WYSIWYG_MAX_BLOCKS;
       if (limits.wysiwyg && countBlocks) {
         blocks = markdownBlocks(source, { contextCheck: this.mode === 'wysiwyg' });
-        limits = mdLimitsOf(source, blocks.filter((block) => block.kind !== 'gap').length);
+        limits = mdLimitsOf(source, blocks.filter((block) => block.kind !== 'gap').length, markdownWeight(source, blocks));
         if (!limits.wysiwyg) blocks = undefined;
       }
       if (this.mode === 'wysiwyg' && !(limits.wysiwyg && mdWysiwygShown(this.editState))) {
@@ -5098,7 +5101,7 @@ class MarkdownView {
     }
     const text = document.getText();
     if (text.length > MD_WYSIWYG_MAX_CHARS || !this.limits.wysiwyg) {
-      this.rejectMdEdit(msg, 'blocked', MD_TOO_LARGE, true);
+      this.rejectMdEdit(msg, 'blocked', text.length > MD_WYSIWYG_MAX_CHARS ? MD_TOO_LARGE : (this.limits.reason ?? MD_TOO_LARGE), true);
       return;
     }
     for (const edit of edits) {
@@ -5337,7 +5340,7 @@ interface MdPayload {
   version: number;
   blocks?: MdBlock[];
   eol: '\n' | '\r\n';
-  limits: { wysiwyg: boolean; reason?: string };
+  limits: { wysiwyg: boolean; reason?: string; weight?: number };
   resourceBase?: string;
 }
 
