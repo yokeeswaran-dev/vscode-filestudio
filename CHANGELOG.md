@@ -7,6 +7,22 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+#### Delimited text (`.csv`, `.tsv`, `.psv`, `.ssv`)
+
+- You can now **edit delimited text files in the grid**: type, F2 or double-click, Delete, and paste a block from
+  Excel or a text table (one undo step). Right-click a cell, a row header or a column header to **insert or delete
+  rows and columns**, clear contents or **sort** (row 1 is the header and stays on top). **Find and Replace**: Ctrl+F,
+  Ctrl+H, F3, Enter and Esc. Undo, Redo, Save and Revert work as in any VS Code editor, and several editors of the same
+  file (Split Editor, a text editor beside the grid) stay in step.
+- Only what you edit changes in the file: other lines, quotes, line endings and a BOM stay as they are. What you type is
+  saved as text (`=1+1` stays text).
+- A file that VS Code would save differently (for example mixed line endings from Excel) asks first: **Edit anyway**.
+  A file with a wrong encoding, a quote that is never closed, or a size over 50 MB is not edited in the grid.
+  Columns of a file split on spaces cannot be inserted or deleted.
+- New setting **FileStudio > Csv > Editing** (on by default); **FileStudio > Editing: Enabled** turns all editing off.
+
 ### Changed
 
 #### Markdown

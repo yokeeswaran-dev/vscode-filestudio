@@ -8,10 +8,14 @@ const path = require('node:path');
 const ROOT = path.join(__dirname, '..', '..');
 const read = (f) => fs.readFileSync(path.join(ROOT, f), 'utf8');
 
-test('settings: no CSV editing setting and no promise of CSV editing in package.json', () => {
+test('settings (0.2.1): the CSV editing setting exists, is on by default and is described like the other format switches', () => {
   const props = JSON.parse(read('package.json')).contributes.configuration.properties;
-  assert.equal(props['fileStudio.csv.editing'], undefined, 'CSV stays view-only in 0.2.0');
-  for (const [key, p] of Object.entries(props)) assert.doesNotMatch(p.description || '', /csv|tsv|psv|ssv/i, key);
+  const csv = props['fileStudio.csv.editing'];
+  assert.ok(csv, 'CSV editing is on in 0.2.1');
+  assert.equal(csv.type, 'boolean');
+  assert.equal(csv.default, true);
+  assert.equal(csv.scope, 'resource');
+  assert.match(csv.description, /fileStudio\.editing\.enabled/);
 });
 
 test('README: the roadmap names no version for features that are not in 0.2.0', () => {

@@ -2443,6 +2443,44 @@ function buildSpaceSsv() {
   return toAligned(rows, { align: ['right', 'left', 'left', 'left', 'left', 'right', 'left'], newline: '\n' });
 }
 
+// ----- csv edit fixtures -----
+
+/**
+ * (v0.2.0, CSV editing) Small delimited files whose exact bytes the CSV edit tests need, in test/samples/csv-edit/
+ * (a sub-folder: the F5 workspace root and the "open every sample" integration suite stay as they are). Written as
+ * literal text so every byte is visible here:
+ *   ragged.csv            rows of different lengths, blank lines, two trailing blank records, LF
+ *   mixed-eol.csv         CRLF records, an LF inside a quoted cell (as Excel writes it) and one LF record end
+ *   cr-only.csv           classic-Mac CR line breaks (also one inside a quoted cell)
+ *   no-final-newline.csv  CRLF, the last record has no line break
+ *   quote-all.csv         every field quoted (also numbers and empty fields), CRLF
+ *   decimal-comma.csv     ';' delimiter, decimal commas, text quoted and numbers not, LF
+ *   sep-line.csv          Excel's 'sep=;' first line, decimal commas, CRLF
+ *   bom.csv               UTF-8 BOM, LF
+ *   double-bom.csv        two UTF-8 BOMs (VS Code removes one; the other stays in A1)
+ *   latin1.csv            Latin-1 bytes (not valid UTF-8: VS Code shows U+FFFD, editing is blocked)
+ *   unclosed-quote.csv    a quote that never closes (editing is blocked)
+ *   space.ssv             space separated: aligned columns, "quoted fields", "" empty fields, a blank line, leading
+ *                         and trailing spaces, LF
+ */
+function csvEditFixtures() {
+  const utf8 = (text) => Buffer.from(text, 'utf8');
+  return [
+    ['csv-edit/ragged.csv', utf8('id,name,city,score\n1,Ann\n2,Bob,Oslo,7,extra,more\n\n3\n,,\n4,"Di, Jr.",Rome,9\n\n\n')],
+    ['csv-edit/mixed-eol.csv', utf8('id,note,n\r\n1,"line one\nline two",3\r\n2,plain,4\n3,"x\r\ny",5\r\n4,last,6\r\n')],
+    ['csv-edit/cr-only.csv', utf8('a,b,c\r1,2,3\r"x\ry",5,6\r7,8,9\r')],
+    ['csv-edit/no-final-newline.csv', utf8('h1,h2,h3\r\nx,y,z\r\nlast,row,end')],
+    ['csv-edit/quote-all.csv', utf8('"id","name","amount","note"\r\n"1","Ann","10.5","say ""hi"""\r\n"2","Bob","7",""\r\n"3","Cy","8,25","a, b"\r\n')],
+    ['csv-edit/decimal-comma.csv', utf8('"Produit";"Prix";"Quantité";"Remarque"\n"Pain";1,25;3;"frais"\n"Lait";0,99;12;""\n"Café";7,5;1;"moulu; fin"\n"Sel";2;0;"x"\n')],
+    ['csv-edit/sep-line.csv', utf8('sep=;\r\nA;B;C\r\n1,5;x;"y;z"\r\n2,25;;\r\n')],
+    ['csv-edit/bom.csv', utf8('\uFEFFname,value\nalpha,1\nbeta,2\n')],
+    ['csv-edit/double-bom.csv', utf8('\uFEFF\uFEFFa,b\n1,2\n')],
+    ['csv-edit/latin1.csv', Buffer.from('nom,ville,prix\nRené,Zürich,"3,50"\nFrançois,Besançon,4\n', 'latin1')],
+    ['csv-edit/unclosed-quote.csv', utf8('h1,h2\nx,"never closes\nmore,text\n')],
+    ['csv-edit/space.ssv', utf8('name   age  city\nAnn    31   Oslo\n"Bo B" 40   "New York"\n  Cy   22   Lima  \n""     50   Kyiv\n\nDi     ""   Rome\n')],
+  ];
+}
+
 // ===== DOCX: XML HELPERS =====
 
 const XML_DECLARATION = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n';
@@ -4721,6 +4759,7 @@ async function main() {
   await step('sample.psv', buildSamplePsv);
   await step('sample.ssv', buildSampleSsv);
   await step('sample-space.ssv', buildSpaceSsv);
+  for (const [file, data] of csvEditFixtures()) await step(file, () => data);
   await step('sample.docx', () => generateDocx(images));
   await step('sample.pdf', generatePdf);
   await step('sample.pptx', generatePptx);

@@ -157,6 +157,8 @@ class FileSystemError extends Error {
     return new FileSystemError(`Unable to read file '${uri}' (Error: Unable to resolve nonexistent file '${uri}')`, 'FileNotFound');
   }
 }
+const LF = String.fromCharCode(10);
+const ProgressLocation = { SourceControl: 1, Window: 10, Notification: 15 };
 const FileType = { Unknown: 0, File: 1, Directory: 2, SymbolicLink: 64 };
 // enums the F code uses.
 const ExtensionMode = { Production: 1, Development: 2, Test: 3 };
@@ -292,6 +294,7 @@ class FakeTextDocument {
     this.isDirty = false;
     this.eol = text.includes('\r\n') ? EndOfLine.CRLF : EndOfLine.LF;
     this.encoding = 'utf8';
+    this.languageId = 'plaintext';
   }
   /** Position of an offset (\n, \r\n and \r each count as one line break, like VS Code). */
   positionAt(offset) {
@@ -317,8 +320,9 @@ class FakeTextDocument {
     this.isDirty = false;
     return true;
   }
-  getText() {
-    return this.text;
+  /** vscode.TextDocument.getText(range?): the whole text, or the text between two positions. */
+  getText(range) {
+    return range ? this.text.slice(this.offsetAt(range.start), this.offsetAt(range.end)) : this.text;
   }
   get lineCount() {
     return this.text.split('\n').length;
@@ -438,6 +442,8 @@ function createPanel(viewColumn = 1) {
     },
     onDidDispose: onDispose.event,
     onDidChangeViewState: onViewState.event,
+    /** Test helper: VS Code tells the panel that it was shown / hidden (set `visible` first). */
+    fireViewState: () => onViewState.fire({ webviewPanel: panel }),
     /** Test helper: a message from the webview. */
     send: (msg) => onMessage.fire(msg),
     dispose: () => onDispose.fire(),
@@ -478,6 +484,11 @@ const window = {
   },
   tabGroups,
   activeTextEditor: undefined,
+  /** (v0.2.0) Runs the task at once; records the title (and location) for assertions. */
+  withProgress: async (options, task) => {
+    record('withProgress', options.title, options.location);
+    return task({ report() {} }, { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) });
+  },
   /** TextEditors VS Code shows: { document, visibleRanges, revealRange(range, type) }. */
   visibleTextEditors: [],
   onDidChangeTextEditorVisibleRanges: onDidChangeVisibleRanges.event,
@@ -516,15 +527,41 @@ const workspace = {
   getWorkspaceFolder: (uri) => workspaceFolders.find((f) => uri.path.toLowerCase().startsWith(`${f.uri.path.toLowerCase()}/`)),
   applyEdit: async (edit) => {
     record('applyEdit', edit.edits.map((e) => [e.range.start.line, e.range.start.character, e.range.end.line, e.range.end.character, e.text]));
+    // Like VS Code: every range is a position in the document BEFORE the edit; one call = one version bump.
+    const byDocument = new Map();
     for (const e of edit.edits) {
-      const document = textDocuments.get(e.uri.toString());
-      const text = document.getText();
-      const from = document.offsetAt(e.range.start);
-      const to = document.offsetAt(e.range.end);
-      document.setText(text.slice(0, from) + e.text + text.slice(to), true);
+      const key = e.uri.toString();
+      if (!byDocument.has(key)) byDocument.set(key, []);
+      byDocument.get(key).push(e);
+    }
+    for (const [key, edits] of byDocument) {
+      const document = textDocuments.get(key);
+      let text = document.getText();
+      const spans = edits.map((e) => ({ from: document.offsetAt(e.range.start), to: document.offsetAt(e.range.end), text: e.text }));
+      spans.sort((a, b) => b.from - a.from || b.to - a.to);
+      for (const e of spans) text = text.slice(0, e.from) + e.text + text.slice(e.to);
+      document.isDirty = true;
+      document.setText(text);
     }
     return true;
   },
+  /** (v0.2.0) workspace.save(uri): writes the document to its file and makes it clean. */
+  save: async (uri) => {
+    record('save', uri.fsPath);
+    const document = textDocuments.get(uri.toString());
+    if (document) {
+      fs.writeFileSync(uri.fsPath, document.getText());
+      document.isDirty = false;
+    }
+    return uri;
+  },
+  /** (v0.2.0) workspace.encode / decode (UTF-8 only; VS Code's text codec API). */
+  encode: async (text, options) => {
+    // windows1252 is approximated by Latin-1: a character above U+00FF becomes '?' (as VS Code does for a character it cannot hold)
+    if (options && options.encoding === 'windows1252') return new Uint8Array(Buffer.from(text.replace(/[^ -ÿ]/gu, '?'), 'latin1'));
+    return new Uint8Array(Buffer.from(text, 'utf8'));
+  },
+  decode: async (bytes, options) => Buffer.from(bytes).toString(options && options.encoding === 'windows1252' ? 'latin1' : 'utf8'),
 };
 
 const commands = {
@@ -570,6 +607,7 @@ module.exports = {
   CancellationError,
   FileSystemError,
   FileType,
+  ProgressLocation,
   ViewColumn,
   TextEditorRevealType,
   TabInputText,

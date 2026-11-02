@@ -26,7 +26,11 @@ import {
   applyEdit,
   buildXlsx,
   checkPatchable,
+  CsvEditBlocked,
   CsvGridModel,
+  csvFindPattern,
+  csvQuotePolicy,
+  decodeCsvRecord,
   detectLossyFeatures,
   hardReadOnlyText,
   invertEdit,
@@ -39,10 +43,16 @@ import {
   deepVerifyAllowed,
   verifyXlsx,
   detectSsvDelimiter,
+  indexCsv,
   loadWorkbook,
   parseCsv,
+  planCsvEdit,
+  shiftCsvIndex,
   workbookToModel,
+  type CsvIndex,
   type CsvModel,
+  type CsvQuotePolicy,
+  type CsvTextEdit,
   type GridSource,
   type WorkbookModel,
 } from './renderers/sheet';
@@ -1943,6 +1953,27 @@ export interface TextFidelity {
 interface TextCodecApi {
   encode(text: string, options: { encoding: string }): Thenable<Uint8Array>;
   decode(content: Uint8Array, options: { encoding: string }): Thenable<string>;
+}
+
+/**
+ * Text an edit inserts that the document's file encoding cannot hold (for example a CJK character in a windows1252 file):
+ * VS Code would save it as '?'. Returns the user message, or undefined when every character survives a round trip
+ * (always for UTF encodings and for plain ASCII). When the codec API is missing the open-time check already blocked editing.
+ */
+async function unencodableText(document: vscode.TextDocument, edits: readonly { text: string }[]): Promise<string | undefined> {
+  const encoding = (document as unknown as { encoding?: unknown }).encoding;
+  if (typeof encoding !== 'string' || /^utf/i.test(encoding)) return undefined;
+  const inserted = edits.map((e) => e.text).join('');
+  if (/^[ -]*$/.test(inserted)) return undefined;
+  const codec = vscode.workspace as unknown as Partial<TextCodecApi>;
+  if (typeof codec.encode !== 'function' || typeof codec.decode !== 'function') return undefined;
+  try {
+    const back = await codec.decode(await codec.encode(inserted, { encoding }), { encoding });
+    if (back === inserted) return undefined;
+  } catch (err) {
+    getLog().info(`[csv] Could not check the encoding of an edit: ${errorMessageOf(err)}`);
+  }
+  return `This file is saved as ${encoding}, which cannot hold every character of this edit (they would be saved as "?"). Remove those characters, or save the file as UTF-8 first ("Save with Encoding").`;
 }
 
 function fidelityChanges(details: string[]): TextFidelity {
@@ -4449,91 +4480,796 @@ export async function changeDelimiter(uri: vscode.Uri): Promise<void> {
   for (const listener of chosenDelimiterListeners) listener(key);
 }
 
-/**
- * One CSV/TSV/PSV/SSV panel: parses on open, re-parses (debounced) when the text changes, answers grid requests. The
- * delimiter is chosen again on every parse (CSV and SSV detect it); when it changes, the webview gets a fresh init.
- */
-class CsvView {
-  private readonly session: ViewerSession;
-  private readonly reparse: Debounced;
-  private readonly format: DelimitedFormat;
-  private model: CsvGridModel | undefined;
-  /** Delimiter of `model` (' ' = runs of spaces). */
-  private delimiter = '';
-  /** Delimiter announced in the last init: the webview shows it, so a different one needs a new init. */
-  private initDelimiter: string | undefined;
-  private parseError: unknown;
-  private parsedVersion = -1;
-  /** The text changed while the panel was hidden: re-parsed when it is shown again. */
-  private stale = false;
+// ----- CSV DOCUMENT STATE (v0.2.0, P3; contract §8) -----
 
-  constructor(
-    private readonly document: vscode.TextDocument,
-    panel: vscode.WebviewPanel,
-  ) {
-    this.format = delimitedFormatOf(document.uri);
-    this.session = new ViewerSession(panel, document.uri, 'csv', (msg) => this.onMessage(msg));
-    // (v0.2.0, F) Edit gate registry: view-only until P3 (CsvDocState) gives it a real edit state.
-    const gate = { format: 'csv', uri: document.uri, computeEditState: viewOnlyEditState, dirty: () => document.isDirty } as const;
-    this.session.onDispose(attachEditGateDoc(gate, (state) => this.session.post({ type: 'editState', state })));
-    this.reparse = debounce(() => this.refresh(), TEXT_DEBOUNCE_MS);
-    this.session.onDispose(this.reparse);
-    this.session.onDispose(onTextDocumentChanged(document, () => this.reparse.schedule()));
-    // A big file blocks the extension host for seconds per parse: a hidden panel parses when it is shown again.
-    this.session.onDispose(
-      panel.onDidChangeViewState(() => {
-        if (panel.visible && this.stale) this.refresh();
-      }),
-    );
-    // "Change Delimiter" for this file: parse again with the chosen delimiter.
-    const onChosenDelimiter = (key: string): void => {
-      if (key !== document.uri.toString()) return;
-      this.parsedVersion = -1;
-      this.refresh();
-    };
-    chosenDelimiterListeners.add(onChosenDelimiter);
-    this.session.onDispose({ dispose: () => chosenDelimiterListeners.delete(onChosenDelimiter) });
-    // Parse right after the HTML is handed over, so the model is usually ready when the webview asks for it.
-    const initialParse = setTimeout(() => this.ensureParsed(), 0);
-    this.session.onDispose({ dispose: () => clearTimeout(initialParse) });
+/** The edit kinds a delimited-text document supports (contract §8.2). The grid offers exactly these. */
+const CSV_EDIT_KINDS: EditKind[] = ['setCells', 'clear', 'insertRows', 'deleteRows', 'insertCols', 'deleteCols', 'sort', 'replaceAll'];
+/** A `findResult` lists at most this many matches (`truncated` says there were more). */
+const CSV_FIND_MAX_MATCHES = 10_000;
+/** Find stops after this long and answers with the matches found so far (contract §8.4). */
+const CSV_FIND_BUDGET_MS = 2000;
+/** A value edit is a "light" edit (patches, no full re-index) up to this many edits and changed records. */
+const CSV_LIGHT_MAX_EDITS = 2000;
+const CSV_PATCH_MAX_RECORDS = 5000;
+const CSV_LIGHT_MAX_CHARS = 2_000_000;
+
+/** Fidelity check state of one document (SHARED: EDIT GATE `checkTextFidelity`, contract §8.6). */
+interface CsvFidelityState {
+  /** True until the check has finished: the gate refuses every edit (`fidelity`, D-072). */
+  pending: boolean;
+  result?: TextFidelity;
+  /** "Edit anyway" was chosen for the result in `result` (per document session). */
+  accepted: boolean;
+}
+
+/** Index of the record that contains offset `x` (the last record that starts at or before it); -1 before the first. */
+function csvRecordAtOffset(idx: CsvIndex, x: number): number {
+  let lo = 0;
+  let hi = idx.count - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    if (idx.start[mid] <= x) {
+      found = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return found;
+}
+
+/** `text` with the sorted, non-overlapping `edits` (offsets of `text`) applied. */
+function spliceCsvText(text: string, edits: readonly CsvTextEdit[]): string {
+  const parts: string[] = [];
+  let at = 0;
+  for (const e of edits) {
+    parts.push(text.slice(at, e.start), e.text);
+    at = e.end;
+  }
+  parts.push(text.slice(at));
+  return parts.join('');
+}
+
+/** True when two decoded records have the same fields. */
+function sameCsvRecord(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
+ * One open delimited-text document, shared by all its CsvView panels (contract §8.1). The TextDocument stays the
+ * source of truth: every edit is planned as minimal text edits (planCsvEdit), applied with ONE workspace.applyEdit
+ * (= one VS Code undo step) and then followed by a patch of the changed rows. The delimiter is pinned at the first
+ * parse (only Change Delimiter re-pins it). `version` counts every content change; the webview must send the version
+ * it saw, and a different one is `stale` (strict rule, SPEC B). Our own change comes back as a document event with
+ * `expectVersion`; every other change is external (re-index, `invalidate`).
+ */
+class CsvDocState {
+  readonly queue = new SerialQueue();
+  readonly views = new Set<CsvView>();
+  readonly format: DelimitedFormat;
+  /** The pinned delimiter (' ' = runs of spaces); '' before the first parse. */
+  delimiter = '';
+  /** The pin came from detection on a file with no real columns yet (empty, one column): a text change detects again. */
+  private repinOnChange = false;
+  collapse = false;
+  /** Host version of the document: +1 on every content change (own edit, undo/redo, external change, Change Delimiter). */
+  version = 1;
+  model: CsvGridModel | undefined;
+  parseError: unknown;
+  fidelity: CsvFidelityState = { pending: true, accepted: false };
+  /** The document's edit-gate entry (set by the first panel). */
+  gate: EditGateDoc | undefined;
+  readonly gateSpec: EditGateDocSpec;
+  private index: CsvIndex | undefined;
+  private policy: CsvQuotePolicy | undefined;
+  /** The document text at `textVersion` (the cache is dropped by every change that is not ours). */
+  private text: string | undefined;
+  private textVersion = -1;
+  /** The index / model must be rebuilt from the document (it changed in a way we did not apply ourselves). */
+  private dirty = true;
+  private indexProblem: string | undefined;
+  private expectVersion: number | undefined;
+  private echoed = false;
+  /** A change that is not ours came; if the document is clean when it settles, the file was reloaded (check again). */
+  private reloadSuspected = false;
+  private checkSeq = 0;
+  private disposed = false;
+  private readonly key: string;
+  private readonly notify: Debounced;
+  private readonly subscriptions: vscode.Disposable[] = [];
+
+  private static readonly states = new Map<string, CsvDocState>();
+
+  static acquire(document: vscode.TextDocument): CsvDocState {
+    const key = document.uri.toString();
+    let state = CsvDocState.states.get(key);
+    if (!state || state.document !== document || state.disposed) {
+      state = new CsvDocState(document);
+      CsvDocState.states.set(key, state);
+    }
+    return state;
   }
 
-  private ensureParsed(): void {
-    if (this.session.isDisposed || this.parsedVersion === this.document.version) return;
-    this.parsedVersion = this.document.version;
+  private constructor(readonly document: vscode.TextDocument) {
+    this.key = document.uri.toString();
+    this.format = delimitedFormatOf(document.uri);
+    this.gateSpec = {
+      format: 'csv',
+      uri: document.uri,
+      computeEditState: () => this.computeEditState(),
+      version: () => this.version,
+      dirty: () => document.isDirty,
+    };
+    this.notify = debounce(() => this.refreshViews(), TEXT_DEBOUNCE_MS);
+    this.subscriptions.push(this.notify, vscode.workspace.onDidChangeTextDocument((e) => this.onDocumentChanged(e)));
+    // "Change Delimiter" for this file: pin the delimiter again (in the queue, so no edit runs half-way).
+    const onChosen = (key: string): void => {
+      if (key === this.key) void this.queue.run(() => this.repin()).catch((err: unknown) => logError(`[csv] Change Delimiter failed for ${this.key}`, err));
+    };
+    chosenDelimiterListeners.add(onChosen);
+    this.subscriptions.push({ dispose: () => chosenDelimiterListeners.delete(onChosen) });
+    // Parse right after the HTML is handed over, so the model is usually ready when the webview asks for it.
+    const initialParse = setTimeout(() => this.ensureIndexed(), 0);
+    this.subscriptions.push({ dispose: () => clearTimeout(initialParse) });
+    this.startFidelityCheck();
+  }
+
+  release(view: CsvView): void {
+    this.views.delete(view);
+    if (this.views.size > 0) return;
+    this.disposed = true;
+    if (CsvDocState.states.get(this.key) === this) CsvDocState.states.delete(this.key);
+    for (const subscription of this.subscriptions.splice(0)) subscription.dispose();
+  }
+
+  // ----- text, index and model -----
+
+  private readText(): string {
+    if (this.text === undefined || this.textVersion !== this.document.version) {
+      this.text = this.document.getText();
+      this.textVersion = this.document.version;
+    }
+    return this.text;
+  }
+
+  private quotePolicy(text: string, index: CsvIndex): CsvQuotePolicy {
+    return (this.policy ??= csvQuotePolicy(text, index));
+  }
+
+  /** Installs `csv` (parsed from `text`) as the model and builds the index for it. */
+  private install(text: string, csv: CsvModel): void {
+    const model = new CsvGridModel(csv, fileNameOf(this.document.uri));
+    model.getMeta().sheets[0].id = 'csv';
+    const index = indexCsv(text, this.delimiter, this.collapse);
+    this.indexProblem = undefined;
+    if (index.count !== csv.rows.length) {
+      // The index and the grid model must agree on the records; if they ever do not, nothing is edited.
+      this.indexProblem = 'FileStudio could not read this file safely enough to edit it.';
+      getLog().error(`[csv] Index (${index.count} records) and grid (${csv.rows.length} rows) disagree for ${this.key}`);
+    }
+    this.model = model;
+    this.index = index;
+    this.policy = undefined;
+    this.parseError = undefined;
+  }
+
+  /** Parses the document again when it changed outside our own edits (synchronous; also covers the debounce gap). */
+  ensureIndexed(): void {
+    if (!this.dirty || this.disposed) return;
+    this.dirty = false;
+    const text = this.readText();
     try {
-      const csv = parseDelimited(this.document.getText(), this.format, chosenDelimiters.get(this.document.uri.toString()));
-      this.model = new CsvGridModel(csv, this.session.fileName);
-      this.delimiter = csv.delimiter;
-      this.parseError = undefined;
+      const chosen = this.delimiter === '' ? chosenDelimiters.get(this.key) : this.delimiter;
+      const csv = parseDelimited(text, this.format, chosen);
+      if (this.delimiter === '') {
+        this.delimiter = csv.delimiter; // pinned at the first parse (contract §8.1)
+        this.repinOnChange = chosen === undefined && !csv.rows.slice(0, 50).some((r) => r.length > 1);
+        this.collapse = csv.delimiter === ' ';
+      }
+      this.install(text, csv);
     } catch (err) {
       this.model = undefined;
+      this.index = undefined;
       this.parseError = err ?? new Error('Unknown error');
       logError(`[csv] Could not parse ${this.document.uri.toString(true)}`, err);
+    }
+  }
+
+  /** Why no edit can be made now (a hard block, contract §8.5), or undefined. */
+  private blockMessage(): string | undefined {
+    if (this.parseError !== undefined) return 'FileStudio could not read this file, so it cannot be edited.';
+    if (this.indexProblem !== undefined) return this.indexProblem;
+    const quote = this.index?.unclosedQuoteRecord ?? -1;
+    if (quote >= 0) return `Row ${quote + 1} opens a quote that is never closed; editing could change the rest of the file.`;
+    return undefined;
+  }
+
+  // ----- edit state -----
+
+  private gateState(): DocGateState {
+    const f = this.fidelity;
+    return {
+      fidelity: { pending: f.pending, ok: f.result?.ok ?? false, accepted: f.accepted, ...(f.result?.blocked === undefined ? {} : { blocked: f.result.blocked }) },
+      block: this.blockMessage(),
+    };
+  }
+
+  private async computeEditState(): Promise<EditState> {
+    this.ensureIndexed();
+    const gate = await checkEditable('csv', this.document.uri, this.gateState(), this.document);
+    if (!gate.ok && gate.code === 'fidelity' && this.fidelity.pending) {
+      return { editable: false, code: 'fidelity', reason: EDIT_TEXT.checking, kinds: [] };
+    }
+    const state = editStateOf(gate, CSV_EDIT_KINDS);
+    const anyway = this.fidelity.result?.canEditAnyway;
+    if (!gate.ok && gate.code === 'fidelity' && anyway) state.canEditAnyway = anyway;
+    return state;
+  }
+
+  /** The edit state last computed (the init and every invalidate carry it). */
+  currentEditState(): EditState {
+    return this.gate?.state ?? viewOnlyEditState();
+  }
+
+  // ----- save-fidelity check (contract §8.6) -----
+
+  /** Runs checkTextFidelity; until it finishes, the document is not editable (D-072). */
+  private startFidelityCheck(): void {
+    const seq = ++this.checkSeq;
+    const previous = this.fidelity.result;
+    this.fidelity = { ...this.fidelity, pending: true };
+    void this.gate?.refresh();
+    void (async () => {
+      const delay = testApiEnabled ? Number(process.env.FILESTUDIO_TEST_FIDELITY_DELAY_MS) : 0;
+      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+      let result: TextFidelity;
+      try {
+        result = await checkTextFidelity(this.document);
+      } catch (err) {
+        logError(`[csv] Fidelity check failed for ${this.key}`, err);
+        result = { ok: false, canEditAnyway: { title: EDIT_TEXT.fidelityTitle, details: [EDIT_TEXT.fidelityUnreadable] } };
+      }
+      if (seq !== this.checkSeq || this.disposed) return;
+      // An earlier "Edit anyway" only holds for the same list of changes.
+      const same =
+        previous !== undefined &&
+        previous.ok === result.ok &&
+        previous.blocked === result.blocked &&
+        JSON.stringify(previous.canEditAnyway) === JSON.stringify(result.canEditAnyway);
+      this.fidelity = { pending: false, result, accepted: same && this.fidelity.accepted };
+      getLog().info(
+        `[csv] ${fileNameOf(this.document.uri)}: ${result.ok ? 'saving in VS Code keeps the file as it is' : (result.blocked ?? (result.canEditAnyway?.details.join(' ') ?? 'saving changes the file'))}`,
+      );
+      await this.gate?.refresh();
+    })().catch((err: unknown) => logError(`[csv] Could not finish the fidelity check of ${this.key}`, err));
+  }
+
+  /** "Edit anyway" was clicked: the host asks itself; the click is never consent (contract §3.6). */
+  async editAnyway(): Promise<void> {
+    const f = this.fidelity;
+    const offer = f.result?.canEditAnyway;
+    if (f.pending || !offer || f.result?.blocked !== undefined || f.accepted) {
+      getLog().info(`[csv] 'editAnyway' for ${this.key} ignored: nothing to accept`);
+      return;
+    }
+    const answer = await ask('fidelity', offer.title, { modal: true, detail: offer.details.join('\n') }, 'Edit anyway');
+    if (answer !== 'Edit anyway' || this.fidelity !== f) return;
+    this.fidelity = { ...f, accepted: true };
+    await this.gate?.refresh();
+  }
+
+  // ----- changes of the document -----
+
+  private onDocumentChanged(e: vscode.TextDocumentChangeEvent): void {
+    if (e.document.uri.toString() !== this.key || e.contentChanges.length === 0) return; // dirty-flag-only events are skipped
+    if (this.expectVersion !== undefined && e.document.version === this.expectVersion && e.reason === undefined) {
+      this.echoed = true; // our own edit (contract §8.2 echo rule); applied by the edit flow
+      return;
+    }
+    this.externalChange();
+    // A change that leaves the document clean is a reload from disk or a Revert: check the file again (D-072). The
+    // dirty flag reaches the extension host a moment after the text, so it is read when the debounce fires.
+    this.reloadSuspected = true;
+  }
+
+  /** Something other than our own edit changed the text: new version now, re-index when the debounce fires (or earlier, on demand). */
+  private externalChange(): void {
+    if (this.repinOnChange) {
+      this.delimiter = ''; // the file had no columns when the delimiter was pinned: look again (0.2.0 did on every parse)
+      this.repinOnChange = false;
+    }
+    this.version++;
+    this.dirty = true;
+    this.text = undefined;
+    this.notify.schedule();
+  }
+
+  /** Debounced (150 ms): tell every panel. */
+  private refreshViews(): void {
+    if (this.disposed) return;
+    if (![...this.views].some((v) => v.session.panel.visible)) {
+      // every panel is hidden: no parse now (a big file would block the host while the user types in the text editor);
+      // the panels mark themselves stale and the first one shown parses (CsvView.refresh -> shown)
+      for (const view of [...this.views]) view.refresh(false);
+      return;
+    }
+    this.shown();
+    void this.gate?.refresh();
+    for (const view of [...this.views]) view.refresh(false);
+  }
+
+  /** A panel is visible: parse what changed meanwhile and run the save-fidelity re-check a reload asked for. */
+  shown(): void {
+    this.ensureIndexed();
+    if (this.reloadSuspected) {
+      this.reloadSuspected = false;
+      if (!this.document.isDirty) this.startFidelityCheck();
+    }
+  }
+
+  /** Change Delimiter (in the queue): pin again, new version, new init; edits planned before are stale. */
+  private repin(): void {
+    this.delimiter = ''; // the next parse takes the chosen delimiter (or detects one)
+    this.dirty = true;
+    this.text = undefined;
+    this.version++;
+    this.ensureIndexed();
+    void this.gate?.refresh();
+    for (const view of [...this.views]) view.refresh(true);
+  }
+
+  // ----- edits (contract §8.2) -----
+
+  edit(view: CsvView, msg: MessageOf<'edit'>): Promise<void> {
+    return this.queue.run(() => this.runEdit(view, msg));
+  }
+
+  private async runEdit(view: CsvView, msg: MessageOf<'edit'>): Promise<void> {
+    const document = this.document;
+    this.ensureIndexed();
+    // §3.2 steps 1-3: kill switch, read-only, document state.
+    const gate = await checkEditable('csv', document.uri, this.gateState(), document);
+    if (!gate.ok) {
+      view.session.rejectEdit(msg.editId, gate.code, gate.reason);
+      if (gate.code === 'disabled' || gate.code === 'readOnly') void this.gate?.refresh(); // the panels follow the setting
+      return;
+    }
+    const heavy = this.wholeFileTitle(msg.intent);
+    if (heavy === undefined) await this.planAndApply(view, msg);
+    else await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: heavy }, () => this.planAndApply(view, msg));
+    if (msg.then === 'save' && view.lastAccepted === msg.editId) await this.save(`edit ${msg.editId}`);
+  }
+
+  private async save(why: string): Promise<void> {
+    try {
+      await vscode.workspace.save(this.document.uri);
+    } catch (err) {
+      logError(`[csv] Could not save ${this.key} (${why})`, err);
+    }
+  }
+
+  /** The progress title of a whole-file operation (sort, column insert / delete, Replace All, big writes), or undefined. */
+  private wholeFileTitle(i: EditIntent): string | undefined {
+    const n = (count: number): string => count.toLocaleString('en-US');
+    const rows = this.index?.count ?? 0;
+    switch (i.kind) {
+      case 'sort':
+        return `Sorting ${n(rows)} rows…`;
+      case 'insertCols':
+      case 'deleteCols':
+        return `Updating ${n(rows)} rows…`;
+      case 'replaceAll':
+        return `Replacing in ${n(rows)} rows…`;
+      case 'setCells':
+        return i.cells.length > CSV_LIGHT_MAX_EDITS ? `Writing ${n(i.cells.length)} cells…` : undefined;
+      case 'clear': {
+        let area = 0;
+        for (const r of i.ranges) area += (r.r1 - r.r0 + 1) * (r.c1 - r.c0 + 1);
+        return area > CSV_LIGHT_MAX_EDITS ? `Clearing ${n(area)} cells…` : undefined;
+      }
+      default:
+        return undefined;
+    }
+  }
+
+  /** The records an intent writes into, for the guard (at most ~2,000 of them; a sample for big ranges). */
+  private targetRecords(i: EditIntent, count: number): number[] {
+    const set = new Set<number>();
+    if (i.kind === 'setCells') {
+      for (const [r] of i.cells) if (r < count) set.add(r);
+    } else if (i.kind === 'clear') {
+      for (const range of i.ranges) {
+        for (let r = range.r0; r <= Math.min(range.r1, count - 1) && set.size < CSV_LIGHT_MAX_EDITS; r++) set.add(r);
+        if (range.r1 >= count - 1 && count > 0) set.add(count - 1);
+      }
+    } else if (count > 0) {
+      set.add(0);
+      set.add(count - 1);
+    }
+    return [...set];
+  }
+
+  /**
+   * §3.2 step 4-5. Everything up to the `applyEdit` call is synchronous (no await between the version check and the
+   * call), so an edit planned for version N never lands on text of version N+1.
+   */
+  private async planAndApply(view: CsvView, msg: MessageOf<'edit'>): Promise<void> {
+    const document = this.document;
+    const session = view.session;
+    const reject = (code: EditRejectCode, reason: string): void => session.rejectEdit(msg.editId, code, reason);
+    const off = disabledEditSetting('csv', document.uri); // read again: the setting may have changed while we waited
+    if (off !== undefined) return reject('disabled', EDIT_TEXT.disabled(off));
+    this.ensureIndexed();
+    const again = documentGate(this.gateState());
+    if (!again.ok) return reject(again.code, again.reason);
+    const model = this.model;
+    const index = this.index;
+    if (!model || !index) return reject('internal', EDIT_TEXT.internal);
+    if (msg.baseVersion !== this.version) {
+      reject('stale', EDIT_TEXT.stale);
+      view.refresh(false, true); // "the view was refreshed"
+      return;
+    }
+    const intent = msg.intent;
+    if (!CSV_EDIT_KINDS.includes(intent.kind)) return reject('blocked', EDIT_TEXT.notAvailable);
+
+    const text = this.readText();
+    const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+    let edits: CsvTextEdit[];
+    try {
+      edits = planCsvEdit(text, index, this.quotePolicy(text, index), eol, intent);
+    } catch (err) {
+      if (err instanceof CsvEditBlocked) return reject('blocked', err.message);
+      if (err instanceof Error && err.constructor === Error) return reject('invalid', err.message);
+      logError(`[csv] Could not plan an edit of ${this.key}`, err);
+      return reject('internal', EDIT_TEXT.internal);
+    }
+    const unholdable = await unencodableText(document, edits);
+    if (unholdable !== undefined) return reject('blocked', unholdable);
+    // Guard: the records we are about to change must read the same from the index as in the grid the user sees.
+    const rows = model.csv.rows;
+    const mismatch =
+      rows.length !== index.count ||
+      this.targetRecords(intent, index.count).some((r) => !sameCsvRecord(decodeCsvRecord(text, index, r), rows[r]));
+    if (mismatch) {
+      getLog().error(`[csv] Edit ${msg.editId} of ${this.key}: the index and the grid disagree; nothing was changed`);
+      this.dirty = true;
+      this.text = undefined;
+      this.notify.schedule();
+      return reject('internal', EDIT_TEXT.internal);
+    }
+    if (edits.length === 0) {
+      view.accepted(msg.editId, this.version, []); // nothing to write (a no-op edit, e.g. '' into a cell that does not exist)
+      return;
+    }
+    const we = new vscode.WorkspaceEdit();
+    for (const e of edits) {
+      const a = document.positionAt(e.start);
+      const b = document.positionAt(e.end);
+      we.replace(document.uri, new vscode.Range(a.line, a.character, b.line, b.character), e.text);
+    }
+    const expect = document.version + 1;
+    this.expectVersion = expect;
+    this.echoed = false;
+    let applied = false;
+    try {
+      applied = await vscode.workspace.applyEdit(we);
+    } catch (err) {
+      logError(`[csv] Could not apply edit ${msg.editId} to ${this.key}`, err);
+    }
+    const own = applied && this.echoed && document.version === expect;
+    this.expectVersion = undefined;
+    if (!applied) {
+      // VS Code refused (for example read-only in this session): the file was not changed; show the document again.
+      this.dirty = true;
+      this.text = undefined;
+      reject('failed', EDIT_TEXT.failed);
+      this.refreshViews();
+      return;
+    }
+    if (!own) {
+      // The change did not come back as expected (or another change landed meanwhile): treat it like an external change.
+      getLog().warn(`[csv] Edit ${msg.editId} of ${this.key} was applied but its change event did not match; refreshing`);
+      this.externalChange();
+      view.accepted(msg.editId, this.version, []);
+      return;
+    }
+    this.afterOwnEdit(view, msg, text, index, edits);
+  }
+
+  /** The document now holds our edit: bring the index and the model up to date and tell every panel. */
+  private afterOwnEdit(view: CsvView, msg: MessageOf<'edit'>, text: string, oldIndex: CsvIndex, edits: CsvTextEdit[]): void {
+    const document = this.document;
+    const light = (msg.intent.kind === 'setCells' || msg.intent.kind === 'clear') && this.tryLightUpdate(view, msg, text, oldIndex, edits);
+    if (light) return;
+    // Structural kinds, sort, Replace All, big edits: read the text again and rebuild everything.
+    this.text = document.getText();
+    this.textVersion = document.version;
+    this.version++;
+    this.dirty = true;
+    this.ensureIndexed();
+    void this.gate?.refresh();
+    view.accepted(msg.editId, this.version, undefined);
+    for (const v of [...this.views]) v.refresh(false, v === view);
+  }
+
+  /**
+   * Value edit: splice the cached text, re-scan only the touched records, shift the later offsets, update `model.rows`
+   * (column widths stay) and send patches. False when anything does not add up (the caller rebuilds everything).
+   */
+  private tryLightUpdate(view: CsvView, msg: MessageOf<'edit'>, text: string, oldIndex: CsvIndex, edits: CsvTextEdit[]): boolean {
+    const model = this.model;
+    const document = this.document;
+    if (!model || edits.length > CSV_LIGHT_MAX_EDITS) return false;
+    let size = 0;
+    for (const e of edits) size += e.end - e.start + e.text.length;
+    if (size > CSV_LIGHT_MAX_CHARS) return false;
+    const newText = spliceCsvText(text, edits);
+    // Check what VS Code really wrote at every edit against what we expect (it unifies line breaks, for example).
+    let growth = 0;
+    const spans: [number, number][] = [];
+    for (const e of edits) {
+      const ns = e.start + growth;
+      const ne = ns + e.text.length;
+      growth += e.text.length - (e.end - e.start);
+      const a = document.positionAt(ns);
+      const b = document.positionAt(ne);
+      if (document.getText(new vscode.Range(a.line, a.character, b.line, b.character)) !== e.text) {
+        getLog().warn(`[csv] VS Code wrote something else than planned in ${this.key}; rebuilding from the document`);
+        return false;
+      }
+      spans.push([ns, ne]);
+    }
+    const newIndex = shiftCsvIndex(oldIndex, edits, newText);
+    if (newIndex.count < oldIndex.count || newIndex.unclosedQuoteRecord >= 0) return false;
+    // The records touched by the edits, in the new index.
+    const touched = new Set<number>();
+    let lo = Infinity;
+    let hi = -1;
+    for (const [ns, ne] of spans) {
+      const ra = Math.max(0, csvRecordAtOffset(newIndex, ns));
+      const rb = Math.max(ra, csvRecordAtOffset(newIndex, Math.max(ns, ne - 1)));
+      if (rb - ra > CSV_PATCH_MAX_RECORDS) return false;
+      for (let r = ra; r <= rb; r++) touched.add(r);
+      lo = Math.min(lo, ra);
+      hi = Math.max(hi, rb);
+    }
+    const added = newIndex.count - oldIndex.count;
+    if (added > 0) {
+      if (hi !== newIndex.count - 1) return false; // records appear only at the end for a value edit
+      for (let r = oldIndex.count; r < newIndex.count; r++) touched.add(r);
+      lo = Math.min(lo, oldIndex.count);
+    }
+    if (hi < 0 || hi - lo + 1 > CSV_PATCH_MAX_RECORDS) return false;
+    const rows = model.csv.rows;
+    const sheet = model.getMeta().sheets[0];
+    const before = [sheet.rowCount, sheet.colCount];
+    for (const r of touched) {
+      const record = decodeCsvRecord(newText, newIndex, r);
+      rows[r] = record;
+      if (record.length > sheet.colCount) sheet.colCount = record.length;
+    }
+    rows.length = newIndex.count;
+    let used = rows.length;
+    while (used > 0 && rows[used - 1].every((field) => !field)) used--;
+    sheet.rowCount = Math.max(1, used);
+    const dimsChanged = sheet.rowCount !== before[0] || sheet.colCount !== before[1];
+    this.text = newText;
+    this.textVersion = document.version;
+    this.index = newIndex;
+    this.version++;
+    const patch: RowsPatch = { sheetId: 'csv', start: lo, end: hi + 1, ...model.getRows(0, lo, hi + 1) };
+    view.accepted(msg.editId, this.version, [patch]);
+    if (dimsChanged) view.session.post({ type: 'patch', version: this.version, patches: [], sheets: [sheet] });
+    for (const other of this.views) {
+      if (other === view) continue;
+      if (other.canReceivePatches()) {
+        other.session.post({ type: 'patch', version: this.version, patches: [patch], ...(dimsChanged ? { sheets: [sheet] } : {}) });
+      } else {
+        other.stale = true; // hidden: gets the whole state when shown
+      }
+    }
+    return true;
+  }
+
+  // ----- commands from the grid while an edit is in flight (§2.7 `command`, D-067) -----
+
+  command(view: CsvView, msg: MessageOf<'command'>): Promise<void> {
+    return this.queue.run(async () => {
+      if (msg.id === 'save') {
+        await this.save('command');
+        return;
+      }
+      // VS Code runs undo / redo for the active editor only: another tab must not change this document by mistake.
+      if (view.session.panel.active === false) {
+        getLog().info(`[csv] '${msg.id}' for ${this.key} ignored: this editor is not the active tab`);
+        return;
+      }
+      await vscode.commands.executeCommand(msg.id);
+    });
+  }
+
+  // ----- Find (contract §8.4) -----
+
+  /** Host search over the grid's values (never over the text); does not wait for the queue. */
+  find(view: CsvView, msg: MessageOf<'find'>): void {
+    const reply = (r: Partial<Extract<HostMessage, { type: 'findResult' }>>): void =>
+      view.session.post({ type: 'findResult', reqId: msg.reqId, version: this.version, matches: [], total: 0, truncated: false, ...r });
+    try {
+      this.ensureIndexed();
+      const model = this.model;
+      if (!model) return reply({ error: EDIT_TEXT.internal });
+      const found = csvFindPattern(msg.query);
+      if ('invalid' in found) return reply({ error: found.invalid });
+      const { re, maxCell } = found;
+      let skippedLong = false;
+      type Hit = { sheetId: SheetId; r: number; c: number };
+      const all: Hit[] = [];
+      let first: Hit | undefined;
+      let last: Hit | undefined;
+      let after: Hit | undefined; // the first match after `from`
+      let before: Hit | undefined; // the last match before `from`
+      let total = 0;
+      let partial = false;
+      const from = msg.from;
+      const started = Date.now();
+      const rows = model.csv.rows;
+      scan: for (let r = 0; r < rows.length; r++) {
+        if (!msg.query.regex && (r & 255) === 0 && Date.now() - started > CSV_FIND_BUDGET_MS) {
+          partial = true;
+          break scan;
+        }
+        const row = rows[r];
+        for (let c = 0; c < row.length; c++) {
+          const v = row[c];
+          if (v === '' || typeof v !== 'string') continue; // like Replace All: an empty value is never a match
+          if (msg.query.regex) {
+            // a pattern check cannot catch every slow regex: bound the cell length and check the clock per cell
+            if (Date.now() - started > CSV_FIND_BUDGET_MS) {
+              partial = true;
+              break scan;
+            }
+            if (v.length > maxCell) {
+              skippedLong = true;
+              continue;
+            }
+          }
+          re.lastIndex = 0;
+          if (!re.test(v)) continue;
+          total++;
+          const hit: Hit = { sheetId: 'csv', r, c };
+          first ??= hit;
+          last = hit;
+          if (from) {
+            if (r < from.r || (r === from.r && c < from.c)) before = hit;
+            else if (!after && (r > from.r || c > from.c)) after = hit;
+          }
+          if (msg.direction === 'all' && all.length < CSV_FIND_MAX_MATCHES) all.push(hit);
+        }
+      }
+      const pick = msg.direction === 'next' ? (from ? (after ?? (partial ? undefined : first)) : first) /* a stopped scan must not wrap to the top */ : msg.direction === 'prev' ? (from ? (before ?? last) : last) : undefined;
+      const matches = msg.direction === 'all' ? all : pick ? [pick] : [];
+      reply({
+        matches,
+        total,
+        truncated: partial || skippedLong || (msg.direction === 'all' && total > all.length),
+        ...(partial
+          ? { error: 'The search took too long and was stopped. Showing the matches found so far.' }
+          : skippedLong
+            ? { error: 'Some values are too long for this regular expression and were skipped.' }
+            : {}),
+      });
+    } catch (err) {
+      logError(`[csv] Find failed for ${this.key}`, err);
+      reply({ error: EDIT_TEXT.internal });
+    }
+  }
+}
+
+// ----- csv view -----
+
+/**
+ * One CSV/TSV/PSV/SSV panel. The document-wide work (parse, index, edits, versions, find) is in CsvDocState, shared by
+ * all panels of the document; the panel answers grid requests and tells its webview what changed.
+ */
+class CsvView {
+  readonly session: ViewerSession;
+  /** The text changed (or the state did) while the panel was hidden: it is refreshed when shown again. */
+  stale = false;
+  /** The editId of the last edit this panel had accepted (used by `then: 'save'`). */
+  lastAccepted = -1;
+  private readonly state: CsvDocState;
+  private readonly gate: EditGateHandle;
+  /** Delimiter announced in the last init: the webview shows it, so a different one needs a new init. */
+  private initDelimiter: string | undefined;
+
+  constructor(document: vscode.TextDocument, panel: vscode.WebviewPanel) {
+    this.state = CsvDocState.acquire(document);
+    const state = this.state;
+    this.session = new ViewerSession(panel, document.uri, 'csv', (msg) => this.onMessage(msg));
+    state.views.add(this);
+    // (v0.2.0) The document's edit gate entry (settings listener, read-only state, test API); its state is ours.
+    this.gate = attachEditGateDoc(state.gateSpec, (editState) => {
+      if (this.session.isReady) this.session.post({ type: 'editState', state: editState });
+    });
+    state.gate = this.gate.doc;
+    this.session.editHandlers = {
+      version: () => state.version,
+      onEdit: (msg) => state.edit(this, msg),
+      onEditAnyway: () => state.editAnyway(),
+      onFind: (msg) => state.find(this, msg),
+      onCommand: (msg) => state.command(this, msg),
+    };
+    this.session.onDispose(this.gate);
+    this.session.onDispose({ dispose: () => state.release(this) });
+    // A big file blocks the extension host for seconds per parse: a hidden panel refreshes when it is shown again.
+    this.session.onDispose(
+      panel.onDidChangeViewState(() => {
+        if (panel.visible && this.stale) this.refresh(false);
+      }),
+    );
+  }
+
+  /** True when the webview is loaded and visible (a hidden one is refreshed as a whole when shown). */
+  canReceivePatches(): boolean {
+    return this.session.isReady && this.session.panel.visible && this.session.shown === 'content' && this.initDelimiter === this.state.delimiter;
+  }
+
+  /** The grid's rows are served from the model, at the host version the model belongs to. */
+  private answerRows(msg: MessageOf<'getRows'>): void {
+    this.state.ensureIndexed();
+    const model = this.state.model;
+    if (!model) {
+      this.session.postError(`"${this.session.fileName}" could not be displayed`, this.state.parseError, true);
+      return;
+    }
+    try {
+      const { rows, styles } = model.getRows(msg.sheet, msg.start, msg.end, msg.c0, msg.c1);
+      const columns = msg.c0 === undefined ? {} : { c0: msg.c0, c1: msg.c1 };
+      this.session.post({
+        type: 'rows',
+        reqId: msg.reqId,
+        sheet: msg.sheet,
+        start: msg.start,
+        end: msg.end,
+        ...columns,
+        rows,
+        styles,
+        version: this.state.version,
+        sheetId: 'csv',
+      });
+    } catch (err) {
+      this.session.postError(`Could not read rows ${msg.start + 1}-${msg.end} of sheet ${msg.sheet + 1}`, err);
     }
   }
 
   private onMessage(msg: WebviewMessage): Promise<void> | void {
     switch (msg.type) {
       case 'ready':
-        this.ensureParsed();
-        this.sendInit();
-        return;
+        getLog().info(`[csv] ${this.session.fileName}: viewer ready`); // tests wait for this line (the webview is loaded)
+        this.state.ensureIndexed();
+        // The first edit state is known before the init is sent (the gate's listeners only report later changes).
+        return this.gate.doc.refresh().then((computed) => this.sendInit(this.gate.doc.state ?? computed));
       case 'getRows':
-        // Served from the current model; a pending re-parse is followed by 'invalidate'.
-        answerGetRows(this.session, this.model, msg, this.parseError);
+        this.answerRows(msg);
         return;
       case 'getStats':
-        answerGetStats(this.session, this.model, msg);
+        this.state.ensureIndexed();
+        answerGetStats(this.session, this.state.model, msg);
         return;
       default:
         return handleCommonMessage(this.session, msg, { allowLocal: true });
     }
   }
 
-  private sendInit(): void {
-    if (!this.model) {
-      this.session.postError(`Could not parse "${this.session.fileName}"`, this.parseError, true); // logged by ensureParsed
+  private sendInit(editState: EditState = this.state.currentEditState()): void {
+    const state = this.state;
+    state.ensureIndexed();
+    if (!state.model) {
+      this.session.postError(`Could not parse "${this.session.fileName}"`, state.parseError, true); // logged by ensureIndexed
       return;
     }
     try {
@@ -4541,29 +5277,42 @@ class CsvView {
         type: 'init',
         kind: 'csv',
         fileName: this.session.fileName,
-        meta: this.model.getMeta(),
-        readOnly: true,
-        delimited: { format: this.format, delimiter: this.delimiter },
-        editState: viewOnlyEditState(),
+        meta: state.model.getMeta(),
+        readOnly: !editState.editable,
+        delimited: { format: state.format, delimiter: state.delimiter },
+        version: state.version,
+        editState,
       });
-      this.initDelimiter = this.delimiter;
+      this.initDelimiter = state.delimiter;
+      this.stale = false;
     } catch (err) {
       this.session.postError(`Could not display "${this.session.fileName}"`, err);
     }
   }
 
-  /** Debounced: the text changed (typing in a text editor, undo, external reload). */
-  private refresh(): void {
-    this.stale = !this.session.panel.visible;
+  /** Answers an accepted edit (exactly one per edit). `patches` undefined = the whole view follows (`invalidate`). */
+  accepted(editId: number, version: number, patches: RowsPatch[] | undefined): void {
+    this.lastAccepted = editId;
+    this.session.post({ type: 'editResult', editId, accepted: true, version, ...(patches ? { patches } : {}) });
+  }
+
+  /**
+   * The document changed: a new init when the view never showed content or `forceInit` (Change Delimiter), else
+   * `invalidate` (drop the row cache, ask for the visible rows again). A hidden panel waits until it is shown, unless
+   * `now` (the sender of an edit is visible by definition).
+   */
+  refresh(forceInit: boolean, now = false): void {
+    this.stale = !this.session.panel.visible && !now;
     if (this.stale) return;
-    this.ensureParsed();
+    this.state.shown();
     if (!this.session.isReady) return; // 'ready' will send init from the current text
-    if (!this.model || this.session.shown !== 'content' || this.delimiter !== this.initDelimiter) {
+    const state = this.state;
+    if (!state.model || this.session.shown !== 'content' || forceInit || state.delimiter !== this.initDelimiter) {
       this.sendInit();
       return;
     }
     try {
-      this.session.post({ type: 'invalidate', meta: this.model.getMeta(), editState: viewOnlyEditState() });
+      this.session.post({ type: 'invalidate', meta: state.model.getMeta(), version: state.version, editState: state.currentEditState() });
     } catch (err) {
       this.session.postError(`Could not display "${this.session.fileName}"`, err);
     }

@@ -168,7 +168,8 @@ function dispatch(msg) {
     case 'recalcState':
       /* P5 */ break;
     case 'findResult':
-      /* P3 / P4 */ break;
+      if (acceptsViewMessage(msg.type, ['sheet', 'csv'])) onFindResult(msg); // P3 (csv); P4 reuses it
+      break;
     case 'filterResult':
       /* P4 */ break;
     case 'columnTexts':
@@ -746,6 +747,7 @@ const NO_CELLS = [];
  * @property {Map<number, Map<number, Map<number, string>>>} overlay  pending cell texts by sheet, row and column (EDITING)
  * @property {EditMessage | null} inFlightEdit  the one edit asked of the host and not answered yet
  * @property {(EditMessage | CommandMessage)[]} sendQueue  edits and commands waiting for it, in order
+ * @property {{ format: string, delimiter: string } | undefined} delimited  csv: the format and delimiter in use (' ' = runs of spaces: no column edits)
  */
 
 /** @type {GridState | null} */
@@ -801,6 +803,7 @@ function showGrid(msg) {
     overlay: new Map(),
     inFlightEdit: null,
     sendQueue: [],
+    delimited: msg.kind === 'csv' ? msg.delimited : undefined,
   };
   resetRowCache();
   rowCache.metaFloor = rowCache.reqSeq;
@@ -809,6 +812,7 @@ function showGrid(msg) {
     closeCellBox('close', false);
     hideTooltip();
     closeMenu();
+    disposeFindBar();
     saveGridState.flush();
     scheduleStats.cancel();
     announceActive.cancel();
@@ -1043,6 +1047,20 @@ function wireGridEvents() {
   listen(sc, 'keydown', onGridKeyDown);
   listen(sc, 'wheel', onGridWheel, { passive: false });
   listen(sc, 'dblclick', onGridDblClick);
+  listen(sc, 'contextmenu', onGridContextMenu);
+  // The Menu key opens our menu on keydown and the browser's `contextmenu` event follows on key up, aimed at the focused menu
+  // item: it must not reach VS Code (which would show its own menu and take the focus away). Capture phase, before VS Code.
+  listen(
+    document,
+    'contextmenu',
+    (e) => {
+      if (Date.now() - ctxKeyAt < 800) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    },
+    true,
+  );
   listen(sc, 'paste', onGridPaste);
   listen(window, 'mousemove', onWindowMouseMove);
   listen(window, 'mouseup', onWindowMouseUp);
@@ -1509,6 +1527,7 @@ function onInvalidate(msg) {
   if (msg.version !== undefined) G.version = Math.max(G.version, msg.version);
   dropQueuedEdits();
   G.overlay.clear();
+  findDataChanged();
   if (msg.editState) onEditState({ type: 'editState', state: msg.editState });
   if (msg.banner !== undefined) updateBanner(msg.banner ?? undefined);
   if (msg.meta) {
@@ -4726,6 +4745,12 @@ function onGridKeyDown(e) {
       openCellBox(view, m.r, m.c, { mode: 'edit', caretAtEnd: true });
       break;
     }
+    case 'ContextMenu':
+      if (!openContextMenuAtActive(view)) return;
+      break;
+    case 'F10':
+      if (!shift || ctrl || e.altKey || !openContextMenuAtActive(view)) return;
+      break;
     case 'Delete':
       if (!ctrl && !e.altKey && !canClear()) sayReadOnly();
       if (ctrl || e.altKey || !canClear()) return;
@@ -4787,6 +4812,11 @@ function onGridAppKeyDown(e) {
     // The tab strip was rebuilt: keep the focus on the (new) active tab; from the menu, go back to the grid.
     if (inTabs) /** @type {HTMLElement | null} */ (G.dom.tabStrip.querySelector('.fv-tab-active'))?.focus();
     else if (!focus || focus === document.body || !focus.isConnected) G.dom.scroller.focus({ preventScroll: true });
+  } else if (ctrl && !e.altKey && !e.shiftKey && (e.key.toLowerCase() === 'f' || e.key.toLowerCase() === 'h')) {
+    // Find and Replace (csv): Ctrl+F / Ctrl+H. Not while the cell editor is open (its text is being typed).
+    if (G.cellBox || !openFindBar(e.key.toLowerCase() === 'h')) return;
+  } else if (e.key === 'F3' && !ctrl && !e.altKey) {
+    if (G.cellBox || !findStep(e.shiftKey ? 'prev' : 'next')) return;
   } else if (ctrl && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'a') {
     // On a tab, a bar button or the menu, select-all would highlight the whole view's text (the browser's, or VS
     // Code's run on the page): nothing to select there. The name box and the cell text box select their own text.
@@ -4836,6 +4866,7 @@ function focusRegion(dir) {
   const all = [
     [d.banner?.isConnected ? d.banner : null, d.banner?.querySelector('button') ?? null],
     [d.formulaBar, d.nameBox],
+    [findUi && findUi.el.isConnected && !findUi.el.hidden ? findUi.el : null, findUi ? findUi.find : null],
     [d.scroller, d.scroller],
     [d.tabBar, d.tabStrip.querySelector('.fv-tab-active')],
     [d.statusBar, d.statusBar.querySelector('button')],
@@ -6420,6 +6451,7 @@ function updateEditUi() {
   if (fx) fx.setAttribute('title', editable ? 'Cell value or formula' : 'Cell value or formula (read-only)');
   updateBanner(g.bannerText, state?.canEditAnyway);
   updateFormulaBar();
+  updateFindBar();
 }
 
 // ----- EDITING: sending -----
@@ -6494,6 +6526,9 @@ function onEditResult(msg) {
     const it = sent.intent;
     if (it.kind === 'clear') setStatusMessage('Cleared.', 'info');
     else if (it.kind === 'setCells' && it.cells.length > 1) setStatusMessage(`Changed ${formatCount(it.cells.length)} cells.`, 'info');
+    else if (STRUCTURE_DONE[it.kind]) setStatusMessage(structureDoneText(it), 'info');
+    else if (it.kind === 'replaceAll') setStatusMessage(replaceAllDoneText(msg.editId), 'info');
+    findDataChanged();
   } else {
     dropIntentOverlay(sent.intent);
     setStatusMessage(msg.reason || 'The change was not applied.', 'warn');
@@ -6511,6 +6546,7 @@ function onPatch(msg) {
   if (!g || msg.version < g.version) return;
   g.version = msg.version;
   dropQueuedEdits();
+  findDataChanged();
   if (msg.styles) mergeStyles(msg.styles);
   if (msg.sheets) for (const sm of msg.sheets) applySheetMeta(sm);
   if (msg.patches) applyPatches(msg.patches);
@@ -6856,7 +6892,7 @@ function htmlPasteText(td, textCls) {
   const style = td.getAttribute('style') || '';
   const asText = td.hasAttribute('x:str') || /mso-number-format\s*:\s*["']?\\?@/i.test(style) || [...td.classList].some((c) => !!textCls?.has(c.toLowerCase()));
   const text = htmlCellText(td, asText);
-  if (asText) return textReadsAsValue(text) ? `'${text}` : text;
+  if (asText) return G?.kind === 'sheet' && textReadsAsValue(text) ? `'${text}` : text; // a CSV keeps typed text as it is
   const num = td.getAttribute('x:num');
   if (num) {
     const v = Number(num);
@@ -7023,6 +7059,688 @@ function pasteTable(view, table) {
   function tooLarge() {
     setStatusMessage('This change is too large (max 1,000,000 cells).', 'warn');
   }
+}
+
+// ----- STRUCTURE MENUS -----
+// The row / column / cell context menu (contract §10; built for CSV in P3, reused by P4): insert and delete rows and
+// columns, clear contents, sort. It offers only the kinds in editState.kinds; the host still checks every edit and may
+// refuse it (for example column edits in a file split on spaces). One menu action = one `edit` = one undo step.
+
+/** The live status text of a finished structure edit. @type {Partial<Record<EditKind, true>>} */
+const STRUCTURE_DONE = { insertRows: true, deleteRows: true, insertCols: true, deleteCols: true, sort: true };
+
+/** @param {EditKind} kind Does the host offer this kind now? */
+function hasEditKind(kind) {
+  const s = G?.editState;
+  return !!s && s.editable && !!s.kinds && s.kinds.includes(kind);
+}
+
+/** @param {number} n @param {string} word @returns {string} "1 row", "3 rows" */
+function countOf(n, word) {
+  return n === 1 ? `1 ${word}` : `${formatCount(n)} ${word}s`;
+}
+
+/** @param {EditIntent} it @returns {string} */
+function structureDoneText(it) {
+  switch (it.kind) {
+    case 'insertRows':
+      return `Inserted ${countOf(it.count, 'row')}.`;
+    case 'deleteRows':
+      return `Deleted ${countOf(it.count, 'row')}.`;
+    case 'insertCols':
+      return `Inserted ${countOf(it.count, 'column')}.`;
+    case 'deleteCols':
+      return `Deleted ${countOf(it.count, 'column')}.`;
+    case 'sort':
+      return `Sorted by column ${colName(it.key)}, ${it.desc ? 'Z to A' : 'A to Z'}. Row 1 stays on top.`;
+    default:
+      return 'Done.';
+  }
+}
+
+/**
+ * @typedef {object} MenuEntry
+ * @property {string} label
+ * @property {() => void} run
+ * @property {boolean} [disabled]
+ * @property {string} [hint]   short text at the end of the item
+ * @property {string} [title]  tooltip (also says why an item is disabled)
+ */
+
+/**
+ * The menu items for a click on a row header, a column header or a cell. Groups are separated by `null`.
+ * Counts follow the last selected range; a range past the used area changes nothing there, so its items are disabled.
+ * @param {SheetView} view @param {'row' | 'col' | 'cell'} scope
+ * @returns {(MenuEntry | null)[]}
+ */
+function structureEntries(view, scope) {
+  const rng = view.sel.ranges[view.sel.ranges.length - 1];
+  const sheetId = view.meta.id;
+  if (!rng || sheetId === undefined) return [];
+  const nRows = view.meta.rowCount;
+  const nCols = view.meta.colCount;
+  const rows = Math.min(rng.r1, nRows - 1) - rng.r0 + 1;
+  const cols = Math.min(rng.c1, nCols - 1) - rng.c0 + 1;
+  const spaceCols = G?.delimited?.delimiter === ' ';
+  const noSpace = 'Not available: this file is split on runs of spaces, so a column cannot be inserted or deleted safely.';
+  /** @type {(MenuEntry | null)[]} */
+  const out = [];
+  /** @param {(MenuEntry | null)[]} group */
+  const addGroup = (group) => {
+    if (group.length === 0) return;
+    if (out.length > 0) out.push(null);
+    out.push(...group);
+  };
+  /** @param {EditIntent} intent @returns {() => void} */
+  const run = (intent) => () => runStructureEdit(intent);
+  if (scope !== 'col') {
+    /** @type {MenuEntry[]} */
+    const g = [];
+    const n = Math.max(1, rows);
+    if (hasEditKind('insertRows')) {
+      g.push({ label: `Insert ${countOf(n, 'row')} above`, disabled: rows < 1, run: run({ kind: 'insertRows', sheetId, at: rng.r0, count: n }) });
+      g.push({
+        label: `Insert ${countOf(n, 'row')} below`,
+        disabled: rows < 1 || rng.r0 + rows >= nRows,
+        title: rng.r0 + rows >= nRows ? 'This is the last row: type in the row below it to add rows at the end.' : undefined,
+        run: run({ kind: 'insertRows', sheetId, at: rng.r0 + rows, count: n }),
+      });
+    }
+    addGroup(g);
+  }
+  if (scope !== 'row') {
+    /** @type {MenuEntry[]} */
+    const g = [];
+    const n = Math.max(1, cols);
+    if (hasEditKind('insertCols')) {
+      g.push({ label: `Insert ${countOf(n, 'column')} left`, disabled: cols < 1 || spaceCols, title: spaceCols ? noSpace : undefined, run: run({ kind: 'insertCols', sheetId, at: rng.c0, count: n }) });
+      g.push({
+        label: `Insert ${countOf(n, 'column')} right`,
+        disabled: cols < 1 || spaceCols || rng.c0 + cols >= nCols,
+        title: spaceCols ? noSpace : rng.c0 + cols >= nCols ? 'This is the last column: type in the column next to it to add columns at the end.' : undefined,
+        run: run({ kind: 'insertCols', sheetId, at: rng.c0 + cols, count: n }),
+      });
+    }
+    addGroup(g);
+  }
+  /** @type {MenuEntry[]} */
+  const del = [];
+  if (scope !== 'col' && hasEditKind('deleteRows')) del.push({ label: `Delete ${countOf(Math.max(1, rows), 'row')}`, disabled: rows < 1, run: run({ kind: 'deleteRows', sheetId, at: rng.r0, count: Math.max(1, rows) }) });
+  if (scope !== 'row' && hasEditKind('deleteCols')) {
+    del.push({ label: `Delete ${countOf(Math.max(1, cols), 'column')}`, disabled: cols < 1 || spaceCols, title: spaceCols ? noSpace : undefined, run: run({ kind: 'deleteCols', sheetId, at: rng.c0, count: Math.max(1, cols) }) });
+  }
+  addGroup(del);
+  if (canClear()) addGroup([{ label: 'Clear contents', hint: 'Delete', run: () => runClear() }]);
+  if (scope !== 'row' && hasEditKind('sort')) {
+    const key = view.sel.active.c;
+    const sortRange = { r0: 0, c0: 0, r1: Math.max(0, nRows - 1), c1: Math.max(0, nCols - 1) };
+    const dis = key >= nCols || nRows < 3;
+    const title = 'Sorts all rows by this column. Row 1 is the header and stays on top.';
+    addGroup([
+      { label: 'Sort A to Z', hint: `column ${colName(key)}`, disabled: dis, title, run: run({ kind: 'sort', sheetId, range: sortRange, key, desc: false, header: true }) },
+      { label: 'Sort Z to A', hint: `column ${colName(key)}`, disabled: dis, title, run: run({ kind: 'sort', sheetId, range: sortRange, key, desc: true, header: true }) },
+    ]);
+  }
+  return out;
+}
+
+/** The menu's Clear contents (the same edit as the Delete key). */
+function runClear() {
+  closeMenu();
+  G?.dom.scroller.focus({ preventScroll: true });
+  clearSelectionContents(activeView());
+}
+
+/** Sends a structure edit; the focus goes back to the grid. @param {EditIntent} intent */
+function runStructureEdit(intent) {
+  closeMenu();
+  G?.dom.scroller.focus({ preventScroll: true });
+  sendEdit(intent);
+}
+
+/** Time of the last context-menu key: the browser's own `contextmenu` event that follows it is ignored. */
+let ctxKeyAt = 0;
+
+/** @param {MouseEvent} e */
+function onGridContextMenu(e) {
+  const g = G;
+  if (!g || g.sheet < 0 || g.kind !== 'csv') return; // an xlsx grid keeps VS Code's own menu (Cut / Copy / Paste)
+  if (Date.now() - ctxKeyAt < 500) {
+    e.preventDefault();
+    return;
+  }
+  const sc = g.dom.scroller;
+  const rect = sc.getBoundingClientRect();
+  const vx = scrollerX(rect, e.clientX);
+  const vy = e.clientY - rect.top;
+  if (vx >= sc.clientWidth || vy >= sc.clientHeight || vx < 0 || vy < 0) return; // scrollbars keep VS Code's menu
+  const view = activeView();
+  if (!view.L) return;
+  const hit = hitTest(vx, vy);
+  if (hit.area === 'corner' || g.cellBox) return;
+  /** @type {'row' | 'col' | 'cell'} */
+  const scope = hit.area === 'rowhdr' ? 'row' : hit.area === 'colhdr' ? 'col' : 'cell';
+  if (structureEntries(view, scope).length === 0) return; // nothing to offer: VS Code's own menu, and the selection stays
+  // A right click inside the selection keeps it (the menu acts on it); else it selects the cell / row / column first.
+  if (scope === 'cell') {
+    if (!selectionContains(view, hit.r, hit.c)) selectCell(view, hit.r, hit.c);
+  } else if (scope === 'row') {
+    if (!view.sel.ranges.some((rg) => hit.r >= rg.r0 && hit.r <= rg.r1 && rg.c0 === 0)) selectLines(view, 'rows', hit.r, hit.r, false);
+  } else if (!view.sel.ranges.some((rg) => hit.c >= rg.c0 && hit.c <= rg.c1 && rg.r0 === 0)) selectLines(view, 'cols', hit.c, hit.c, false);
+  if (!openStructureMenu(view, scope, e.clientX, e.clientY)) return; // nothing to offer: VS Code's own menu
+  e.preventDefault();
+  e.stopPropagation();
+}
+
+/**
+ * The keyboard twin of the right click (the Menu key, Shift+F10): opens the menu next to the active cell.
+ * @param {SheetView} view
+ * @returns {boolean} false when the menu has nothing to offer
+ */
+function openContextMenuAtActive(view) {
+  const g = G;
+  if (!g || g.kind !== 'csv' || !view.L) return false;
+  const a = view.sel.active;
+  scrollCellIntoView(view, a.r, a.c);
+  const L = /** @type {Layout} */ (view.L);
+  const sc = g.dom.scroller;
+  const rect = sc.getBoundingClientRect();
+  const area = cellArea(view, a.r, a.c);
+  const dx = area.c0 >= L.fc ? sc.scrollLeft : 0;
+  const dy = area.r0 >= L.fr ? virtualScrollTop() : 0;
+  const x = clamp(L.hdrW + L.colLeft[area.c0] - dx + 8, 0, sc.clientWidth);
+  const y = clamp(L.hdrH + L.rowTop[area.r0] - dy + 8, 0, sc.clientHeight);
+  const opened = openStructureMenu(view, 'cell', L.rtl ? rect.right - x : rect.left + x, rect.top + y);
+  // only a menu that opened makes the browser's follow-up `contextmenu` event ours to swallow
+  ctxKeyAt = opened ? Date.now() : 0;
+  return opened;
+}
+
+/**
+ * Builds and shows the menu at a viewport point; the first enabled item takes the focus.
+ * @param {SheetView} view @param {'row' | 'col' | 'cell'} scope @param {number} x @param {number} y
+ * @returns {boolean} false when the menu is empty
+ */
+function openStructureMenu(view, scope, x, y) {
+  const g = G;
+  if (!g) return false;
+  const entries = structureEntries(view, scope);
+  if (entries.length === 0) return false;
+  closeMenu();
+  const label = scope === 'row' ? 'Row' : scope === 'col' ? 'Column' : 'Cell';
+  const items = entries.map((en) => {
+    if (!en) return h('div', { class: 'fv-menu-sep', role: 'separator' });
+    return h(
+      'button',
+      {
+        class: en.disabled ? 'fv-menu-item fv-menu-disabled' : 'fv-menu-item',
+        type: 'button',
+        role: 'menuitem',
+        'aria-disabled': en.disabled ? 'true' : null,
+        title: en.title,
+        onclick: () => {
+          if (en.disabled) return;
+          en.run();
+        },
+      },
+      h('span', { class: 'fv-menu-label' }, en.label),
+      en.hint ? h('span', { class: 'fv-menu-hint' }, en.hint) : null,
+    );
+  });
+  const menu = h('div', { class: 'fv-menu fv-ctx', role: 'menu', 'aria-label': `${label} menu`, dir: view.L?.rtl ? 'rtl' : 'ltr' }, ...items);
+  menu.addEventListener('focusin', (e) => {
+    const t = /** @type {HTMLElement} */ (e.target);
+    if (t.classList?.contains('fv-menu-disabled') && t.title) setStatusMessage(t.title, 'info');
+  });
+  menu.addEventListener('keydown', (e) => {
+    // disabled items stay in the arrow order (aria-disabled): focusing one says why it is off (see the focusin listener)
+    const list = /** @type {HTMLElement[]} */ ([...menu.querySelectorAll('.fv-menu-item')]);
+    const pos = list.indexOf(/** @type {HTMLElement} */ (document.activeElement));
+    if (e.key === 'Escape' || e.key === 'Tab') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeMenu();
+      G?.dom.scroller.focus({ preventScroll: true });
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      e.stopPropagation();
+      if (list.length) list[(pos + (e.key === 'ArrowDown' ? 1 : list.length - 1)) % list.length]?.focus();
+    } else if (e.key === 'Home' || e.key === 'End') {
+      e.preventDefault();
+      e.stopPropagation();
+      list[e.key === 'Home' ? 0 : list.length - 1]?.focus();
+    }
+  });
+  menu.addEventListener('focusout', (e) => {
+    const to = /** @type {Node | null} */ (e.relatedTarget);
+    if (G?.dom.menu === menu && !(to && menu.contains(to))) closeMenu();
+  });
+  g.dom.menu = menu;
+  root.appendChild(menu);
+  const mw = menu.offsetWidth;
+  const mh = menu.offsetHeight;
+  menu.style.left = `${clamp(x, 4, Math.max(4, window.innerWidth - mw - 4))}px`;
+  menu.style.top = `${clamp(y, 4, Math.max(4, window.innerHeight - mh - 4))}px`;
+  /** @type {HTMLElement | null} */ (menu.querySelector('.fv-menu-item:not(.fv-menu-disabled)'))?.focus({ preventScroll: true });
+  return true;
+}
+
+// ----- FIND BAR -----
+// Find & Replace for delimited text (contract §8.4, §10). Ctrl+F opens it, Ctrl+H opens it with the Replace row; F3 /
+// Shift+F3 and Enter / Shift+Enter go to the next / previous match, Esc closes it. The host searches the values (never
+// the file text): `find` answers with the matches (`all`, for the count) or one match (`next` / `prev`, from the active
+// cell). Replace changes the active cell if it matches (one `setCells`), then moves on; Replace All is ONE `replaceAll`
+// edit (one undo step) that the host plans over every value.
+
+/** Options kept while the view is open (also when the bar is closed and opened again). */
+const findOpts = { text: '', replace: '', matchCase: false, wholeCell: false, regex: false };
+
+/**
+ * @typedef {object} FindUi
+ * @property {HTMLElement} el  the bar
+ * @property {HTMLInputElement} find
+ * @property {HTMLInputElement} replace
+ * @property {HTMLElement} replaceRow
+ * @property {HTMLButtonElement} toggle  shows / hides the Replace row
+ * @property {HTMLElement} count
+ * @property {HTMLButtonElement} caseBtn
+ * @property {HTMLButtonElement} wholeBtn
+ * @property {HTMLButtonElement} regexBtn
+ * @property {HTMLButtonElement} replaceBtn
+ * @property {HTMLButtonElement} replaceAllBtn
+ * @property {boolean} replaceOpen
+ * @property {number} seq  last request id
+ * @property {number} allSeq  id of the last 'all' request (older answers are dropped)
+ * @property {number} navSeq  id of the last next / prev request
+ * @property {ReturnType<typeof setTimeout> | undefined} timer
+ * @property {{ r: number, c: number }[]} all  matches of the last 'all' answer (row-major)
+ * @property {number} total  cells that match (all of them, even when `all` is cut)
+ * @property {boolean} truncated
+ * @property {string} error  the host's message about the pattern / a stopped search, '' when fine
+ * @property {{ editId: number, total: number } | null} replacing  the Replace All in flight
+ */
+
+/** @type {FindUi | null} */
+let findUi = null;
+
+/** @returns {boolean} Is Find available in this view? (delimited text; xlsx gets it with its own host handler) */
+function canFind() {
+  return !!G && G.kind === 'csv' && G.sheet >= 0;
+}
+
+/**
+ * Opens the bar (or moves the focus into it).
+ * @param {boolean} withReplace  Ctrl+H: show the Replace row
+ * @returns {boolean} false when this view has no Find
+ */
+function openFindBar(withReplace) {
+  const g = G;
+  if (!g || !canFind()) return false;
+  closeMenu();
+  const ui = findUi ?? buildFindBar();
+  findUi = ui;
+  const host = g.dom.scroller.parentElement;
+  if (!host) return false;
+  if (!ui.el.isConnected) host.appendChild(ui.el);
+  ui.el.hidden = false;
+  ui.el.dir = isRtl() ? 'rtl' : 'ltr';
+  if (withReplace) ui.replaceOpen = true;
+  updateFindBar();
+  ui.find.focus({ preventScroll: true });
+  ui.find.select();
+  if (ui.find.value !== '') scheduleFind(0);
+  return true;
+}
+
+/** Hides the bar; the focus goes back to the grid. */
+function closeFindBar() {
+  const ui = findUi;
+  if (!ui || ui.el.hidden) return;
+  ui.el.hidden = true;
+  ui.seq++;
+  ui.allSeq = ui.seq;
+  ui.navSeq = ui.seq;
+  findNavAt = 0; // a pending next / prev answer is dropped now: Replace must not wait for it
+  clearTimeout(ui.timer);
+  G?.dom.scroller.focus({ preventScroll: true });
+}
+
+function disposeFindBar() {
+  if (!findUi) return;
+  clearTimeout(findUi.timer);
+  findUi.el.remove();
+  findUi = null;
+}
+
+/** @returns {FindUi} */
+function buildFindBar() {
+  /** @param {string} label @param {string} text @param {string} title @param {() => void} onclick */
+  const button = (label, text, title, onclick) => /** @type {HTMLButtonElement} */ (h('button', { class: 'fv-find-btn', type: 'button', 'aria-label': label, title, onclick }, text));
+  /** @param {string} label @param {string} text @param {string} title @param {'matchCase' | 'wholeCell' | 'regex'} opt */
+  const toggleBtn = (label, text, title, opt) => {
+    const b = /** @type {HTMLButtonElement} */ (h('button', { class: 'fv-find-btn fv-find-opt', type: 'button', 'aria-label': label, 'aria-pressed': String(findOpts[opt]), title }, text));
+    b.addEventListener('click', (ev) => {
+      findOpts[opt] = !findOpts[opt];
+      b.setAttribute('aria-pressed', String(findOpts[opt]));
+      scheduleFind(0);
+      if (ev.detail > 0) find.focus({ preventScroll: true }); // a mouse click; from the keyboard the focus stays, so the new state is announced
+    });
+    return b;
+  };
+  const find = /** @type {HTMLInputElement} */ (
+    h('input', { class: 'fv-find-input', type: 'text', spellcheck: 'false', autocomplete: 'off', maxlength: '1000', 'aria-label': 'Find', placeholder: 'Find', value: findOpts.text })
+  );
+  const replace = /** @type {HTMLInputElement} */ (
+    h('input', { class: 'fv-find-input', type: 'text', spellcheck: 'false', autocomplete: 'off', maxlength: '1000', 'aria-label': 'Replace with', placeholder: 'Replace', value: findOpts.replace })
+  );
+  const count = h('span', { class: 'fv-find-count', role: 'status', 'aria-live': 'polite' });
+  const toggle = /** @type {HTMLButtonElement} */ (
+    h('button', { class: 'fv-find-btn fv-find-toggle', type: 'button', 'aria-label': 'Show Replace', 'aria-expanded': 'false', title: 'Show Replace (Ctrl+H)', onclick: () => toggleReplaceRow() }, '▸')
+  );
+  const caseBtn = toggleBtn('Match case', 'Aa', 'Match case (Alt+C)', 'matchCase');
+  const wholeBtn = toggleBtn('Match the whole cell', 'Cell', 'Match the whole cell (Alt+W)', 'wholeCell');
+  const regexBtn = toggleBtn('Use regular expression', '.*', 'Use regular expression (Alt+R)', 'regex');
+  const replaceBtn = button('Replace', 'Replace', 'Replace this cell, then go to the next match (Enter)', () => findReplaceOne());
+  const replaceAllBtn = button('Replace all', 'Replace all', 'Replace in every matching cell: one undo step (Ctrl+Alt+Enter)', () => findReplaceAll());
+  const replaceRow = h('div', { class: 'fv-find-row fv-find-replace', hidden: true }, replace, replaceBtn, replaceAllBtn);
+  const el = h(
+    'div',
+    { class: 'fv-find', role: 'search', 'aria-label': 'Find and replace', hidden: true },
+    h(
+      'div',
+      { class: 'fv-find-row' },
+      toggle,
+      find,
+      caseBtn,
+      wholeBtn,
+      regexBtn,
+      count,
+      button('Previous match', '↑', 'Previous match (Shift+Enter)', () => findStep('prev')),
+      button('Next match', '↓', 'Next match (Enter)', () => findStep('next')),
+      button('Close', '✕', 'Close (Escape)', () => closeFindBar()),
+    ),
+    replaceRow,
+  );
+  /** @type {FindUi} */
+  const ui = { el, find, replace, replaceRow, toggle, count, caseBtn, wholeBtn, regexBtn, replaceBtn, replaceAllBtn, replaceOpen: false, seq: 0, allSeq: 0, navSeq: 0, timer: undefined, all: [], total: 0, truncated: false, error: '', replacing: null };
+  find.addEventListener('input', () => {
+    findOpts.text = find.value;
+    scheduleFind(150);
+  });
+  replace.addEventListener('input', () => {
+    findOpts.replace = replace.value;
+  });
+  el.addEventListener('keydown', onFindKeyDown);
+  return ui;
+}
+
+/** @param {KeyboardEvent} e */
+function onFindKeyDown(e) {
+  const ui = findUi;
+  if (!ui || e.isComposing) return;
+  const ctrl = e.ctrlKey || e.metaKey;
+  const key = e.key.toLowerCase();
+  // Typing in the boxes is undone by the browser, not by the document: the keys do not reach VS Code (D-026).
+  if (ctrl && !e.altKey && (key === 'z' || key === 'y')) {
+    e.stopPropagation();
+    return;
+  }
+  // Alt+C / W / R by physical key: on macOS Option+C types another character, so `key` is not 'c'
+  const altLetter = e.altKey && !ctrl && !e.shiftKey ? (e.code === 'KeyC' ? 'c' : e.code === 'KeyW' ? 'w' : e.code === 'KeyR' ? 'r' : key) : '';
+  // Enter belongs to the two boxes only: on a button it must keep its own click (Close, Replace all, the options)
+  const inBox = e.target === ui.find || e.target === ui.replace;
+  if (e.key === 'Escape') closeFindBar();
+  else if (e.key === 'Enter' && ctrl && e.altKey) findReplaceAll();
+  else if (e.key === 'Enter' && !ctrl && !e.altKey && inBox && e.target === ui.replace) findReplaceOne();
+  else if (e.key === 'Enter' && !ctrl && !e.altKey && inBox) findStep(e.shiftKey ? 'prev' : 'next');
+  else if (altLetter === 'c' || altLetter === 'w' || altLetter === 'r') (altLetter === 'c' ? ui.caseBtn : altLetter === 'w' ? ui.wholeBtn : ui.regexBtn).click();
+  else return;
+  e.preventDefault();
+  e.stopPropagation();
+}
+
+function toggleReplaceRow() {
+  const ui = findUi;
+  if (!ui) return;
+  ui.replaceOpen = !ui.replaceOpen;
+  updateFindBar();
+  (ui.replaceOpen ? ui.replace : ui.find).focus({ preventScroll: true });
+}
+
+/** Shows what the host allows: the Replace row and buttons follow editState. */
+function updateFindBar() {
+  const ui = findUi;
+  if (!ui) return;
+  const canReplace = hasEditKind('replaceAll') || hasEditKind('setCells');
+  const open = ui.replaceOpen && canReplace;
+  ui.replaceRow.hidden = !open;
+  ui.toggle.hidden = !canReplace;
+  ui.toggle.textContent = open ? '▾' : '▸';
+  ui.toggle.setAttribute('aria-expanded', String(open));
+  ui.toggle.setAttribute('aria-label', open ? 'Hide Replace' : 'Show Replace');
+  ui.toggle.title = open ? 'Hide Replace' : 'Show Replace (Ctrl+H)';
+  ui.replaceBtn.disabled = !(hasEditKind('setCells') && isCellEditable());
+  ui.replaceAllBtn.disabled = !hasEditKind('replaceAll');
+  ui.replace.disabled = !canReplace;
+  // focus inside a part that was just hidden or disabled would fall to the page: move it to the Find box
+  const ae = document.activeElement;
+  if (ae instanceof HTMLElement && ui.el.contains(ae) && ae !== ui.find && (ae.closest('[hidden]') || /** @type {HTMLButtonElement} */ (ae).disabled)) ui.find.focus({ preventScroll: true });
+}
+
+/** @returns {FindQuery} */
+function currentFindQuery() {
+  return { scope: 'csv', text: findOpts.text, matchCase: findOpts.matchCase, regex: findOpts.regex, wholeCell: findOpts.wholeCell, lookIn: 'values' };
+}
+
+/** Looks again for the matches shortly (typing, an option changed). @param {number} delay */
+function scheduleFind(delay) {
+  const ui = findUi;
+  if (!ui) return;
+  clearTimeout(ui.timer);
+  ui.timer = setTimeout(requestAll, delay);
+}
+
+/** The data changed (an edit, undo, another panel): the match list is out of date. */
+function findDataChanged() {
+  if (findUi && !findUi.el.hidden && findOpts.text !== '') scheduleFind(150);
+}
+
+function requestAll() {
+  const ui = findUi;
+  if (!ui || !G || !canFind()) return;
+  if (findOpts.text === '') {
+    ui.seq++;
+    ui.allSeq = ui.seq;
+    ui.all = [];
+    ui.total = 0;
+    ui.truncated = false;
+    ui.error = '';
+    updateFindCount();
+    return;
+  }
+  ui.allSeq = ++ui.seq;
+  post({ type: 'find', reqId: ui.allSeq, query: currentFindQuery(), direction: 'all' });
+}
+
+/**
+ * Goes to the next / previous match after the active cell (wraps around). The answer arrives as `findResult`.
+ * @param {'next' | 'prev'} direction
+ * @returns {boolean} false when there is nothing to do (no Find here)
+ */
+function findStep(direction) {
+  if (!G || !canFind()) return false;
+  // F3 with the bar closed shows it (so the text being searched is visible) and goes on from the active cell.
+  if (!findUi || findUi.el.hidden) {
+    if (!openFindBar(false)) return false;
+    if (findOpts.text !== '') scheduleFind(0);
+  }
+  const ui = /** @type {FindUi} */ (findUi);
+  if (findOpts.text === '') {
+    ui.find.focus({ preventScroll: true });
+    return true;
+  }
+  const a = activeView().sel.active;
+  ui.navSeq = ++ui.seq;
+  findNavAt = Date.now();
+  post({ type: 'find', reqId: ui.navSeq, query: currentFindQuery(), from: { sheetId: 'csv', r: a.r, c: a.c }, direction });
+  return true;
+}
+
+/** When the last next / prev request was sent (0 = answered): Replace waits for the answer, else it would replace the same cell twice. */
+let findNavAt = 0;
+
+/** @param {FindResultMessage} msg */
+function onFindResult(msg) {
+  const ui = findUi;
+  if (!ui || !G || !canFind()) return;
+  if (msg.reqId === ui.allSeq) {
+    ui.all = msg.matches.map((m) => ({ r: m.r, c: m.c }));
+    ui.total = msg.total;
+    ui.truncated = msg.truncated;
+    ui.error = msg.error ?? '';
+    updateFindCount();
+  } else if (msg.reqId === ui.navSeq) {
+    findNavAt = 0;
+    ui.error = msg.error ?? '';
+    const m = msg.matches[0];
+    if (m) {
+      const view = activeView();
+      selectCell(view, m.r, m.c);
+      scrollCellIntoView(view, m.r, m.c);
+      ui.total = msg.total;
+    } else if (!ui.error) {
+      ui.total = 0;
+    }
+    updateFindCount();
+    if (ui.error) setStatusMessage(ui.error, 'warn');
+    else if (m) {
+      // the focus stays in the Find box, so the grid does not announce the cell: say it here (the count says "No results" itself)
+      const shown = displayText(cellAt(activeView(), m.r, m.c));
+      setStatusMessage(`${colName(m.c)}${m.r + 1}${shown ? ': ' + shown.slice(0, 60) : ''}`, 'info');
+    }
+  }
+}
+
+/** The "3 of 12" text (the position needs the full list: not when the host cut it). */
+function updateFindCount() {
+  const ui = findUi;
+  if (!ui) return;
+  let text = '';
+  if (findOpts.text !== '') {
+    if (ui.error && ui.total === 0) text = ui.truncated ? 'Stopped' : 'Invalid'; // a stopped search had a valid pattern
+    else if (ui.total === 0) text = 'No results';
+    else {
+      const a = G && G.sheet >= 0 ? activeView().sel.active : null;
+      const at = a && !ui.truncated ? ui.all.findIndex((m) => m.r === a.r && m.c === a.c) : -1;
+      const total = `${formatCount(ui.total)}${ui.truncated ? '+' : ''}`;
+      text = at >= 0 ? `${formatCount(at + 1)} of ${total}` : `${total} found`;
+    }
+  }
+  ui.count.textContent = text;
+  ui.count.title = ui.error;
+  ui.count.classList.toggle('fv-find-bad', ui.error !== '' && ui.total === 0);
+}
+
+/**
+ * The expression for the current options, the same rules as the host's csvFindPattern (only used on ONE cell value of a
+ * pattern the host has already accepted). @returns {RegExp | null}
+ */
+function findRegexLocal() {
+  if (findOpts.text === '' || findUi?.error) return null;
+  let source = findOpts.regex ? findOpts.text : findOpts.text.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+  if (findOpts.wholeCell) source = `^(?:${source})$`;
+  try {
+    return new RegExp(source, findOpts.matchCase ? 'gu' : 'giu');
+  } catch {
+    try {
+      // unicode mode rejects escapes such as - @ and a literal '{' that VS Code's own Find accepts (same rule as the host)
+      return findOpts.regex ? new RegExp(source, findOpts.matchCase ? 'g' : 'gi') : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
+/** The longest value a regex with this many repeating parts (* + {n}) may run on; same numbers as the host (csvRegexCellLimit). @param {string} src */
+function findRegexCellLimit(src) {
+  let q = 0;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '\\') i++;
+    else if (ch === '[') {
+      i++;
+      if (src[i] === '^') i++;
+      if (src[i] === ']') i++;
+      while (i < src.length && src[i] !== ']') i += src[i] === '\\' ? 2 : 1;
+    } else if (ch === '*' || ch === '+' || (ch === '{' && /\d/.test(src[i + 1] ?? ''))) q++;
+  }
+  return q <= 1 ? 2000 : q === 2 ? 300 : q === 3 ? 100 : 40;
+}
+
+/** Replace: the active cell changes if it matches (like the host's Replace All: a plain replacement is as typed), then the next match is shown. */
+function findReplaceOne() {
+  const ui = findUi;
+  const g = G;
+  if (!ui || !g || !canFind() || !hasEditKind('setCells') || !isCellEditable()) return;
+  if (findNavAt && Date.now() - findNavAt < 3000) return; // the move to the next match is still on its way
+  const view = activeView();
+  const a = view.sel.active;
+  const sheetId = view.meta.id;
+  const re = findRegexLocal();
+  if (!re || sheetId === undefined) return;
+  const cell = cellAt(view, a.r, a.c);
+  const value = cell ? rawValue(cell) : '';
+  // the host bounds regex work by cell length (many * + in a row backtrack for ever on a long value): the same guard here
+  if (findOpts.regex && value.length > findRegexCellLimit(findOpts.text)) {
+    setStatusMessage('This value is too long for this regular expression; it was not replaced.', 'warn');
+    return;
+  }
+  re.lastIndex = 0;
+  if (value !== '' && re.test(value)) {
+    re.lastIndex = 0;
+    const rep = ui.replace.value;
+    const next = findOpts.regex ? value.replace(re, rep) : value.replace(re, () => rep);
+    if (next !== value) {
+      setCellOverlay(view.index, a.r, a.c, next);
+      scheduleRender();
+      updateFormulaBar();
+      sendEdit({ kind: 'setCells', sheetId, cells: [[a.r, a.c, next]] });
+    }
+  } else if (!cell && ui.total > 0) {
+    setStatusMessage('The cell is still loading; press Replace again.', 'info');
+    return;
+  }
+  findStep('next');
+}
+
+function findReplaceAll() {
+  const ui = findUi;
+  if (!ui || !canFind() || !hasEditKind('replaceAll')) return;
+  if (findOpts.text === '') {
+    ui.find.focus({ preventScroll: true });
+    return;
+  }
+  if (ui.error && ui.total === 0) {
+    setStatusMessage(ui.error, 'warn');
+    return;
+  }
+  if (ui.total === 0) {
+    setStatusMessage('Nothing to replace.', 'info');
+    return;
+  }
+  const editId = nextEditId;
+  sendEdit({ kind: 'replaceAll', query: currentFindQuery(), replace: ui.replace.value });
+  if (nextEditId !== editId) ui.replacing = { editId, total: ui.total }; // only when an edit was really sent
+}
+
+/** @param {number} editId @returns {string} the live status after a Replace All */
+function replaceAllDoneText(editId) {
+  const r = findUi?.replacing;
+  if (findUi && r && r.editId === editId) {
+    findUi.replacing = null;
+    return `Replaced in ${countOf(r.total, 'cell')}.`;
+  }
+  return 'Replaced.';
 }
 
 // ----- LINKS & NAVIGATION -----

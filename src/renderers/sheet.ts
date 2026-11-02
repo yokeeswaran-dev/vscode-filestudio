@@ -7280,6 +7280,986 @@ function csvColumnWidths(rows: readonly string[][], colCount: number): Record<nu
   return out;
 }
 
+// ----- CSV EDITS -----
+//
+// (v0.2.0) Minimal text edits for an open CSV / TSV / PSV / SSV TextDocument (contract §2.4 + §8.3; port of the
+// fuzz-tested s2-protocol prototype). The TextDocument is the source of truth: every planner returns sorted,
+// non-overlapping CsvTextEdits for ONE WorkspaceEdit (= one undo step), and records that do not change keep their
+// bytes. Offsets are UTF-16 code units of document.getText(): VS Code has already removed one BOM and unified the line
+// breaks (the index still reads CRLF, CR and LF, so it never needs unifyCsvNewlines). Fields are read with
+// readCsvLikeExcel's rules, so decodeCsvRecord(text, idx, r) equals parseCsv(text, { forView: true }).rows[r] for the
+// pinned delimiter. Values are written exactly as typed (no type parsing: '=1+1' stays text); line breaks inside a
+// value are written as the document EOL.
+
+/** Record offsets of a delimited text. Only the first `count` entries of the three arrays are used. */
+export interface CsvIndex {                       // offsets into document.getText() (after BOM; no newline unification)
+  start: Int32Array; contentEnd: Int32Array; end: Int32Array;   // per record: first char, end of fields, end incl. line break
+  count: number; sepLine: boolean; trailingNewline: boolean; unclosedQuoteRecord: number;   // -1 = none
+  delimiter: string; collapse: boolean;           // pinned (collapse = runs of spaces, SSV)
+}
+export interface CsvTextEdit { start: number; end: number; text: string }  // one TextEdit; never splits CRLF / surrogates
+/** An edit that must not run (contract §8.5). `message` is the full user text; nothing was changed. */
+export class CsvEditBlocked extends Error {
+  constructor(readonly code: 'unclosedQuote' | 'spaceColumns' | 'tooLarge' | 'sepLine' | 'bom', msg: string) {
+    super(msg);
+    this.name = 'CsvEditBlocked';
+  }
+}
+/** How new values are quoted (csvQuotePolicy). Recompute it after the delimiter is re-pinned. */
+export interface CsvQuotePolicy {
+  /** True when value `v` written into column `c` gets quotes. */
+  quote(c: number, v: string): boolean;
+}
+
+/** VS Code passes text documents to extensions only up to 50 MB of UTF-16 code units (VP EXTENSION_SYNC_LIMIT). */
+const CSV_EDIT_MAX_CHARS = 50 * 1024 * 1024;
+/** More changed records than this become one replace from the first to the last changed record (D-032). */
+const CSV_EDIT_JOIN_RECORDS = 2000;
+/** csvQuotePolicy reads the quoting of the first records only. */
+const CSV_QUOTE_SAMPLE_RECORDS = 200;
+/**
+ * The number class of csvQuotePolicy: '.' or ',' decimals. A ';' file from a decimal-comma locale writes '1,5'; the
+ * dot-only rule of serializeCsv's 'nonNumeric' policy (NUMERIC_TEXT_RE) would call it text and quote it.
+ */
+const CSV_NUMBER_CLASS_RE = /^[ \t]*[-+]?(?:\d+[.,]?\d*|[.,]\d+)(?:[eE][-+]?\d+)?[ \t]*$/;
+/** Find & Replace limits (D-047). */
+const CSV_FIND_MAX_LENGTH = 1000;
+/** Replace All with a regular expression stops (and changes nothing) after this long. */
+const CSV_REPLACE_BUDGET_MS = 10_000;
+const CSV_TOO_LARGE_TEXT = 'This change would make the file larger than 50 MB (the extension limit).';
+const CSV_SPACE_COLUMNS_TEXT = 'Columns cannot be inserted or deleted in a space-separated file.';
+
+/** Raw span of one field: [s, e) in the text; `quoted` = it starts with '"'. */
+interface CsvFieldSpan {
+  s: number;
+  e: number;
+  quoted: boolean;
+}
+
+/** Offset of the first record: after a BOM still in the text (a file with two BOMs) and Excel's 'sep=' line. */
+function csvBodyStart(text: string): number {
+  const p = text.charCodeAt(0) === 0xfeff ? 1 : 0;
+  const sep = CSV_SEP_LINE_RE.exec(p ? text.slice(p) : text);
+  return p + (sep ? sep[0].length : 0);
+}
+
+/**
+ * Reads one record from `i` (a record start) with readCsvLikeExcel's field rules and returns where its fields end
+ * (before the line break; space-separated: after trailing spaces). `state.unclosed` is set when a quote never closes
+ * (the record then runs to the end of the text). With `fields`, the raw span of every field is collected.
+ */
+function scanCsvRecord(text: string, i: number, delimiter: string, collapse: boolean, state: { unclosed: boolean }, fields?: CsvFieldSpan[]): number {
+  const n = text.length;
+  const d0 = delimiter.charCodeAt(0);
+  const dl = delimiter.length;
+  if (collapse) while (text.charCodeAt(i) === 32) i++;
+  for (;;) {
+    const s = i;
+    let j = i;
+    let quoted = false;
+    if (text.charCodeAt(i) === 34) {
+      quoted = true;
+      let from = i + 1;
+      for (;;) {
+        const q = text.indexOf('"', from);
+        if (q < 0) {
+          j = n;
+          state.unclosed = true;
+          break;
+        }
+        if (text.charCodeAt(q + 1) === 34) {
+          from = q + 2;
+          continue;
+        }
+        j = q + 1;
+        break;
+      }
+    }
+    let k = j;
+    for (; k < n; k++) {
+      const ch = text.charCodeAt(k);
+      if (ch === 13 || ch === 10 || (ch === d0 && (dl === 1 || text.startsWith(delimiter, k)))) break;
+    }
+    fields?.push({ s, e: k, quoted });
+    if (k >= n) return k;
+    const ch = text.charCodeAt(k);
+    if (ch === 13 || ch === 10) return k;
+    if (!collapse) {
+      i = k + dl;
+      continue;
+    }
+    let m = k;
+    while (text.charCodeAt(m) === 32) m++;
+    if (m < n && text.charCodeAt(m) !== 13 && text.charCodeAt(m) !== 10) {
+      i = m;
+      continue;
+    }
+    return m; // spaces after the last field separate nothing
+  }
+}
+
+/** End of the record whose fields end at `k`: after its line break (CRLF, CR or LF), or the end of the text. */
+function csvRecordEnd(text: string, k: number): number {
+  if (k >= text.length) return text.length;
+  return k + (text.charCodeAt(k) === 13 && text.charCodeAt(k + 1) === 10 ? 2 : 1);
+}
+
+/** Growable Int32Array triple for the record offsets. */
+class CsvIndexBuilder {
+  start: Int32Array;
+  contentEnd: Int32Array;
+  end: Int32Array;
+  count = 0;
+  constructor(capacity: number) {
+    const cap = Math.max(1024, capacity);
+    this.start = new Int32Array(cap);
+    this.contentEnd = new Int32Array(cap);
+    this.end = new Int32Array(cap);
+  }
+  push(s: number, k: number, e: number): void {
+    if (this.count === this.start.length) {
+      const grow = (a: Int32Array): Int32Array => {
+        const b = new Int32Array(a.length * 2);
+        b.set(a);
+        return b;
+      };
+      this.start = grow(this.start);
+      this.contentEnd = grow(this.contentEnd);
+      this.end = grow(this.end);
+    }
+    this.start[this.count] = s;
+    this.contentEnd[this.count] = k;
+    this.end[this.count] = e;
+    this.count++;
+  }
+}
+
+/**
+ * Record index of a delimited text (document.getText()) for the pinned `delimiter` (' ' with `collapse` = runs of
+ * spaces, SSV). Records cover the text after the BOM / 'sep=' line exactly; a final line break ends the last record
+ * (`trailingNewline`), it does not start an empty one (as parseCsv). About 112 ms on 48 MB.
+ */
+export function indexCsv(text: string, delimiter: string, collapse: boolean): CsvIndex {
+  const n = text.length;
+  const bodyStart = csvBodyStart(text);
+  const out = new CsvIndexBuilder(1024);
+  const state = { unclosed: false };
+  let unclosedQuoteRecord = -1;
+  let trailingNewline = false;
+  for (let i = bodyStart; i < n; ) {
+    state.unclosed = false;
+    const k = scanCsvRecord(text, i, delimiter, collapse, state);
+    if (state.unclosed && unclosedQuoteRecord < 0) unclosedQuoteRecord = out.count;
+    const e = csvRecordEnd(text, k);
+    out.push(i, k, e);
+    if (e >= n) {
+      trailingNewline = k < n;
+      break;
+    }
+    i = e;
+  }
+  return {
+    start: out.start,
+    contentEnd: out.contentEnd,
+    end: out.end,
+    count: out.count,
+    sepLine: bodyStart > (text.charCodeAt(0) === 0xfeff ? 1 : 0),
+    trailingNewline,
+    unclosedQuoteRecord,
+    delimiter,
+    collapse,
+  };
+}
+
+function csvFieldSpans(text: string, idx: CsvIndex, r: number): CsvFieldSpan[] {
+  const fields: CsvFieldSpan[] = [];
+  scanCsvRecord(text, idx.start[r], idx.delimiter, idx.collapse, { unclosed: false }, fields);
+  return fields;
+}
+
+/** Field value: a quoted field loses its quotes ('""' = '"'); text after the closing quote is kept (Excel). */
+function decodeCsvField(text: string, f: CsvFieldSpan): string {
+  if (!f.quoted) return text.slice(f.s, f.e);
+  let value = '';
+  let from = f.s + 1;
+  for (;;) {
+    const q = text.indexOf('"', from);
+    if (q < 0 || q >= f.e) return value + text.slice(from, f.e);
+    value += text.slice(from, q);
+    if (q + 1 < f.e && text.charCodeAt(q + 1) === 34) {
+      value += '"';
+      from = q + 2;
+      continue;
+    }
+    return value + text.slice(q + 1, f.e);
+  }
+}
+
+/** The field values of record r (= the view's row r). */
+export function decodeCsvRecord(text: string, idx: CsvIndex, r: number): string[] {
+  return csvFieldSpans(text, idx, r).map((f) => decodeCsvField(text, f));
+}
+
+/** A blank record: one empty field (an empty line; space-separated also an all-space line, or `""`). */
+function csvBlankFields(text: string, fields: readonly CsvFieldSpan[]): boolean {
+  return fields.length === 1 && decodeCsvField(text, fields[0]) === '';
+}
+
+function csvNeedsQuotes(v: string, idx: CsvIndex): boolean {
+  return (
+    v.includes(idx.delimiter) || v.includes('"') || v.includes('\n') || v.includes('\r') ||
+    (idx.collapse && (v === '' || v.includes(' ') || v.includes('\t'))) ||
+    v.endsWith(' ') || v.endsWith('\t') // files.trimTrailingWhitespace would cut it on save (a quoted value ends with a quote)
+  );
+}
+
+function csvValueClass(v: string): 'empty' | 'num' | 'text' {
+  return v === '' ? 'empty' : CSV_NUMBER_CLASS_RE.test(v) ? 'num' : 'text';
+}
+
+/**
+ * The file's quoting style from its first 200 records: per (column, empty/number/text) class, then per class (at
+ * least 3 fields decide; a tie or less = unquoted). A value is always quoted when it must be: the delimiter, '"' or a
+ * line break inside (space-separated: also empty, space or tab).
+ */
+export function csvQuotePolicy(text: string, idx: CsvIndex): CsvQuotePolicy {
+  const counts = new Map<string, { q: number; u: number }>();
+  const add = (key: string, quoted: boolean): void => {
+    let s = counts.get(key);
+    if (!s) counts.set(key, (s = { q: 0, u: 0 }));
+    if (quoted) s.q++;
+    else s.u++;
+  };
+  const sample = Math.min(idx.count, CSV_QUOTE_SAMPLE_RECORDS);
+  for (let r = 0; r < sample; r++) {
+    const fields = csvFieldSpans(text, idx, r);
+    if (fields.length === 1 && fields[0].s === fields[0].e) continue; // an empty line says nothing
+    fields.forEach((f, c) => {
+      const v = decodeCsvField(text, f);
+      if (csvNeedsQuotes(v, idx)) return; // quoted because it must be: says nothing about the style
+      const cls = csvValueClass(v);
+      add(`${c}:${cls}`, f.quoted);
+      add(cls, f.quoted);
+    });
+  }
+  const decide = (s: { q: number; u: number } | undefined): boolean | undefined => (s && s.q + s.u >= 3 ? s.q > s.u : undefined);
+  return {
+    quote(c: number, v: string): boolean {
+      if (csvNeedsQuotes(v, idx)) return true;
+      const cls = csvValueClass(v);
+      return decide(counts.get(`${c}:${cls}`)) ?? decide(counts.get(cls)) ?? false;
+    },
+  };
+}
+
+function encodeCsvField(v: string, c: number, policy: CsvQuotePolicy): string {
+  return policy.quote(c, v) ? `"${v.replace(/"/g, '""')}"` : v;
+}
+
+/** True when offset k of s lies inside a CRLF or a surrogate pair. */
+function csvSplitsPair(s: string, k: number): boolean {
+  if (k <= 0 || k >= s.length) return false;
+  const a = s.charCodeAt(k - 1);
+  const b = s.charCodeAt(k);
+  return (a === 13 && b === 10) || (a >= 0xd800 && a <= 0xdbff && b >= 0xdc00 && b <= 0xdfff);
+}
+
+/**
+ * Shrinks the replace of text[start, end) by `insert` to the part that really changes (common prefix and suffix
+ * kept). The result never starts or ends inside a CRLF or a surrogate pair (old or new text). null = no change.
+ */
+export function trimEdit(text: string, start: number, end: number, insert: string): CsvTextEdit | null {
+  const oldLen = end - start;
+  const max = Math.min(oldLen, insert.length);
+  let a = 0;
+  while (a < max && text.charCodeAt(start + a) === insert.charCodeAt(a)) a++;
+  if (a === oldLen && a === insert.length) return null;
+  while (a > 0 && (csvSplitsPair(text, start + a) || csvSplitsPair(insert, a))) a--;
+  let b = 0;
+  while (b < max - a && text.charCodeAt(end - 1 - b) === insert.charCodeAt(insert.length - 1 - b)) b++;
+  while (b > 0 && (csvSplitsPair(text, end - b) || csvSplitsPair(insert, insert.length - b))) b--;
+  return { start: start + a, end: end - b, text: insert.slice(a, insert.length - b) };
+}
+
+function csvTooLarge(): CsvEditBlocked {
+  return new CsvEditBlocked('tooLarge', CSV_TOO_LARGE_TEXT);
+}
+
+/** Throws `tooLarge` when the text would grow past the extension limit (checked before big strings are built). */
+function csvCheckGrowth(textLength: number, extra: number): void {
+  if (textLength + extra > CSV_EDIT_MAX_CHARS) throw csvTooLarge();
+}
+
+/** Most columns a column edit may reach (Excel has 16,384): bounds the padding / insert work of one small message. */
+const CSV_MAX_COLUMNS = 100000;
+/** A column from an intent: like csvIndexArg, and not past CSV_MAX_COLUMNS. */
+function csvColumnArg(x: number): number {
+  if (csvIndexArg(x) > CSV_MAX_COLUMNS) throw csvTooLarge();
+  return x;
+}
+
+/** A row / column / count from an intent: a non-negative safe integer (parseWebviewMessage checked it already). */
+function csvIndexArg(x: number): number {
+  if (!Number.isSafeInteger(x) || x < 0) throw new Error(`CSV edit: invalid row, column or count (${String(x)})`);
+  return x;
+}
+
+function csvEolValue(v: string, eol: string): string {
+  return v.includes('\r') || v.includes('\n') ? v.replace(/\r\n|\r|\n/g, eol) : v;
+}
+
+/** Sorts and merges edits that touch (same point / adjacent), so a WorkspaceEdit never gets two inserts at one place. */
+function mergeTouchingEdits(edits: CsvTextEdit[]): CsvTextEdit[] {
+  edits.sort((a, b) => a.start - b.start || a.end - b.end);
+  const out: CsvTextEdit[] = [];
+  for (const e of edits) {
+    const last = out[out.length - 1];
+    if (last && e.start <= last.end) {
+      if (e.start < last.end) throw new Error('CSV edit planner: overlapping edits');
+      last.text += e.text;
+      last.end = e.end;
+    } else {
+      out.push({ ...e });
+    }
+  }
+  return out;
+}
+
+/** More than CSV_EDIT_JOIN_RECORDS edits (sorted) -> one replace that keeps the untouched text between them. */
+function joinCsvEdits(text: string, edits: CsvTextEdit[]): CsvTextEdit[] {
+  if (edits.length <= CSV_EDIT_JOIN_RECORDS) return edits;
+  const parts: string[] = [];
+  for (let k = 0; k < edits.length; k++) {
+    if (k) parts.push(text.slice(edits[k - 1].end, edits[k].start));
+    parts.push(edits[k].text);
+  }
+  return [{ start: edits[0].start, end: edits[edits.length - 1].end, text: parts.join('') }];
+}
+
+/**
+ * The edit of record r with `vals` (column -> new value, line breaks already in the document EOL) spliced in: only
+ * changed fields are rewritten (neighbours keep their quoting); a column past the record end pads this record only;
+ * '' on a missing field is a no-op. null = nothing changes.
+ */
+function csvRecordEdit(
+  text: string,
+  idx: CsvIndex,
+  policy: CsvQuotePolicy,
+  r: number,
+  fields: readonly CsvFieldSpan[],
+  vals: ReadonlyMap<number, string>,
+): CsvTextEdit | null {
+  const sep = idx.delimiter;
+  const contentEnd = idx.contentEnd[r];
+  const emptyLine = fields.length === 1 && fields[0].s === fields[0].e;
+  let n = fields.length;
+  let out = '';
+  let pos = idx.start[r];
+  let changed = false;
+  for (const [c, v] of [...vals].sort((a, b) => a[0] - b[0])) {
+    if (c < n) {
+      if (decodeCsvField(text, fields[c]) === v) continue;
+      out += text.slice(pos, fields[c].s) + encodeCsvField(v, c, policy);
+      pos = fields[c].e;
+      changed = true;
+    } else if (v !== '') {
+      // past the record end (ragged): pad this record only
+      csvCheckGrowth(text.length, (c - n) * sep.length);
+      if (pos < contentEnd) {
+        out += text.slice(pos, contentEnd);
+        pos = contentEnd;
+      }
+      // space-separated: the empty field of a blank line must become "" or it would vanish into the spaces
+      if (idx.collapse && emptyLine && n === 1 && !changed) out += encodeCsvField('', 0, policy);
+      for (let x = n; x < c; x++) out += sep + encodeCsvField('', x, policy);
+      out += sep + encodeCsvField(v, c, policy);
+      n = c + 1;
+      changed = true;
+    }
+  }
+  if (!changed) return null;
+  out += text.slice(pos, contentEnd);
+  // the last record cannot be empty without a final line break (it would vanish): write it as ""
+  if (out === '' && r === idx.count - 1 && !idx.trailingNewline) out = '""';
+  return trimEdit(text, idx.start[r], contentEnd, out);
+}
+
+/** One empty record as wide as `width` (space-separated, one column: an empty line). */
+function csvBlankRecord(width: number, policy: CsvQuotePolicy, idx: CsvIndex): string {
+  if (idx.collapse && width <= 1) return '';
+  const parts: string[] = [];
+  for (let c = 0; c < Math.max(1, width); c++) parts.push(encodeCsvField('', c, policy));
+  return parts.join(idx.delimiter);
+}
+
+/** Number of fields of the header record (1 for an empty text). */
+function csvHeaderWidth(text: string, idx: CsvIndex): number {
+  return idx.count ? csvFieldSpans(text, idx, 0).length : 1;
+}
+
+/**
+ * Records below the data (`rows` sorted, all >= idx.count): new records are as wide as the header (wider when a value
+ * is further right), gaps become empty records, and the file keeps its "final line break or not".
+ */
+function csvAppendEdit(
+  text: string,
+  idx: CsvIndex,
+  policy: CsvQuotePolicy,
+  eol: string,
+  rows: readonly number[],
+  byRow: ReadonlyMap<number, ReadonlyMap<number, string>>,
+): CsvTextEdit {
+  const width = csvHeaderWidth(text, idx);
+  const sep = idx.delimiter;
+  const blank = csvBlankRecord(width, policy, idx) + eol;
+  csvCheckGrowth(text.length, (rows[rows.length - 1] - idx.count) * blank.length);
+  let s = '';
+  let next = idx.count;
+  for (const r of rows) {
+    if (r > next) s += blank.repeat(r - next);
+    const vals = byRow.get(r) ?? new Map<number, string>();
+    let maxC = width - 1;
+    for (const [c, v] of vals) if (v !== '' && c > maxC) maxC = c;
+    csvCheckGrowth(text.length + s.length, maxC * sep.length);
+    const parts: string[] = [];
+    for (let c = 0; c <= maxC; c++) parts.push(encodeCsvField(vals.get(c) ?? '', c, policy));
+    s += parts.join(sep) + eol;
+    next = r + 1;
+  }
+  const at = text.length;
+  const body = s.slice(0, s.length - eol.length);
+  if (!idx.count) {
+    // only a BOM / 'sep=' line before: a 'sep=' line without its line break would swallow the first record
+    const last = text.charCodeAt(at - 1);
+    const needsBreak = idx.sepLine && last !== 10 && last !== 13;
+    return { start: at, end: at, text: (needsBreak ? eol : '') + body };
+  }
+  return { start: at, end: at, text: idx.trailingNewline ? s : eol + body };
+}
+
+function planCsvSetCells(
+  text: string,
+  idx: CsvIndex,
+  policy: CsvQuotePolicy,
+  eol: string,
+  cells: readonly (readonly [number, number, string])[],
+): CsvTextEdit[] {
+  const byRow = new Map<number, Map<number, string>>();
+  for (const [r, c, v] of cells) {
+    if (typeof v !== 'string') throw new Error('CSV edit: a cell value is not text');
+    let m = byRow.get(csvIndexArg(r));
+    if (!m) byRow.set(r, (m = new Map()));
+    m.set(csvColumnArg(c), csvEolValue(v, eol)); // the last value for a cell wins
+  }
+  const edits: CsvTextEdit[] = [];
+  const appended: number[] = [];
+  for (const [r, vals] of byRow) {
+    if (r >= idx.count) {
+      // rows below the data: only a value makes a record ('' there is a no-op)
+      for (const v of vals.values()) {
+        if (v !== '') {
+          appended.push(r);
+          break;
+        }
+      }
+      continue;
+    }
+    const e = csvRecordEdit(text, idx, policy, r, csvFieldSpans(text, idx, r), vals);
+    if (e) edits.push(e);
+  }
+  if (appended.length) edits.push(csvAppendEdit(text, idx, policy, eol, appended.sort((a, b) => a - b), byRow));
+  return joinCsvEdits(text, mergeTouchingEdits(edits));
+}
+
+/** Clear contents: existing non-empty fields inside the ranges become ''. Rows / columns past the data are no-ops. */
+function planCsvClear(text: string, idx: CsvIndex, policy: CsvQuotePolicy, ranges: readonly Range[]): CsvTextEdit[] {
+  const rects = ranges.map((g) => ({
+    r0: Math.min(csvIndexArg(g.r0), csvIndexArg(g.r1)),
+    r1: Math.max(g.r0, g.r1),
+    c0: Math.min(csvIndexArg(g.c0), csvIndexArg(g.c1)),
+    c1: Math.max(g.c0, g.c1),
+  }));
+  // union of the row spans, clamped to the records
+  const spans = rects
+    .map((g) => [g.r0, Math.min(g.r1, idx.count - 1)] as [number, number])
+    .filter(([a, b]) => a <= b)
+    .sort((x, y) => x[0] - y[0]);
+  const merged: [number, number][] = [];
+  for (const [a, b] of spans) {
+    const last = merged[merged.length - 1];
+    if (last && a <= last[1] + 1) last[1] = Math.max(last[1], b);
+    else merged.push([a, b]);
+  }
+  const edits: CsvTextEdit[] = [];
+  for (const [a, b] of merged) {
+    for (let r = a; r <= b; r++) {
+      const fields = csvFieldSpans(text, idx, r);
+      let vals: Map<number, string> | undefined;
+      for (const g of rects) {
+        if (r < g.r0 || r > g.r1) continue;
+        const hi = Math.min(g.c1, fields.length - 1);
+        for (let c = g.c0; c <= hi; c++) if (decodeCsvField(text, fields[c]) !== '') (vals ??= new Map()).set(c, '');
+      }
+      const e = vals && csvRecordEdit(text, idx, policy, r, fields, vals);
+      if (e) edits.push(e);
+    }
+  }
+  return joinCsvEdits(text, edits);
+}
+
+/** Empty records (as wide as the header) before record `at`. Rows below the data are virtual: nothing to insert. */
+function planCsvInsertRows(text: string, idx: CsvIndex, policy: CsvQuotePolicy, eol: string, at: number, count: number): CsvTextEdit[] {
+  if (!count || at >= idx.count) return [];
+  const one = csvBlankRecord(csvHeaderWidth(text, idx), policy, idx) + eol;
+  csvCheckGrowth(text.length, count * one.length);
+  return [{ start: idx.start[at], end: idx.start[at], text: one.repeat(count) }];
+}
+
+/** Removes records [at, at + count) with their line breaks; the "no final line break" state is kept when possible. */
+function planCsvDeleteRows(idx: CsvIndex, at: number, count: number): CsvTextEdit[] {
+  const last = Math.min(idx.count, at + count) - 1;
+  if (!count || at > last) return [];
+  if (last === idx.count - 1 && !idx.trailingNewline) {
+    if (at === 0) return [{ start: idx.start[0], end: idx.end[last], text: '' }];
+    // also drop the line break before them, unless the new last record would then be empty (it would vanish:
+    // the file then keeps that line break, so it ends with one)
+    if (idx.contentEnd[at - 1] > idx.start[at - 1]) return [{ start: idx.contentEnd[at - 1], end: idx.end[last], text: '' }];
+  }
+  return [{ start: idx.start[at], end: idx.end[last], text: '' }];
+}
+
+/**
+ * Rebuilds the span from the first to the last changed record as ONE replace (whole-file operations, D-032):
+ * `fn` returns a record's new text or null (unchanged); untouched records and line breaks in between are kept.
+ */
+function csvPerRecord(text: string, idx: CsvIndex, fn: (r: number) => string | null): CsvTextEdit[] {
+  let first = -1;
+  let last = -1;
+  let size = text.length;
+  const pieces: string[] = [];
+  for (let r = 0; r < idx.count; r++) {
+    let rec = fn(r);
+    if (rec === null) continue;
+    if (rec === '' && r === idx.count - 1 && !idx.trailingNewline) rec = '""'; // see csvRecordEdit
+    size += rec.length - (idx.contentEnd[r] - idx.start[r]);
+    if (size > CSV_EDIT_MAX_CHARS) throw csvTooLarge();
+    if (first < 0) first = r;
+    else pieces.push(text.slice(idx.contentEnd[last], idx.start[r]));
+    pieces.push(rec);
+    last = r;
+  }
+  if (first < 0) return [];
+  const e = trimEdit(text, idx.start[first], idx.contentEnd[last], pieces.join(''));
+  return e ? [e] : [];
+}
+
+/** Empty columns before column `at` in every record that reaches it (shorter and blank records stay as they are). */
+function planCsvInsertCols(text: string, idx: CsvIndex, policy: CsvQuotePolicy, at: number, count: number): CsvTextEdit[] {
+  if (idx.collapse) throw new CsvEditBlocked('spaceColumns', CSV_SPACE_COLUMNS_TEXT);
+  if (!count) return [];
+  if (at + count > CSV_MAX_COLUMNS) throw csvTooLarge();
+  csvCheckGrowth(text.length, count * idx.delimiter.length * Math.max(idx.count, 1)); // by multiplication, before any string is built
+  let ins = '';
+  for (let k = 0; k < count; k++) ins += encodeCsvField('', at + k, policy) + idx.delimiter;
+  return csvPerRecord(text, idx, (r) => {
+    const fields = csvFieldSpans(text, idx, r);
+    if (fields.length <= at || csvBlankFields(text, fields)) return null;
+    return text.slice(idx.start[r], fields[at].s) + ins + text.slice(fields[at].s, idx.contentEnd[r]);
+  });
+}
+
+/**
+ * Removes columns [at, at + count) from every record that has them (a record that loses all becomes blank). A blank
+ * record (an empty line or `""`) stays as it is: its value does not change.
+ */
+function planCsvDeleteCols(text: string, idx: CsvIndex, at: number, count: number): CsvTextEdit[] {
+  if (idx.collapse) throw new CsvEditBlocked('spaceColumns', CSV_SPACE_COLUMNS_TEXT);
+  if (!count) return [];
+  return csvPerRecord(text, idx, (r) => {
+    const fields = csvFieldSpans(text, idx, r);
+    const n = fields.length;
+    if (n <= at || csvBlankFields(text, fields)) return null;
+    const stop = at + count;
+    const s0 = idx.start[r];
+    if (stop < n) return text.slice(s0, fields[at].s) + text.slice(fields[stop].s, idx.contentEnd[r]);
+    if (at > 0) return text.slice(s0, fields[at - 1].e) + text.slice(fields[n - 1].e, idx.contentEnd[r]);
+    return '';
+  });
+}
+
+/**
+ * Sorts whole records by column `key` (D-034): record 0 (the header) and the 'sep=' line never move (the range is
+ * clamped to start at row 2; `header` = the range's first row is a header too), trailing blank records are not
+ * sorted, and records move as raw slices (byte-identical). Numbers (as the grid reads them) before text (case-
+ * insensitive), blank keys last in both orders; stable.
+ */
+function planCsvSort(text: string, idx: CsvIndex, eol: string, range: Range, key: number, desc: boolean, header: boolean): CsvTextEdit[] {
+  const lo = Math.min(csvIndexArg(range.r0), csvIndexArg(range.r1));
+  const r0 = Math.max(lo + (header ? 1 : 0), 1);
+  let r1 = Math.min(Math.max(range.r0, range.r1), idx.count - 1);
+  while (r1 >= r0 && csvBlankFields(text, csvFieldSpans(text, idx, r1))) r1--;
+  if (r1 - r0 < 1) return [];
+  const collator = new Intl.Collator(undefined, { sensitivity: 'base' }); // accented letters sort with their base letter
+  const keys: { r: number; blank: boolean; num: number | undefined; str: string }[] = [];
+  for (let r = r0; r <= r1; r++) {
+    const fields = csvFieldSpans(text, idx, r);
+    const v = key < fields.length ? decodeCsvField(text, fields[key]) : '';
+    const t = v.trim();
+    const num = t === '' ? undefined : csvNumber(v, idx.delimiter);
+    keys.push({ r, blank: t === '', num, str: num === undefined ? t : '' });
+  }
+  keys.sort((a, b) => {
+    if (a.blank || b.blank) return a.blank === b.blank ? a.r - b.r : a.blank ? 1 : -1;
+    let d: number;
+    if (a.num !== undefined && b.num !== undefined) d = a.num - b.num;
+    else if (a.num !== undefined || b.num !== undefined) d = a.num !== undefined ? -1 : 1;
+    else d = collator.compare(a.str, b.str);
+    return (desc ? -d : d) || a.r - b.r;
+  });
+  const parts = keys.map((k) => text.slice(idx.start[k.r], idx.contentEnd[k.r]));
+  let joined = parts.join(eol);
+  // an empty record moved to the very end of a file without a final line break would vanish: keep its line break
+  if (r1 === idx.count - 1 && !idx.trailingNewline && parts[parts.length - 1] === '') joined += eol;
+  const e = trimEdit(text, idx.start[r0], idx.contentEnd[r1], joined);
+  return e ? [e] : [];
+}
+
+/** Nested quantifiers ((x+)+, (x*)*, (x+)*) or a repeated group whose alternatives overlap ((x|x)+): may backtrack forever. */
+function csvRiskyPattern(src: string): boolean {
+  interface Group {
+    inner: boolean;
+    altStart: number;
+    alts: string[];
+  }
+  const stack: Group[] = [];
+  let closed: Group | null = null; // the group that ended just before the current character
+  const overlapping = (alts: readonly string[]): boolean => {
+    for (let a = 0; a < alts.length; a++) {
+      for (let b = a + 1; b < alts.length; b++) if (alts[a].startsWith(alts[b]) || alts[b].startsWith(alts[a])) return true;
+    }
+    return false;
+  };
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '\\') {
+      i++;
+      closed = null;
+    } else if (ch === '[') {
+      i++;
+      if (src[i] === '^') i++;
+      if (src[i] === ']') i++;
+      while (i < src.length && src[i] !== ']') i += src[i] === '\\' ? 2 : 1;
+      closed = null;
+    } else if (ch === '(') {
+      let body = i + 1;
+      if (src[body] === '?') {
+        if (src[body + 1] === '<' && src[body + 2] !== '=' && src[body + 2] !== '!') body = Math.max(body, src.indexOf('>', body) + 1);
+        else body += src[body + 1] === '<' ? 3 : 2;
+      }
+      stack.push({ inner: false, altStart: body, alts: [] });
+      i = body - 1;
+      closed = null;
+    } else if (ch === '|') {
+      const top = stack[stack.length - 1];
+      if (top) {
+        top.alts.push(src.slice(top.altStart, i));
+        top.altStart = i + 1;
+      }
+      closed = null;
+    } else if (ch === ')') {
+      const g = stack.pop();
+      closed = null;
+      if (g) {
+        g.alts.push(src.slice(g.altStart, i));
+        if (g.inner && stack.length) stack[stack.length - 1].inner = true;
+        closed = g;
+      }
+    } else if (ch === '?') {
+      // an optional part inside a group counts as a repeat ((a|b?){24}, (a?)+); a lazy '?' after a repeat is harmless
+      if (stack.length) stack[stack.length - 1].inner = true;
+      closed = null;
+    } else if (ch === '*' || ch === '+' || ch === '{') {
+      if (closed && (closed.inner || overlapping(closed.alts) || closed.alts.includes(''))) return true;
+      if (stack.length) stack[stack.length - 1].inner = true;
+      if (ch === '{') {
+        const close = src.indexOf('}', i);
+        if (close > i) i = close;
+      }
+      closed = null;
+    } else {
+      closed = null;
+    }
+  }
+  return false;
+}
+
+/**
+ * Repeating parts (* + {n,m}) of a regex source, outside classes and escapes. Many of them in a row backtrack in
+ * polynomial time (a*a*a*b), which a pattern check cannot catch; csvRegexCellLimit bounds the cell length instead.
+ */
+function csvRegexQuantifiers(src: string): number {
+  let n = 0;
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (ch === '\\') i++;
+    else if (ch === '[') {
+      i++;
+      if (src[i] === '^') i++;
+      if (src[i] === ']') i++;
+      while (i < src.length && src[i] !== ']') i += src[i] === '\\' ? 2 : 1;
+    } else if (ch === '*' || ch === '+' || (ch === '{' && /\d/.test(src[i + 1] ?? ''))) n++;
+  }
+  return n;
+}
+
+/** The longest cell a regex with `q` repeating parts may run on (a few tens of ms at most per cell; measured). */
+function csvRegexCellLimit(q: number): number {
+  return q <= 1 ? 2000 : q === 2 ? 300 : q === 3 ? 100 : 40;
+}
+const CSV_REGEX_MAX_QUANTIFIERS = 4;
+
+/**
+ * Find & Replace query -> global RegExp (D-047): at most 1,000 characters, compiled in try, nested-quantifier
+ * patterns refused. Unicode mode (a match never splits a surrogate pair); case-insensitive unless matchCase;
+ * wholeCell = the whole value must match. `invalid` = the user message.
+ */
+export function csvFindPattern(q: FindQuery): { re: RegExp; maxCell: number } | { invalid: string } {
+  if (typeof q.text !== 'string' || q.text === '') return { invalid: 'Type the text to find.' };
+  if (q.text.length > CSV_FIND_MAX_LENGTH) return { invalid: 'The search text is too long (at most 1,000 characters).' };
+  if (q.regex && csvRiskyPattern(q.text)) return { invalid: 'This pattern could take too long; simplify it.' };
+  const quantifiers = q.regex ? csvRegexQuantifiers(q.text) : 0;
+  if (quantifiers > CSV_REGEX_MAX_QUANTIFIERS) return { invalid: 'This pattern has too many repeating parts (* + {n}) and could take too long; simplify it.' };
+  let source = q.regex ? q.text : q.text.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+  if (q.wholeCell) source = `^(?:${source})$`;
+  try {
+    const maxCell = q.regex ? csvRegexCellLimit(quantifiers) : Infinity;
+    try {
+      return { re: new RegExp(source, q.matchCase ? 'gu' : 'giu'), maxCell };
+    } catch (unicodeError) {
+      // unicode mode rejects escapes such as \- \@ and a literal '{' that VS Code's own Find accepts: try without it
+      if (!q.regex) throw unicodeError;
+      return { re: new RegExp(source, q.matchCase ? 'g' : 'gi'), maxCell };
+    }
+  } catch (error) {
+    return { invalid: `This is not a valid regular expression: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+/**
+ * Replace All, recomputed here over every value (never a list from the webview). Plain text: every match becomes
+ * `replace` as typed; regex: JavaScript replacement patterns ($1, $&). Empty values are never changed.
+ */
+function planCsvReplaceAll(text: string, idx: CsvIndex, policy: CsvQuotePolicy, eol: string, query: FindQuery, replace: string): CsvTextEdit[] {
+  const found = csvFindPattern(query);
+  if ('invalid' in found) throw new Error(found.invalid);
+  const { re, maxCell } = found;
+  const rep = csvEolValue(String(replace), eol);
+  const started = Date.now();
+  const edits: CsvTextEdit[] = [];
+  for (let r = 0; r < idx.count; r++) {
+    const fields = csvFieldSpans(text, idx, r);
+    let vals: Map<number, string> | undefined;
+    for (let c = 0; c < fields.length; c++) {
+      const v = decodeCsvField(text, fields[c]);
+      if (v === '') continue;
+      if (query.regex) {
+        if (v.length > maxCell) {
+          throw new Error(
+            `Row ${r + 1} has a value of ${v.length.toLocaleString('en-US')} characters, too long for this regular expression (limit ${maxCell}); nothing was changed. Simplify the pattern or use plain text.`,
+          );
+        }
+        if (Date.now() - started > CSV_REPLACE_BUDGET_MS) {
+          throw new Error('Replace All took too long and was stopped; nothing was changed. Simplify the pattern.');
+        }
+      }
+      re.lastIndex = 0;
+      const next = query.regex ? v.replace(re, rep) : v.replace(re, () => rep);
+      if (next !== v) (vals ??= new Map()).set(c, csvEolValue(next, eol));
+    }
+    const e = vals && csvRecordEdit(text, idx, policy, r, fields, vals);
+    if (e) edits.push(e);
+  }
+  return joinCsvEdits(text, edits);
+}
+
+/** The first characters (at least `limit`, when the text is that long) of the text after `edits` (sorted, not overlapping). */
+function csvResultHead(text: string, edits: readonly CsvTextEdit[], limit: number): string {
+  let out = '';
+  let pos = 0;
+  for (const e of edits) {
+    if (out.length >= limit) break;
+    out += text.slice(pos, e.start) + e.text;
+    pos = e.end;
+  }
+  return out + text.slice(pos, pos + limit);
+}
+
+/** True when the text after `edits` (sorted, not overlapping) starts with Excel's 'sep=X' line, which reads as the delimiter, not as a record. */
+function csvMakesSepLine(text: string, edits: readonly CsvTextEdit[]): boolean {
+  const LIMIT = 4096;
+  const out = csvResultHead(text, edits, LIMIT);
+  const body = out.charCodeAt(0) === 0xfeff ? out.slice(1) : out;
+  if (body.length >= LIMIT && !/[\r\n]/.test(body)) return false; // cut inside a very long line: not a sep line
+  return CSV_SEP_LINE_RE.test(body);
+}
+
+/**
+ * The minimal text edits for one CSV edit intent (setCells, clear, insert/delete rows/cols, sort, replaceAll) on
+ * document.getText() with its pinned index: sorted, non-overlapping, for ONE WorkspaceEdit. `eol` = document.eol (new
+ * records and line breaks inside values). Throws CsvEditBlocked (§8.5: a quote never closed, column insert/delete in
+ * a space-separated file, a result over 50 MB) or a plain Error (a kind that is not a CSV edit, bad numbers, an
+ * invalid find pattern); nothing is changed then.
+ */
+export function planCsvEdit(text: string, idx: CsvIndex, policy: CsvQuotePolicy, eol: '\n' | '\r\n', i: EditIntent): CsvTextEdit[] {
+  if (idx.unclosedQuoteRecord >= 0) {
+    throw new CsvEditBlocked(
+      'unclosedQuote',
+      `Row ${idx.unclosedQuoteRecord + 1} opens a quote that is never closed; editing could change the rest of the file.`,
+    );
+  }
+  let edits: CsvTextEdit[];
+  switch (i.kind) {
+    case 'setCells':
+      edits = planCsvSetCells(text, idx, policy, eol, i.cells);
+      break;
+    case 'clear':
+      edits = i.what === 'formats' ? [] : planCsvClear(text, idx, policy, i.ranges); // CSV has no formats
+      break;
+    case 'insertRows':
+      edits = planCsvInsertRows(text, idx, policy, eol, csvIndexArg(i.at), csvIndexArg(i.count));
+      break;
+    case 'deleteRows':
+      edits = planCsvDeleteRows(idx, csvIndexArg(i.at), csvIndexArg(i.count));
+      break;
+    case 'insertCols':
+      edits = planCsvInsertCols(text, idx, policy, csvIndexArg(i.at), csvIndexArg(i.count));
+      break;
+    case 'deleteCols':
+      edits = planCsvDeleteCols(text, idx, csvIndexArg(i.at), csvIndexArg(i.count));
+      break;
+    case 'sort':
+      edits = planCsvSort(text, idx, eol, i.range, csvIndexArg(i.key), !!i.desc, !!i.header);
+      break;
+    case 'replaceAll':
+      edits = planCsvReplaceAll(text, idx, policy, eol, i.query, i.replace);
+      break;
+    default:
+      throw new Error(`CSV edit: '${i.kind}' is not available for delimited text`);
+  }
+  if (edits.length && !idx.sepLine && csvMakesSepLine(text, edits)) {
+    throw new CsvEditBlocked(
+      'sepLine',
+      "This edit would make the first line 'sep=' plus one character. Excel and FileStudio read that line as the delimiter setting, not as data, so the row would disappear. Use a different value.",
+    );
+  }
+  if (edits.length && text.charCodeAt(0) !== 0xfeff && csvResultHead(text, edits, 1).charCodeAt(0) === 0xfeff) {
+    // VS Code reads a U+FEFF at the start of a file as a BOM: the character would vanish from the cell on reopen
+    throw new CsvEditBlocked('bom', 'This edit would put the invisible character U+FEFF at the very start of the file. It would be read as a byte order mark and lost from the cell. Use a different value.');
+  }
+  let size = text.length;
+  for (const e of edits) size += e.text.length - (e.end - e.start);
+  if (size > CSV_EDIT_MAX_CHARS && size > text.length) throw csvTooLarge();
+  return edits;
+}
+
+/** Largest record r with idx.start[r] <= x (-1 when x is before the first record). */
+function csvRecordAt(idx: CsvIndex, x: number): number {
+  let lo = 0;
+  let hi = idx.count - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1;
+    if (idx.start[mid] <= x) {
+      found = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  return found;
+}
+
+/**
+ * The index after `edits` (planned on the OLD text: sorted, non-overlapping) were applied; `text` is the NEW text.
+ * Only the records the edits touch are re-scanned, later offsets are shifted (value edits: about 3 ms on 346k
+ * records). Falls back to a full indexCsv when the re-scan does not end on an old record boundary, the edits touch
+ * the BOM / 'sep=' line, or the lengths do not add up.
+ */
+export function shiftCsvIndex(idx: CsvIndex, edits: CsvTextEdit[], text: string): CsvIndex {
+  const full = (): CsvIndex => indexCsv(text, idx.delimiter, idx.collapse);
+  const n0 = idx.count;
+  if (!n0 || idx.unclosedQuoteRecord >= 0) return full();
+  const oldLength = idx.end[n0 - 1];
+  const sorted = [...edits].sort((a, b) => a.start - b.start || a.end - b.end);
+  if (!sorted.length) return text.length === oldLength ? idx : full();
+  if (sorted[0].start < idx.start[0]) return full();
+  // dirty regions: records [ra, rb] re-scanned; `before` / `after` = text growth before / after the region
+  const regions: { ra: number; rb: number; before: number; after: number }[] = [];
+  let growth = 0;
+  let prevEnd = -1;
+  for (const e of sorted) {
+    if (e.start < prevEnd || e.end < e.start || e.end > oldLength) return full();
+    prevEnd = e.end;
+    const ra = csvRecordAt(idx, e.start);
+    const rb = Math.max(ra, e.end > e.start ? csvRecordAt(idx, e.end - 1) : ra);
+    const before = growth;
+    growth += e.text.length - (e.end - e.start);
+    const last = regions[regions.length - 1];
+    if (last && ra <= last.rb) {
+      last.rb = Math.max(last.rb, rb);
+      last.after = growth;
+    } else {
+      regions.push({ ra, rb, before, after: growth });
+    }
+  }
+  const n = text.length;
+  if (oldLength + growth !== n) return full();
+  const out = new CsvIndexBuilder(n0 + 64);
+  const state = { unclosed: false };
+  let trailingNewline = idx.trailingNewline;
+  let r = 0;
+  for (let g = 0; g < regions.length; g++) {
+    const { ra, rb, before, after } = regions[g];
+    for (; r < ra; r++) out.push(idx.start[r] + before, idx.contentEnd[r] + before, idx.end[r] + before);
+    let pos = idx.start[ra] + before;
+    const target = idx.end[rb] + after;
+    if (pos >= n) return full();
+    for (;;) {
+      state.unclosed = false;
+      const k = scanCsvRecord(text, pos, idx.delimiter, idx.collapse, state);
+      if (state.unclosed) return full();
+      const e = csvRecordEnd(text, k);
+      out.push(pos, k, e);
+      pos = e;
+      if (e >= n) {
+        // the text ends here: valid only when the last region reaches the old end too
+        if (target !== n || g !== regions.length - 1) return full();
+        trailingNewline = k < n;
+        r = n0;
+        break;
+      }
+      if (pos === target) {
+        r = rb + 1;
+        break;
+      }
+      if (pos > target) return full(); // the edit changed where later records split
+    }
+  }
+  const shift = growth;
+  for (; r < n0; r++) out.push(idx.start[r] + shift, idx.contentEnd[r] + shift, idx.end[r] + shift);
+  return {
+    start: out.start,
+    contentEnd: out.contentEnd,
+    end: out.end,
+    count: out.count,
+    sepLine: idx.sepLine,
+    trailingNewline,
+    unclosedQuoteRecord: -1,
+    delimiter: idx.delimiter,
+    collapse: idx.collapse,
+  };
+}
+
 // ===== LOSSY FEATURES =====
 
 const LOSSY = {

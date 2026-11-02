@@ -12,7 +12,7 @@ No Microsoft Office, no LibreOffice, no browser: click the file and work with it
 | | Format | File types | |
 | --- | --- | --- | --- |
 | 📊 | **Excel spreadsheets** | `.xlsx` | view and edit |
-| 🧾 | **CSV and delimited text** | `.csv` `.tsv` `.psv` `.ssv` | view |
+| 🧾 | **CSV and delimited text** | `.csv` `.tsv` `.psv` `.ssv` | view and edit |
 | 📄 | **Word documents** | `.docx` | view |
 | 📕 | **PDF documents** | `.pdf` | view |
 | 📽️ | **PowerPoint presentations** | `.pptx` `.pptm` `.ppsx` `.ppsm` `.potx` `.potm` | view |
@@ -36,9 +36,16 @@ No Microsoft Office, no LibreOffice, no browser: click the file and work with it
 - **Safe saving:** only the edited cells change in the file. Charts, pivot tables, comments and other content stay
   as they are. The new file is checked before it is written. The first save keeps a copy as `<name>.xlsx.bak`.
 
-### 🧾 CSV / TSV viewer
+### 🧾 CSV / TSV viewer and editor
 - Comma, semicolon, tab, pipe or space: the **delimiter is detected automatically** (Excel's `sep=` line too).
 - Stays in sync while you edit the file as text. **FileStudio: Change Delimiter** picks another one.
+- **Edit in the grid:** type, F2 or double-click, Delete, paste a block (one undo step), and **right-click** a cell, row
+  or column header to insert or delete rows and columns, clear, or sort (row 1 is the header and stays on top).
+  **Find and Replace** with Ctrl+F / Ctrl+H.
+- **Only what you edit changes in the file:** other lines, quotes, line endings and the BOM stay as they are. What you
+  type is saved as text (`=1+1` stays text). Files over 50 MB, files with a wrong encoding and files that VS Code would
+  save differently stay in the text editor (a file with mixed line endings asks first: **Edit anyway**). Columns of a
+  file split on spaces cannot be inserted or deleted. Turn editing off with **FileStudio > Csv > Editing**.
 
 ### 📄 Word / DOCX viewer
 - Clean reading view with headings, lists, **tables, images** and links.
@@ -121,9 +128,9 @@ Yes, all three open in FileStudio, without Microsoft Office.
 Not yet. Save them as `.docx`, `.xlsx` or `.pptx` first.
 
 **Can I edit the files?**
-Yes, from 0.2.0: cells in `.xlsx` workbooks, and Markdown files (WYSIWYG mode and task checkboxes; Split mode uses
-VS Code's own text editor). CSV, Word, PDF and PowerPoint files are view-only in FileStudio. To change a CSV file,
-use **Reopen as Text**.
+Yes: cells in `.xlsx` workbooks (from 0.2.0), delimited text files `.csv` `.tsv` `.psv` `.ssv` (from 0.2.1), and
+Markdown files (WYSIWYG mode and task checkboxes; Split mode uses VS Code's own text editor). Word, PDF and PowerPoint
+files are view-only in FileStudio.
 
 **Will saving change parts of my workbook that I did not edit?**
 No. FileStudio changes only the cells you edited. The new file is checked before it is written, and it is never left
@@ -167,8 +174,9 @@ See the [issues](https://github.com/yokeeswaran-dev/vscode-filestudio/issues) fo
 
 - **0.2.0:** edit cells in spreadsheets (`.xlsx`) and edit Markdown. CSV, Word, PDF and PowerPoint files stay
   view-only.
-- **Under consideration:** edit CSV and other delimited files in the grid; insert and delete rows, columns and sheets,
-  and change cell formatting in `.xlsx`; formula calculation. There is no date for these.
+- **0.2.1:** edit CSV, TSV, PSV and SSV files in the grid (cells, rows, columns, sort, Find and Replace).
+- **Under consideration:** insert and delete rows, columns and sheets, and change cell formatting in `.xlsx`; formula
+  calculation. There is no date for these.
 - **Next (planned):** fill PDF forms and add notes to PDF pages; change text and table cells in Word files and add
   comments; change slide text and speaker notes in PowerPoint files, hide slides and change their order.
 - **Later:** rotate, delete and reorder PDF pages; track changes in Word files; delete and copy slides.

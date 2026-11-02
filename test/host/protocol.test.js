@@ -260,7 +260,7 @@ function openText(name, text, kind) {
   return { uri, document, panel };
 }
 
-test('xlsx cell editing is on (P2); an intent that is not implemented yet is answered blocked, a malformed one invalid; CSV stays view-only', async () => {
+test('xlsx cell editing is on (P2); an intent that is not implemented yet is answered blocked, a malformed one invalid', async () => {
   const sheet = await openSheet('view-only.xlsx');
   assert.equal(sheet.init.readOnly, false);
   assert.deepEqual(sheet.init.editState, { editable: true, kinds: ['setCells', 'clear'] });
@@ -279,17 +279,7 @@ test('xlsx cell editing is on (P2); an intent that is not implemented yet is ans
   sheet.panel.send({ type: 'command', id: 'undo' });
   await tick(50);
   assert.deepEqual(sheet.panel.posted, []);
-
-  const csv = openText('view-only.csv', 'a,b\n1,2\n', 'csv');
-  csv.panel.send({ type: 'ready' });
-  const init = await waitFor(() => lastOf(csv.panel, 'init'), 3000, 'csv init');
-  assert.equal(init.readOnly, true);
-  assert.deepEqual(init.editState, { editable: false, kinds: [] });
-  csv.panel.send(edit({ kind: 'setCells', sheetId: 'csv', cells: [[0, 0, 'b']] }));
-  const csvResult = await waitFor(() => lastOf(csv.panel, 'editResult'), 3000, 'editResult');
-  assert.equal(csvResult.code, 'blocked');
-  assert.equal(csv.document.getText(), 'a,b\n1,2\n');
-  assert.deepEqual(T.calls.filter((c) => c[0] === 'applyEdit'), []);
+  // CSV is editable since P3 (CsvDocState): see test/host/csv-docstate.test.js.
 });
 
 test('a Markdown init carries editState (editable) and readOnly = !editable', async () => {
