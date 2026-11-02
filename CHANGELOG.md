@@ -48,6 +48,18 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - WYSIWYG no longer adds a blank line next to a heading or a code fence that had none, and a setext heading keeps
   its `=====` / `-----` underline.
 
+### Fixed
+
+#### Spreadsheets (`.xlsx`)
+
+- A workbook whose `styles.xml` or worksheet head has XML comments or CDATA sections can now be edited and saved (it opened read-only before). The comments are kept exactly. A comment that is not closed or not well-formed still opens the workbook read-only.
+- A slow rejection of an edit no longer moves the focus from the name box back to the cell editor.
+- Closing a tab with the mouse while a cell is open for typing now asks first (the tab turns unsaved when you type). Choose **Save** to save the typed text as well. The tab turns unsaved without adding an undo step, so undo still returns it to clean.
+- A workbook with an XML comment or CDATA section inside a font, fill, border or cell-format item of `styles.xml` is opened read-only up front (it cannot be patched safely), instead of failing when you save.
+- A refused edit text is not opened again when the focus has moved to another control (name box, formula bar, tabs); the status line shows the reason and says that the typed text was not kept.
+- After an auto save while a cell is open for typing, more typing marks the tab unsaved again (closing still asks).
+- The first edit in a large workbook is quicker: the safety check starts while you type into the cell.
+
 ## [0.2.0] - 2026-11-01
 
 ### Added

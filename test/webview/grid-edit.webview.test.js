@@ -82,6 +82,14 @@ function editHost(fileName, build, opts = {}) {
         }
         return [host.answer(model, msg)];
       }
+      if (msg.type === 'flushed') {
+        (host.flushed = host.flushed || []).push({ id: msg.id, edits: host.edits.length });
+        return [];
+      }
+      if (msg.type === 'draftTyped') {
+        host.drafts = (host.drafts || 0) + 1;
+        return [];
+      }
       if (msg.type === 'command') {
         host.commands.push(msg);
         return [];
@@ -504,6 +512,119 @@ H.suite('sheet: grid cell editor (P2 core)', ({ test }) => {
       assert.equal((await g.cellBox())?.value, 'NO', 'the editor is open again with the refused text');
       assert.equal(await g.nameBox(), 'B1');
       await p.keyboard.press('Escape');
+    });
+  });
+
+  test('E7b 0.2.1 B4: a late rejection does not take the focus from the name box (the refused editor is not reopened)', (h) => {
+    const host = book();
+    host.hold = true;
+    return h.use(host, {}, async (view) => {
+      const g = H.grid(view);
+      const p = view.page;
+      host.reject = { code: 'blocked', reason: 'This cell is part of an array formula (K5:K7). Edit it in Excel.' };
+      await g.goto('B1');
+      await p.keyboard.type('NO');
+      await p.keyboard.press('Enter');
+      await view.settle();
+      assert.equal(host.edits.length, 1);
+      // the user goes to the name box before the (slow) host answers
+      await view.eval(() => document.querySelector('.fv-namebox').focus());
+      await view.settle();
+      assert.equal(await view.eval(() => document.activeElement?.classList.contains('fv-namebox')), true);
+      host.hold = false;
+      await host.release(view);
+      await view.settle();
+      assert.match(await status(view), /array formula/, 'the reason is still shown');
+      assert.equal(await g.cellBox(), null, 'no cell editor opened');
+      assert.equal(await view.eval(() => document.activeElement?.classList.contains('fv-namebox')), true, 'the focus stays in the name box');
+    });
+  });
+
+  test('E7c 0.2.1 B5: the host is told once when text is typed into the cell editor (not for F2 alone, not for the read-only box)', (h) => {
+    const host = book();
+    return h.use(host, {}, async (view) => {
+      const g = H.grid(view);
+      const p = view.page;
+      await g.goto('B1');
+      await p.keyboard.press('F2');
+      await view.settle();
+      assert.equal(host.drafts || 0, 0, 'F2 alone: the text is unchanged');
+      await p.keyboard.type('ab');
+      await view.settle();
+      assert.equal(host.drafts, 1, 'once per editor, not once per key');
+      await p.keyboard.press('Escape');
+      await g.goto('C1');
+      await p.keyboard.type('x'); // typing opens the editor with the first key
+      await view.settle();
+      assert.equal(host.drafts, 2, 'a new editor tells again');
+      await p.keyboard.press('Escape');
+    }).then(() => h.use(book({ editState: { editable: false, reason: 'x' } }), {}, async (view) => {
+      const g = H.grid(view);
+      await g.goto('B1');
+      await view.page.keyboard.press('F2');
+      await view.page.keyboard.type('zz');
+      await view.settle();
+    }));
+  });
+
+  test('E7d 0.2.1 B5 r1: a flushRequest commits the open draft first (edit, then flushed); an editor the user is typing in is left alone', (h) => {
+    const host = book();
+    return h.use(host, {}, async (view) => {
+      const g = H.grid(view);
+      const p = view.page;
+      await g.goto('B1');
+      await p.keyboard.press('F2');
+      await p.keyboard.type('draft');
+      await view.settle();
+      await view.push({ type: 'flushRequest', id: 1 });
+      await view.settle();
+      assert.deepEqual(host.flushed, [{ id: 1, edits: 0 }], 'focus is in the editor: not committed, but answered');
+      assert.equal(host.edits.length, 0);
+      await p.evaluate(() => { document.hasFocus = () => false; });
+      await view.push({ type: 'flushRequest', id: 2 });
+      await view.settle();
+      assert.equal(host.edits.length, 1, 'the draft was committed');
+      assert.deepEqual(host.flushed[1], { id: 2, edits: 1 }, 'flushed comes after the edit');
+      await view.settle();
+      assert.equal(await cellText(view, 'Shortdraft'), true);
+    });
+  });
+
+  test('E7e 0.2.1 R1: after a flush (auto save) while typing, more typing tells the host again (the close prompt is not lost)', (h) => {
+    const host = book();
+    return h.use(host, {}, async (view) => {
+      const g = H.grid(view);
+      const p = view.page;
+      await g.goto('B1');
+      await p.keyboard.press('F2');
+      await p.keyboard.type('ab');
+      await view.settle();
+      assert.equal(host.drafts, 1);
+      await view.push({ type: 'flushRequest', id: 1 });
+      await view.settle();
+      await p.keyboard.type('c');
+      await view.settle();
+      assert.equal(host.drafts, 2, 'typing after the flush tells again');
+      await p.keyboard.press('Escape');
+    });
+  });
+
+  test('E7f 0.2.1 R1: a refused text that is not reopened (focus elsewhere) says in the status that it was not kept', (h) => {
+    const host = book();
+    host.hold = true;
+    return h.use(host, {}, async (view) => {
+      const g = H.grid(view);
+      const p = view.page;
+      host.reject = { code: 'blocked', reason: 'This cell is part of an array formula (K5:K7). Edit it in Excel.' };
+      await g.goto('B1');
+      await p.keyboard.type('NO');
+      await p.keyboard.press('Enter');
+      await view.settle();
+      await view.eval(() => document.querySelector('.fv-namebox').focus());
+      host.hold = false;
+      await host.release(view);
+      await view.settle();
+      assert.match(await status(view), /array formula.*not kept/s);
     });
   });
 

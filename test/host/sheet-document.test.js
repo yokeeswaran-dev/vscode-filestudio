@@ -884,3 +884,91 @@ test('F-R3: a too-large workbook with a chart is blocked, with no "Edit anyway" 
   assert.equal(state.code, 'blocked');
   assert.equal(state.canEditAnyway, undefined);
 });
+
+// ===== 0.2.1 B5: an open cell draft marks the tab unsaved =====
+
+test('B5: markDraftTyped marks the tab unsaved (content-change event, no undo step); save changes nothing in the file', async () => {
+  const { uri, doc, events } = await open();
+  let changed = 0;
+  doc.onDidChange(() => changed++);
+  const before = sha(uri.fsPath);
+  const mtime = fs.statSync(uri.fsPath).mtimeMs;
+  doc.markDraftTyped();
+  assert.equal(changed, 1, 'VS Code gets one change event, so the tab turns dirty');
+  assert.equal(events.length, 0, 'no undo step');
+  assert.equal(doc.hasUnsavedChanges, false, 'no real change: nothing to write');
+  await doc.save(token);
+  assert.equal(sha(uri.fsPath), before, 'save writes nothing');
+  assert.equal(fs.statSync(uri.fsPath).mtimeMs, mtime);
+});
+
+test('B8: typing into the cell editor starts the patch check in the background (the first edit then does not wait for it); open alone still does not (R2-4)', async () => {
+  const { doc, provider } = await open('prewarm.xlsx');
+  const panel = T.createPanel();
+  provider.resolveCustomEditor(doc, panel, token);
+  panel.send({ type: 'ready' });
+  await waitFor(() => panel.posted.find((m) => m.type === 'init'), 20000, 'init');
+  await tick(50);
+  assert.equal(doc.scan, undefined, 'no scan at open');
+  panel.send({ type: 'draftTyped' });
+  await waitFor(() => doc.scan !== undefined, 5000, 'scan started by typing');
+  await doc.ensureScan();
+  assert.equal(doc.hasUnsavedChanges, false, 'the check changes nothing');
+});
+
+// ===== 0.2.1 B5 round 1 =====
+
+test('B5 r1: markDraftTyped never adds an undo step (edit + undo stays clean; no swallowed Ctrl+Z after a save)', async () => {
+  const { doc, events } = await open();
+  doc.markDraftTyped();
+  assert.equal(events.length, 0, 'clean document: no undo step under the next real edit');
+  await doc.queue.run(() => doc.commit({ label: 'e', after: { ops: [A1('x')], expect: [] } }));
+  assert.equal(events.length, 1, 'the real edit is the only undo step');
+  await doc.save(token);
+  doc.markDraftTyped(); // clean again, journal pos 1
+  assert.equal(events.length, 1, 'after a save: no no-op on top of the real edit');
+});
+
+test('B5 r1: markDraftTyped still tells VS Code the document changed (content-change event) and obeys the editing kill switch', async () => {
+  const { doc } = await open();
+  let any = 0;
+  doc.onDidChange(() => any++);
+  doc.markDraftTyped();
+  assert.equal(any, 1, 'the tab turns unsaved');
+  T.config.set('fileStudio.editing.enabled', false);
+  doc.markDraftTyped();
+  assert.equal(any, 1, 'editing is off: nothing is marked');
+});
+
+test('B5 r1: Save with an open draft asks the editor to commit it first, waits for that edit, then saves it', async () => {
+  const { uri, doc, provider } = await open('flush.xlsx');
+  const panel = T.createPanel();
+  provider.resolveCustomEditor(doc, panel, token);
+  panel.send({ type: 'ready' });
+  await waitFor(() => panel.posted.find((m) => m.type === 'init'), 20000, 'init');
+  panel.send({ type: 'draftTyped' });
+  await tick(20);
+  const saving = provider.saveCustomDocument(doc, token);
+  const req = await waitFor(() => panel.posted.find((m) => m.type === 'flushRequest'), 5000, 'flushRequest');
+  panel.send({ type: 'edit', editId: 77, baseVersion: doc.versions.version, intent: { kind: 'setCells', sheetId: 's1', cells: [[0, 0, 'typed']] } });
+  panel.send({ type: 'flushed', id: req.id });
+  await saving;
+  assert.equal(doc.hasUnsavedChanges, false, 'saved');
+  const zip = await JSZip.loadAsync(fs.readFileSync(uri.fsPath));
+  assert.match(await zip.file('xl/sharedStrings.xml').async('string'), /typed/, 'the draft text is in the file');
+});
+
+test('B5 r1: Save with no draft does not talk to the editor; a silent editor delays Save only by the time limit', async () => {
+  const { doc, provider } = await open('flush2.xlsx');
+  const panel = T.createPanel();
+  provider.resolveCustomEditor(doc, panel, token);
+  panel.send({ type: 'ready' });
+  await waitFor(() => panel.posted.find((m) => m.type === 'init'), 20000, 'init');
+  await provider.saveCustomDocument(doc, token);
+  assert.equal(panel.posted.some((m) => m.type === 'flushRequest'), false, 'no draft: no request');
+  panel.send({ type: 'draftTyped' });
+  await tick(20);
+  const t0 = Date.now();
+  await provider.saveCustomDocument(doc, token); // nobody answers
+  assert.ok(Date.now() - t0 < 6000, 'gives up after the limit');
+});

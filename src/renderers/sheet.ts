@@ -3699,7 +3699,8 @@ function windowsPath(path: string): string {
   return (/^[\\/]{2}/.test(path) ? '\\\\' : /^[\\/]/.test(path) ? '\\' : '') + out.join('\\');
 }
 
-function parseRawStyles(xml: string): RawStyles {
+function parseRawStyles(rawXml: string): RawStyles {
+  const xml = maskXmlMarkup(rawXml, false);
   const numFmts = new Map<number, string>();
   for (const m of xml.matchAll(/<(?:\w+:)?numFmt\b([^>]*?)\/?>/g)) {
     const attrs = parseXmlAttributes(m[1]);
@@ -9253,6 +9254,37 @@ function isXmlNameEnd(code: number): boolean {
   return code === 0x20 || code === 0x3e || code === 0x2f || code === 0x09 || code === 0x0a || code === 0x0d;
 }
 
+/**
+ * The same text with every XML comment and CDATA section (markers included) replaced by spaces, so the length and every
+ * offset stay the same. The patchers search by text and byte; they search the masked text and cut the real one, so a
+ * comment is kept exactly and a fake tag inside it is never found. strict: an unterminated comment or CDATA section, or
+ * "--" inside a comment, throws a PatchError (fail closed); not strict: such a part is masked to its end.
+ */
+function maskXmlMarkup(text: string, strict: boolean, where = 'a part'): string {
+  if (!text.includes('<!--') && !text.includes('<![CDATA[')) return text;
+  let out = '';
+  let pos = 0;
+  for (;;) {
+    const a = text.indexOf('<!--', pos);
+    const b = text.indexOf('<![CDATA[', pos);
+    const start = a < 0 ? b : b < 0 ? a : Math.min(a, b);
+    if (start < 0) break;
+    const isComment = start === a;
+    const closeTag = isComment ? '-->' : ']]>';
+    let end = text.indexOf(closeTag, start + (isComment ? 4 : 9));
+    if (end < 0) {
+      if (strict) throw new PatchError(`${where} has an XML comment or CDATA section that is not closed`);
+      end = text.length;
+    } else {
+      if (strict && isComment && text.slice(start + 4, end).includes('--')) throw new PatchError(`${where} has an XML comment that is not well-formed`);
+      end += closeTag.length;
+    }
+    out += text.slice(pos, start) + ' '.repeat(end - start);
+    pos = end;
+  }
+  return out + text.slice(pos);
+}
+
 /** Root element prefix ('' or 'x:') of a part. */
 function xmlRootPrefix(head: string, local: string, where: string): string {
   const m = new RegExp(`<([A-Za-z_][\\w.-]*:)?${local}[\\s>/]`).exec(head);
@@ -9548,12 +9580,38 @@ async function indexOfCooperative(buf: Buffer, needle: Buffer, from: number, onY
  */
 async function sheetLayout(buf: Buffer, where: string, onYield?: SaveYieldHook): Promise<SheetXmlLayout> {
   assertUtf8Head(buf, where);
-  const P = xmlRootPrefix(buf.toString('latin1', 0, Math.min(buf.length, 16384)), 'worksheet', where);
-  const sdOpen = findStartTag(buf, Buffer.from(`<${P}sheetData`), 0, buf.length);
-  if (sdOpen < 0) throw new PatchError(`${where} has no cell data (<sheetData>)`);
-  // The locator walks bytes, not an XML tree: a comment in the head could hold a fake <sheetData> (the edit would go into the comment).
-  const head = buf.subarray(0, sdOpen);
-  if (head.includes('<!--') || head.includes('<![CDATA[')) throw new PatchError(`${where} has an XML comment or CDATA section before its cell data`);
+  const P = xmlRootPrefix(maskXmlMarkup(buf.toString('latin1', 0, Math.min(buf.length, 16384)), false), 'worksheet', where);
+  // The locator walks bytes, not an XML tree: a comment in the head could hold a fake <sheetData> (the edit would go into
+  // the comment). So a <sheetData> inside a comment or CDATA section of the head is skipped; comments stay as they are.
+  const sdTag = Buffer.from(`<${P}sheetData`);
+  let sdOpen = -1;
+  for (let pos = 0; ;) {
+    const sd = findStartTag(buf, sdTag, pos, buf.length);
+    if (sd < 0) throw new PatchError(`${where} has no cell data (<sheetData>)`);
+    let skipTo = -1;
+    for (let p = pos; ;) {
+      const window = buf.subarray(p, sd);
+      const a = window.indexOf('<!--');
+      const b = window.indexOf('<![CDATA[');
+      const i = a < 0 ? b : b < 0 ? a : Math.min(a, b);
+      if (i < 0) break;
+      const isComment = i === a;
+      const close = buf.indexOf(isComment ? '-->' : ']]>', p + i + (isComment ? 4 : 9));
+      if (close < 0) throw new PatchError(`${where} has an XML comment or CDATA section that is not closed`);
+      const end = close + 3;
+      if (end > sd) {
+        skipTo = end;
+        break;
+      }
+      p = end;
+    }
+    if (skipTo < 0) {
+      sdOpen = sd;
+      break;
+    }
+    pos = skipTo;
+  }
+  maskXmlMarkup(buf.toString('latin1', 0, sdOpen), true, where);
   const gt = buf.indexOf(0x3e, sdOpen);
   if (gt < 0) throw new PatchError(`${where} is damaged`);
   const sdSelfClosing = buf[gt - 1] === 0x2f;
@@ -9620,7 +9678,7 @@ function parseRowCells(body: string, P: string, r: number, where: string): CellS
 
 /** Style index of each column from <cols> (0 = none). */
 function columnStyles(buf: Buffer, L: SheetXmlLayout): (c: number) => number {
-  const head = buf.toString('latin1', 0, L.sdOpen);
+  const head = maskXmlMarkup(buf.toString('latin1', 0, L.sdOpen), false);
   const cols: { min: number; max: number; style: number }[] = [];
   for (const m of head.matchAll(new RegExp(`<${regexEscape(L.P)}col\\b[^>]*>`, 'g'))) {
     const attrs = parseXmlAttrs(m[0]);
@@ -10055,28 +10113,29 @@ const BUILTIN_NUMFMT_IDS: Record<string, number> = { General: 0, '0': 1, '0.00':
 const MAX_CELL_XFS = 64000;
 
 /** The children of a container element of styles.xml (for example the <font> items of <fonts>). */
-function styleSection(text: string, P: string, container: StyleSectionName, child: string, where: string): StyleSection | undefined {
-  const m = new RegExp(`<${regexEscape(P)}${container}(?:\\s[^>]*?)?(/?)>`).exec(text);
+function styleSection(text: string, masked: string, P: string, container: StyleSectionName, child: string, where: string): StyleSection | undefined {
+  const m = new RegExp(`<${regexEscape(P)}${container}(?:\\s[^>]*?)?(/?)>`).exec(masked);
   if (!m) return undefined;
   const start = m.index;
   const openEnd = start + m[0].length;
   if (m[1] === '/') return { start, openEnd, closeStart: openEnd, end: openEnd, open: m[0], items: [], selfClosing: true };
   const closeTag = `</${P}${container}>`;
-  const closeStart = text.indexOf(closeTag, openEnd);
+  const closeStart = masked.indexOf(closeTag, openEnd);
   if (closeStart < 0) throw new PatchError(`${where} is damaged (<${container}>)`);
   const body = text.slice(openEnd, closeStart);
+  const maskedBody = masked.slice(openEnd, closeStart);
   const items: string[] = [];
   const tag = `<${P}${child}`;
   const endTag = `</${P}${child}>`;
   for (let p = 0; ;) {
-    const i = body.indexOf(tag, p);
+    const i = maskedBody.indexOf(tag, p);
     if (i < 0) break;
-    if (!isXmlNameEnd(body.charCodeAt(i + tag.length))) {
+    if (!isXmlNameEnd(maskedBody.charCodeAt(i + tag.length))) {
       p = i + tag.length;
       continue;
     }
-    const gt = body.indexOf('>', i);
-    const end = body[gt - 1] === '/' ? gt + 1 : body.indexOf(endTag, gt) + endTag.length;
+    const gt = maskedBody.indexOf('>', i);
+    const end = maskedBody[gt - 1] === '/' ? gt + 1 : maskedBody.indexOf(endTag, gt) + endTag.length;
     if (gt < 0 || end < gt) throw new PatchError(`${where} is damaged (<${child}>)`);
     items.push(body.slice(i, end));
     p = end;
@@ -10104,19 +10163,31 @@ class StylesPatch {
   /** Highest numFmtId used anywhere in the part (numFmts, xfs, dxfs): a new custom format gets a higher id. */
   private readonly maxNumFmtId: number;
 
+  /** The text with comments and CDATA blanked out (same offsets): every search runs on this, every cut on `text`. */
+  private readonly masked: string;
+
   constructor(private readonly text: string, private readonly where: string) {
+    const masked = (this.masked = maskXmlMarkup(text, true, where));
     let maxId = 163;
-    for (const m of text.matchAll(/\snumFmtId\s*=\s*["'](\d+)["']/g)) maxId = Math.max(maxId, Number(m[1]));
+    for (const m of masked.matchAll(/\snumFmtId\s*=\s*["'](\d+)["']/g)) maxId = Math.max(maxId, Number(m[1]));
     this.maxNumFmtId = maxId;
-    const P = (this.P = xmlRootPrefix(text, 'styleSheet', where));
+    const P = (this.P = xmlRootPrefix(masked, 'styleSheet', where));
     this.sec = {
-      numFmts: styleSection(text, P, 'numFmts', 'numFmt', where),
-      fonts: styleSection(text, P, 'fonts', 'font', where),
-      fills: styleSection(text, P, 'fills', 'fill', where),
-      borders: styleSection(text, P, 'borders', 'border', where),
-      cellXfs: styleSection(text, P, 'cellXfs', 'xf', where),
+      numFmts: styleSection(text, masked, P, 'numFmts', 'numFmt', where),
+      fonts: styleSection(text, masked, P, 'fonts', 'font', where),
+      fills: styleSection(text, masked, P, 'fills', 'fill', where),
+      borders: styleSection(text, masked, P, 'borders', 'border', where),
+      cellXfs: styleSection(text, masked, P, 'cellXfs', 'xf', where),
     };
     if (!this.sec.fonts || !this.sec.fills || !this.sec.cellXfs) throw new PatchError(`${where} has no fonts, fills or cell formats`);
+  }
+
+  /** True when a comment or CDATA section sits inside a font, fill, border, numFmt or xf item (the item parser cannot read it). */
+  hasMarkupInItems(): boolean {
+    for (const name of Object.keys(this.sec) as StyleSectionName[]) {
+      for (const item of this.sec[name]?.items ?? []) if (maskXmlMarkup(item, false) !== item) return true;
+    }
+    return false;
   }
 
   private count(name: StyleSectionName): number {
@@ -10280,7 +10351,8 @@ class StylesPatch {
         : text.slice(0, s.start) + open + text.slice(s.openEnd, s.closeStart) + items + text.slice(s.closeStart);
     }
     if (!this.sec.numFmts && this.added.numFmts.length) {
-      const m = new RegExp(`<${regexEscape(P)}styleSheet\\b[^>]*>`).exec(text);
+      // Searched in the masked ORIGINAL: every edit above sits after the root start tag, so this offset is still right.
+      const m = new RegExp(`<${regexEscape(P)}styleSheet\\b[^>]*>`).exec(this.masked);
       if (!m) throw new PatchError(`${this.where} is damaged`);
       const at = m.index + m[0].length;
       text = text.slice(0, at) + `<${P}numFmts count="${this.added.numFmts.length}">${this.added.numFmts.join('')}</${P}numFmts>` + text.slice(at);
@@ -10453,8 +10525,9 @@ function widenDimension(parts: Buffer[], L: SheetXmlLayout, rows: Map<number, Ma
   if (r1 < 0 || parts[0].length < L.sdOpen) return;
   const head = parts[0].toString('utf8', 0, L.sdOpen);
   const re = new RegExp(`<${regexEscape(L.P)}dimension\\b[^>]*>`);
-  const tag = re.exec(head)?.[0];
-  if (!tag) return;
+  const found = re.exec(maskXmlMarkup(head, false));
+  if (!found) return;
+  const tag = head.slice(found.index, found.index + found[0].length);
   const attrs = parseXmlAttrs(tag);
   const m = /^\$?([A-Za-z]{1,3})\$?(\d+)(?::\$?([A-Za-z]{1,3})\$?(\d+))?$/.exec((xmlAttrText(attrs, 'ref') ?? '').trim());
   if (!m) return;
@@ -10469,7 +10542,7 @@ function widenDimension(parts: Buffer[], L: SheetXmlLayout, rows: Map<number, Ma
   if (n0 === a0 && n1 === a1 && q0 === b0 && q1 === b1) return;
   const ref = `${indexToCol(n0)}${q0 + 1}:${indexToCol(n1)}${q1 + 1}`;
   const newTag = tag.replace(/(\sref\s*=\s*)("[^"]*"|'[^']*')/, `$1"${ref}"`);
-  parts[0] = Buffer.concat([Buffer.from(head.replace(tag, () => newTag), 'utf8'), parts[0].subarray(L.sdOpen)]);
+  parts[0] = Buffer.concat([Buffer.from(head.slice(0, found.index) + newTag + head.slice(found.index + tag.length), 'utf8'), parts[0].subarray(L.sdOpen)]);
 }
 
 function sheetLabel(sheet: XlsxSheetRef): string {
@@ -10715,7 +10788,7 @@ async function verifySheetRows(baseBuf: Buffer, newBuf: Buffer, patchedRows: Rea
   // The <dimension ref> in the head may be widened by the patch (widenDimension): only its ref may differ, and the new
   // ref must be a plain range. Everything else of the head is compared byte by byte below.
   const dimOf = (buf: Buffer, L: SheetXmlLayout): { start: number; end: number; tag: string } | undefined => {
-    const head = buf.toString('latin1', 0, L.sdOpen);
+    const head = maskXmlMarkup(buf.toString('latin1', 0, L.sdOpen), false);
     const m = new RegExp(`<${regexEscape(L.P)}dimension\\b[^>]*>`).exec(head);
     return m ? { start: m.index, end: m.index + m[0].length, tag: m[0] } : undefined;
   };
@@ -11183,9 +11256,17 @@ export async function checkPatchable(
         if (path === pkg.sstPath && (text.includes('<!--') || text.includes('<![CDATA['))) {
           return { ok: false, reason: 'its shared strings contain an XML comment or CDATA section' };
         }
-        // The styles patcher finds <cellXfs> and the other containers by text search: a comment could hold a fake one.
-        if (path === pkg.stylesPath && (text.includes('<!--') || text.includes('<![CDATA['))) {
-          return { ok: false, reason: 'its styles contain an XML comment or CDATA section' };
+        // The styles patcher masks comments and CDATA; a comment that is not closed or not well-formed is refused.
+        if (path === pkg.stylesPath) {
+          maskXmlMarkup(text, true, 'its styles');
+          // A comment BETWEEN items is kept as it is; one INSIDE an item cannot be read by the item parser: refused now, not at save.
+          let inItem = false;
+          try {
+            inItem = new StylesPatch(text, 'its styles').hasMarkupInItems();
+          } catch {
+            inItem = false; // other damage is judged where it always was: when a style edit needs the part
+          }
+          if (inItem) return { ok: false, reason: 'its styles contain an XML comment or CDATA section inside a style item' };
         }
       }
     }

@@ -366,6 +366,8 @@ export type WebviewMessage =
   | { type: 'measure'; reqId: number; sheetId: SheetId; axis: 'row' | 'col'; index: number }
   /** P6 WYSIWYG; P2 grid while an edit is in flight (D-067). The host runs it after the queued edits. */
   | { type: 'command'; id: 'undo' | 'redo' | 'save' }
+  /** (0.2.1 B5) The user typed into the xlsx cell editor: the tab is marked unsaved, so closing it asks first. Never changes the file. */
+  | { type: 'draftTyped' }
   /** P6: switch the Markdown mode of this panel. */
   | { type: 'setMode'; mode: MarkdownMode }
   /** P6 split sync: the preview scrolled to this (fractional) source line. */
@@ -1085,6 +1087,8 @@ export function parseWebviewMessage(raw: unknown, kind?: ViewKind): WebviewMessa
     }
     case 'command':
       return raw.id === 'undo' || raw.id === 'redo' || raw.id === 'save' ? { type: 'command', id: raw.id } : undefined;
+    case 'draftTyped':
+      return kind === 'sheet' ? { type: 'draftTyped' } : undefined;
     case 'setMode':
       return raw.mode === 'preview' || raw.mode === 'split' || raw.mode === 'wysiwyg' ? { type: 'setMode', mode: raw.mode } : undefined;
     case 'previewScrolled':
@@ -1138,6 +1142,7 @@ export interface ViewEditHandlers {
   onFilter?(msg: MessageOf<'filter'>): unknown;
   onMeasure?(msg: MessageOf<'measure'>): unknown;
   onCommand?(msg: MessageOf<'command'>): unknown;
+  onDraftTyped?(msg: MessageOf<'draftTyped'>): unknown;
   onSetMode?(msg: MessageOf<'setMode'>): unknown;
   onPreviewScrolled?(msg: MessageOf<'previewScrolled'>): unknown;
   onFlushed?(msg: MessageOf<'flushed'>): unknown;
@@ -1366,6 +1371,8 @@ class ViewerSession implements vscode.Disposable {
         return h.onMeasure ? h.onMeasure(msg) : this.notAvailable(msg);
       case 'command':
         return h.onCommand ? h.onCommand(msg) : this.notAvailable(msg);
+      case 'draftTyped':
+        return h.onDraftTyped ? h.onDraftTyped(msg) : this.notAvailable(msg);
       case 'setMode':
         return h.onSetMode ? h.onSetMode(msg) : this.notAvailable(msg);
       case 'previewScrolled':
@@ -3218,6 +3225,25 @@ export class SheetDocument implements vscode.CustomDocument {
     if (this.hasUnsavedChanges) this.fireNoopEdit();
   }
 
+  /**
+   * (0.2.1 B5) The user typed into a cell editor that is not committed yet. Closing the tab with the mouse would drop that
+   * text without a question, because the document is not dirty. One no-op edit makes VS Code's tab dirty, so it asks
+   * (Save / Don't Save / Cancel). Nothing is written for it: with no real change a save writes nothing (saveNow step 1).
+   * Not needed when real edits already make the document dirty. Save asks the editor to commit the draft first (flushDrafts).
+   */
+  markDraftTyped(): void {
+    if (this.disposed || !editingEnabled('xlsx', this.uri)) return;
+    this.draftPending = true;
+    if (this.hasUnsavedChanges) return;
+    // Only the content-change event (no undo step): a no-op edit would sit under the next real edit and swallow the first Ctrl+Z
+    // after a save (as fireDirtyMark explains). VS Code keeps this dirty mark until the next save or revert, also after an undo
+    // back to the start (real VS Code test B5 r1); the save writes nothing.
+    this._onDidChange.fire({ document: this } as unknown as vscode.CustomDocumentEditEvent<SheetDocument>);
+  }
+
+  /** (0.2.1 B5) A cell editor with typed text was reported and no save has asked for it yet: Save first asks the editor to commit it. */
+  draftPending = false;
+
   private changed(): void {
     if (!this.disposed) this._onDidChangeState.fire();
   }
@@ -3480,6 +3506,7 @@ export class SheetDocument implements vscode.CustomDocument {
   }
 
   private markSaved(): void {
+    this.draftPending = false;
     this.savedStateId = this.stateId;
     this.divergedFromDisk = false;
   }
@@ -4041,6 +4068,13 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
       onEdit: (msg) => this.onEdit(document, session, msg),
       onEditAnyway: () => this.onEditAnyway(document),
       onCommand: (msg) => this.onCommand(document, msg),
+      onFlushed: (msg) => this.onSheetFlushed(document, msg),
+      onDraftTyped: () => {
+        document.markDraftTyped();
+        // (0.2.1 B8) The patch check is the cost of a cold first edit (80-150 ms near the size limit): the user is typing now,
+        // so it runs in the background. A workbook that is only opened or read still never starts it (R2-4).
+        void document.lazyScan();
+      },
     };
     session.onDispose(handle);
     session.onDispose(document.onDidChangeState(() => void handle.doc.refresh()));
@@ -4053,8 +4087,52 @@ export class SheetEditorProvider implements vscode.CustomEditorProvider<SheetDoc
     });
   }
 
-  saveCustomDocument(document: SheetDocument, cancellation: vscode.CancellationToken): Promise<void> {
+  async saveCustomDocument(document: SheetDocument, cancellation: vscode.CancellationToken): Promise<void> {
+    if (document.draftPending) await this.flushDrafts(document);
     return document.save(cancellation);
+  }
+
+  /** Sheet flushes in flight: the id of a flushRequest -> the function that ends the wait. */
+  private readonly sheetFlushes = new Map<number, () => void>();
+  private sheetFlushId = 0;
+
+  /**
+   * (0.2.1 B5) Save (also from the close prompt) with a cell editor open: the editor commits its text first, so the draft is
+   * saved too. Waits for the edit to be done, at most SHEET_FLUSH_TIMEOUT_MS; a silent editor never blocks the save.
+   */
+  private async flushDrafts(document: SheetDocument): Promise<void> {
+    document.draftPending = false;
+    const waits: Promise<void>[] = [];
+    for (const panel of document.panels) {
+      const session = this.sessions.get(panel);
+      if (!session || !session.isReady) continue;
+      const id = ++this.sheetFlushId;
+      waits.push(
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            this.sheetFlushes.delete(id);
+            getLog().warn(`[sheet] ${document.fileName}: the editor did not answer the flush request in time`);
+            resolve();
+          }, SHEET_FLUSH_TIMEOUT_MS);
+          this.sheetFlushes.set(id, () => {
+            clearTimeout(timer);
+            resolve();
+          });
+          session.post({ type: 'flushRequest', id });
+        }),
+      );
+    }
+    await Promise.all(waits);
+  }
+
+  /** `flushed` comes after the flush's edit message: answered when every edit queued so far is done. */
+  private async onSheetFlushed(document: SheetDocument, msg: MessageOf<'flushed'>): Promise<void> {
+    const done = this.sheetFlushes.get(msg.id);
+    if (!done) return;
+    this.sheetFlushes.delete(msg.id);
+    await document.loading;
+    await document.queue.run(() => undefined);
+    done();
   }
 
   saveCustomDocumentAs(
@@ -5483,6 +5561,8 @@ const MD_OTHER_PARTS = 'This change would also change other parts of the file; i
 const MD_REVEAL_ECHO_MS = 150;
 /** `onWillSaveTextDocument` waits this long for the webview's last typing; then the save goes on without it. */
 const MD_FLUSH_TIMEOUT_MS = 1_000;
+/** (0.2.1 B5) How long Save waits for a cell editor to commit its draft. */
+const SHEET_FLUSH_TIMEOUT_MS = 2_000;
 /** After a change that leaves the document clean (a reload from disk), the fidelity check runs again after this pause. */
 const MD_FIDELITY_RECHECK_MS = 300;
 const MD_NOT_SAVED_YET = 'FileStudio: Your last typing was not saved yet.';

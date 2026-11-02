@@ -178,7 +178,8 @@ function dispatch(msg) {
       mdSplitReveal(msg.line); // P6
       break;
     case 'flushRequest':
-      mdwOnFlushRequest(msg.id); // P6
+      if (currentKind() === 'sheet') sheetOnFlushRequest(msg.id); // 0.2.1 B5
+      else mdwOnFlushRequest(msg.id); // P6
       break;
   }
 }
@@ -5848,6 +5849,7 @@ async function writeClipboard(text, cells) {
  *   takes the focus away (to <body>), which must not close the box (its Copy copies the box's selected text)
  * @property {'view' | 'edit' | 'replace'} mode  view = the read-only box of 0.1.2; edit = F2 / double-click / formula bar; replace = typing
  * @property {string} initialValue  an editor: the text the edit started from (what "unchanged" means)
+ * @property {boolean} [draftSent]  an editor: the host was told (once) that the text was typed in (B5)
  * @property {boolean} composing    an IME composition is running (it never commits)
  */
 
@@ -5910,7 +5912,10 @@ function openCellBox(view, r, c, opts = {}) {
     el.setSelectionRange(caretAtEnd ? el.value.length : 0, el.value.length);
     el.scrollTop = caretAtEnd ? el.scrollHeight : 0;
   }
-  if (mode !== 'view') syncFormulaFromBox();
+  if (mode !== 'view') {
+    syncFormulaFromBox();
+    noteDraftTyped();
+  }
 }
 
 /**
@@ -6057,8 +6062,42 @@ function onCellBoxBlur(e, el) {
 /** @param {HTMLTextAreaElement} el */
 function onCellBoxInput(el) {
   if (G?.cellBox?.el !== el) return;
+  noteDraftTyped();
   syncFormulaFromBox();
   relayoutCellBox();
+}
+
+/**
+ * 0.2.1 B5: tells the host once per editor that the text differs from where it started, so the tab is marked unsaved and
+ * closing it with the mouse asks first. It changes nothing in the file (the host only marks the tab).
+ */
+function noteDraftTyped() {
+  const box = G?.cellBox;
+  if (!G || G.kind !== 'sheet' || !box || box.mode === 'view' || box.draftSent || box.el.value === box.initialValue) return;
+  box.draftSent = true;
+  post({ type: 'draftTyped' });
+}
+
+/**
+ * 0.2.1 B5: the host is saving (the close prompt's Save, Save All, auto save): an open editor with typed text commits it
+ * first, then the host is told (after the edit message). An editor the user is typing in right now (focus inside it) is
+ * left alone: auto save after a delay must not cut the typing. Ctrl+S inside the editor already commits it itself.
+ * @param {number} id
+ */
+function sheetOnFlushRequest(id) {
+  const box = G?.cellBox;
+  const typing = !!box && document.hasFocus() && document.activeElement === box.el;
+  if (box && box.mode !== 'view' && !typing && box.el.value !== box.initialValue) closeCellBox('blur', false);
+  // A save may make the tab clean while the editor stays open: more typing must tell the host again (B5).
+  if (box && typing) box.draftSent = false;
+  // The committed edit may wait behind an edit in flight: the host is told once every edit has been sent and answered.
+  const started = Date.now();
+  const answer = () => {
+    const g = G;
+    if (g && (g.inFlightEdit || g.sendQueue.length > 0) && Date.now() - started < 1500) setTimeout(answer, 20);
+    else post({ type: 'flushed', id });
+  };
+  answer();
 }
 
 /** Alt+Enter: a line break at the caret (Excel). @param {HTMLTextAreaElement} el */
@@ -6533,7 +6572,8 @@ function onEditResult(msg) {
     findDataChanged();
   } else {
     dropIntentOverlay(sent.intent);
-    setStatusMessage(msg.reason || 'The change was not applied.', 'warn');
+    lastRejectReason = msg.reason || 'The change was not applied.';
+    setStatusMessage(lastRejectReason, 'warn');
     reopenRejectedDraft(msg.editId);
   }
   scheduleRender();
@@ -6652,6 +6692,9 @@ function submitCellText(sheet, r, c, text, original, then) {
 /** The last text committed from the editor: a rejected edit opens the editor again with it (Excel keeps the editor open). @type {{ editId: number, sheet: number, r: number, c: number, text: string } | null} */
 let editorDraft = null;
 
+/** The host's reason for the last refused edit (B4 appends to it when the refused text is not reopened). */
+let lastRejectReason = '';
+
 /** The host refused the editor's text: open the editor on that cell again with the text, unless the user moved on. @param {number} editId */
 function reopenRejectedDraft(editId) {
   const g = G;
@@ -6659,6 +6702,12 @@ function reopenRejectedDraft(editId) {
   if (!g || !d || d.editId !== editId) return;
   editorDraft = null;
   if (g.cellBox || g.sheet !== d.sheet || !isCellEditable()) return;
+  // 0.2.1 B4: a slow rejection must not steal the focus: when it is in another control (name box, formula bar, tabs), the user moved on.
+  const focus = document.activeElement;
+  if (focus && focus !== document.body && !g.dom.scroller.contains(focus)) {
+    setStatusMessage(`${lastRejectReason} The text you typed was not kept.`, 'warn');
+    return;
+  }
   const view = activeView();
   selectRange(view, { r0: d.r, c0: d.c, r1: d.r, c1: d.c });
   openCellBox(view, d.r, d.c, { mode: 'replace', text: d.text });
@@ -6739,6 +6788,7 @@ function onFormulaInput() {
   const box = g?.cellBox;
   if (!g || !box || box.mode === 'view') return;
   box.el.value = g.dom.formula.textContent || '';
+  noteDraftTyped();
   relayoutCellBox();
   g.dom.formula.classList.toggle('fv-formula-f', g.kind === 'sheet' && box.el.value.startsWith('='));
 }

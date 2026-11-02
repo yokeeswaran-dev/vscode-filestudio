@@ -102,6 +102,12 @@ test('new non-edit messages: valid shapes accepted, bad shapes dropped', () => {
   for (const msg of bad) assert.equal(parse(msg), undefined, JSON.stringify(msg));
 });
 
+test('0.2.1 B5: draftTyped is accepted for xlsx only, with no payload needed', () => {
+  assert.deepEqual(parse({ type: 'draftTyped' }, 'sheet'), { type: 'draftTyped' });
+  assert.equal(parse({ type: 'draftTyped' }, 'markdown'), undefined);
+  assert.equal(parse({ type: 'draftTyped' }, 'csv'), undefined);
+});
+
 // ===== EDIT: VALID SHAPES =====
 
 test('every edit kind is accepted in its exact shape (contract §2.2)', () => {

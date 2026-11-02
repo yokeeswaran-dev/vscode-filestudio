@@ -156,7 +156,7 @@ No. Everything runs on your computer: no telemetry, no uploads. Links open only 
 - FileStudio does not calculate formulas (see the FAQ).
 - In `.xlsx`, you can change cell values and formulas only: not rows, columns, sheets or cell formatting.
 - Cut (Ctrl+X) is not available in the grid: use Copy and then Delete.
-- If you close a tab while a cell is still open for typing, the text in that cell is not kept. Press Enter first.
+- If you close a tab while a cell is still open for typing, VS Code asks first (the tab shows as unsaved once you type). Choose **Save** to save the text too, **Cancel** to go back to the cell, or **Don't Save** to drop it. The tab stays unsaved after you press Esc on typed text (or undo back to the start), until the next save (nothing is written for it). If you move the focus out of the editor and then it is refused (for example an invalid formula), the refused text is not opened again.
 - Very large Markdown files are slow to open in WYSIWYG mode (a Loading message with a percentage is shown while the
   editor is built). WYSIWYG is turned off above 200,000 characters, 3,000 blocks, or a weight of 10,000 points (a
   paragraph counts 1, a table row about 1.5, a list line 1): use Split for those. Above about 1,500 points the editor

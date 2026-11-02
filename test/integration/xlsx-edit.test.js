@@ -124,6 +124,22 @@ suite('xlsx cell editing (P2)', () => {
     assert.equal(textAt(await readRows(ctx), 0, 0), 'edit one');
   });
 
+  test('0.2.1 B5 r1: draftTyped first, then an edit + undo: document clean, tab unsaved (VS Code rule) until Save, which writes nothing', async () => {
+    const ctx = await openCopy();
+    const before = sha(ctx.uri);
+    await api.post(ctx.key, { type: 'draftTyped' });
+    await h.waitFor(() => h.isDirty(ctx.uri), { message: 'dirty after the draft' });
+    await post(ctx, setCell(0, 0, 'typed'));
+    await h.undo();
+    await h.waitFor(() => api.state(ctx.key).dirty === false, { message: 'document clean after undo' });
+    // VS Code keeps the dirty mark of a content-change event until the next save or revert; undo cannot clear it.
+    assert.equal(h.isDirty(ctx.uri), true, 'the tab stays unsaved until Save');
+    await h.save();
+    await clean(ctx);
+    await h.sleep(300);
+    assert.equal(sha(ctx.uri), before, 'nothing written');
+  });
+
   test('one Clear and one paste-sized setCells are each one undo step', async () => {
     const ctx = await openCopy();
     const cells = [];
